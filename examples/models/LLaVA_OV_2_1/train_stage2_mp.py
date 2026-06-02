@@ -11,8 +11,7 @@ import numpy as np
 from datetime import timedelta
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from muon_standalone import Muon
+from megatron.bridge.models.qwen_vl_ov2.muon_standalone import Muon
 
 STAGE1_CKPT = os.environ.get("STAGE1_CKPT",
     # date0523 lineage: colleague's Muon-trained vit+adapter stage-1 (loads 588/588 into our Bridge model)

@@ -1,86 +1,145 @@
-# LLaVA-OneVision-2.1 — 4B (p16m33) on Megatron-Bridge
+# LLaVA-OneVision-2.1 · 4B (p16m3) on Megatron-Bridge
 
-Two-stage build of the **genuine 4B** OV2.1 model under the NVIDIA Megatron-Bridge
-framework, bootstrapped from the already-assembled mcore checkpoint.
+Two-stage training of **LLaVA-OneVision-2.1 4B** under [Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge), reproducing the AIAK (`OV2_public_main`) recipe with standalone data-parallel trainers.
 
-> Status: scaffold + launch scripts. The two code pieces marked **[BUILD]** below
-> must be added/validated in the training env before stage-2 can run end-to-end.
-> Stage-1 (packed 558k) runs on the **existing** OV2 packed pipeline.
+```
+LlavaOnevision2 = language_model (Qwen3-4B GPTModel)   # frozen in both stages here
+                + vision_model   (OneVision ViT, patch16 / 24L / hidden 1024 / spatial-merge 3)
+                + adapter        (PatchMerger: 1024·3² = 9216 → GELU → 2560)
+```
+
+- **Stage 1** — *adapter-only* alignment on 558k caption data (LLM + ViT frozen). Optimizer **Adam**, cosine LR.
+- **Stage 2** — *vit + adapter* SFT on 780k LLaVA-Next data (LLM frozen). Optimizer **Muon**, constant LR. Online sequence-packing variant available.
+
+> The checkpoints loaded here (assembled mcore `tp1pp1`) carry all three namespaces (`language_model.*` / `vision_model.*` / `adapter.*`) and are byte-identical to the official `lmms-lab/LLaVA-OneVision-2-4B-p16m33-mcore-tp1-pp1` for the LLM+vision tensors.
 
 ---
 
-## Model (resolved from `lmms-lab/LLaVA-OneVision-2-4B-p16m33/config.json`)
+## QuickStart (docker → training)
 
-| Part | Spec |
-|------|------|
-| LLM backbone | **Qwen3-4B-Instruct-2507** — dense Qwen3, hidden **2560**, **36** layers, heads 32 / kv 8, head_dim 128, ffn 9728, rope_θ 5e6, rms_eps 1e-6, vocab 151936 |
-| Vision encoder | onevision_encoder, **patch_size 16**, hidden 1024, 24 layers, 16 heads, ffn 4096, **spatial_merge_size 3**, image 448, out_hidden 2560 |
-| Adapter (m33) | input 1024 → `hidden = 1024 * 3² = 9216` → output **2560** (layernorm@1024, linear_fc1 9216→9216, linear_fc2 9216→2560) |
-| image_token_id | 151655 |
+Everything runs inside the **`mbridge:qwen35`** docker image on the A100 box (`docker images | grep mbridge` → `mbridge:qwen35`, ~29 GB). The image already has torch + Transformer-Engine + Megatron-Core; you only need to bind-mount the data/checkpoints and set `PYTHONPATH`.
 
-NB vs the 8B graft: 8B used patch **14** / merge **2** / adapter→4096 on a **Qwen3-VL-8B** LLM.
-This is a different model — patch **16**, merge **3**, adapter→**2560**, plain **Qwen3-4B** LLM.
+### 0. Prerequisites (paths used by the defaults)
 
-## Assets (all verified present on this host)
+| asset | path |
+|---|---|
+| repo | `/ov2/feilong/Megatron-Bridge` |
+| **docker image** | **`mbridge:qwen35`** |
+| processor | `/ov2/feilong/preprocessor_p16m33` |
+| stage-1 init ckpt (mcore) | `/ov2/feilong/ov2_quickstart/ov_encoder_p16m3_qwen3_mcore_tp1pp1` |
+| stage-1 data (558k) | `/vlm/data/blip_laion_cc_sbu_558k_wds` |
+| stage-2 data (780k) | `/vlm/data/llava_next_full_mega` |
 
-| Asset | Path |
-|-------|------|
-| Assembled mcore ckpt (LLM + p16m33 encoder + adapter) | `/ov2/pretrain_models/llava_onevision2/llava_onevision2_4b_p16m33_mcore_tp1_pp1` (`release/mp_rank_00/model_optim_rng.pt`) |
-| HF reference model | `/ov2/pretrain_models/lmms-lab/LLaVA-OneVision-2-4B-p16m33` |
-| LLM HF | `/ov2/pretrain_models/Qwen3-4B-Instruct-2507` |
-| Standalone encoder (HF) | `/ov2/pretrain_models/onevision-encoder-large` |
-| Preprocessor (p16/m3) | `/ov2/feilong/preprocessor_p16m33` |
-| Stage-1 data — 558k **non-packed** (MultiMixQA) | `/vlm/data/blip_laion_cc_sbu_558k_wds` |
-| Stage-2 data — 780k **non-packed** (MultiMixQA) | `/vlm/data/llava_next_full_mega` |
-| Bridge runtime | docker image `mbridge:qwen35` (has megatron.core 0.18.0; run `--gpus all`, `PYTHONPATH=<repo>/src:<repo>/3rdparty/Megatron-LM`) |
+### 1. Launch stage 1 — explicit `docker run`
 
-## Design (per request)
-
-- **Init**: load LLM + vision encoder from the assembled mcore ckpt; **adapter random-init**.
-- **Stage 1** — train **adapter only** (freeze LLM + encoder), 558k **non-packed** data, **1 epoch**, **AIAK adapter-only recipe**: Adam (0.9,0.99,eps1e-5,wd0), lr 2e-5→cosine→1e-6 (warmup 0.002), clip-grad 1.0, gbs 256 via grad-accum, GELU adapter, next-token label shift, token-weighted loss. (The label shift is mandatory — mcore CE does not shift internally; without it loss starts >random ~16.)
-- **Stage 2** — train **encoder + adapter** (freeze LLM), 780k **non-packed** data, **1 epoch**, optimizer **Muon** (`dist_muon`, momentum 0.95, matched_adamw_rms 0.15, scalar-Adam β 0.9/0.99 eps 1e-5 — mirrors the date0528 reference).
-- Both stages use **non-packed MultiMixQA** data → one task encoder ([BUILD-2]) covers both. No packed pipeline used.
-- **No FSDP** (use the distributed optimizer; `data_parallel_sharding_strategy` only).
-
-## Assembled mcore ckpt — verified layout (the "stitch" target)
-
-`llava_onevision2_4b_p16m33_mcore_tp1_pp1` has **3 sibling namespaces** (standard mcore):
-- `language_model.*` (435) — Qwen3-4B GPTModel (embedding/decoder/output_layer, TE, qk-layernorm)
-- `vision_model.*` (388) — onevision encoder directly (qkv has bias; 3072 = 3×1024)
-- `adapter.*` — layernorm(1024) + linear_fc1(9216×9216) + linear_fc2(2560×9216)
-
-Bridge's OV2 `onevision_encoder_model` + `adapter` are **verbatim AIAK ports**, so a Bridge model
-with the **same 3-sibling layout** (port of AIAK `LlavaOnevision2`) loads this ckpt with
-near-identity naming (drop `_extra_state`; adapter re-init for stage-1). That model class is [BUILD-1].
-
-> Muon caveat: Bridge `dist_muon` needs `emerging_optimizers` (git v0.2.0). It is **missing** from
-> `mbridge:qwen35` — pip-install into the image, or use an image that has it, before stage-2.
-
-## Two engineering gaps (why this isn't pure config)
-
-**[BUILD-1] Multimodal model class for 4B.** The repo ported only the OV2 *vision tower*
-(`models/qwen_vl_ov2/{onevision_encoder_model,adapter,...}` — verbatim from AIAK, so their
-param names match the mcore ckpt's `vision_model.*` / `adapter.*`). The 8B recipe reused
-`Qwen3VLModel`'s merge/forward by grafting the tower into a **Qwen3-VL-8B**. There is **no
-Qwen3-VL-4B**, and the 4B LLM is plain Qwen3-4B. So we need a multimodal wrapper holding
-`language_model` (Qwen3-4B GPTModel) + `vision_model` (OV2 tower) that loads the AIAK mcore
-ckpt cleanly. Recommended: **port AIAK's `LlavaOnevision2Model`** (forward = encode→adapter→
-scatter at image_token→LLM) since the mcore ckpt was saved by that exact class → loads 1:1.
-
-**[BUILD-2] Non-packed MultiMixQA task encoder (stage-2 only).** `llava_next_full_mega` is an
-Energon WDS whose `dataset.yaml` sample_type is `aiak_training_llm.data.multimodal.MultiMixQASample`
-(multi-turn conversation, image/video). The current `aiak_shim` only re-exports
-`PackedCaptioningSample`, and `OV2PackingTaskEncoder` raises `NotImplementedError` on anything
-but `PackedCaptioningSample`. So stage-2 needs (a) a `MultiMixQASample` export in the shim and
-(b) a non-packed conversation task encoder (qwen2-vl chat template, mask non-assistant tokens).
-**Stage-1 (558k packed) needs neither — it uses the existing packed pipeline.**
-
-## Run
+This is exactly what `ax_stage_1_alignment_p16m3_adapter_only.sh` runs (detached container `ov2_s1`, 7-way DP on GPUs 1–7):
 
 ```bash
 cd /ov2/feilong/Megatron-Bridge
-bash examples/models/LLaVA_OV_2_1/ax_stage_1_alignment_p16m3_adapter_only.sh   # adapter align (558k, AIAK recipe)
-bash examples/models/LLaVA_OV_2_1/stage2_encoder_adapter_780k.sh              # encoder+adapter (780k)
+OUT=/ov2/feilong/Megatron-Bridge/ov2_1_4b/stage1_alignment_p16m3_adapter_only; mkdir -p "$OUT"
+
+docker run -d --name ov2_s1 \
+  --gpus '"device=1,2,3,4,5,6,7"' --ipc=host --shm-size=32g \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e OVCK=/ov2/feilong/ov2_quickstart/ov_encoder_p16m3_qwen3_mcore_tp1pp1 \
+  -e OUT="$OUT" -e GBS_TARGET=256 -e TOTAL_SAMPLES=558128 \
+  -e LR=2e-5 -e MIN_LR=1e-6 -e WARMUP_FRAC=0.002 -e CLIP_GRAD=1.0 \
+  -e DATA=/vlm/data/blip_laion_cc_sbu_558k_wds \
+  -e PYTHONPATH=/ov2/feilong/Megatron-Bridge/3rdparty/Megatron-LM:/ov2/feilong/Megatron-Bridge/src:/ov2/feilong/Megatron-Bridge/aiak_shim \
+  -v /ov2:/ov2 -v /vlm:/vlm -w /ov2/feilong/Megatron-Bridge \
+  mbridge:qwen35 \
+  bash -lc "torchrun --standalone --nproc_per_node=7 examples/models/LLaVA_OV_2_1/train_stage1_mp.py >> $OUT/train.log 2>&1"
+
+docker logs -f ov2_s1     # or: tail -f $OUT/train.log
 ```
 
-Both scripts expose every hyper-parameter as an overridable env var at the top.
+**Or just** `bash examples/models/LLaVA_OV_2_1/ax_stage_1_alignment_p16m3_adapter_only.sh` (same thing, every flag overridable via env). Expected: iter-1 `lm loss ≈ 4–6`, descending toward ~3.0 (≈ AIAK reference); ~2155 steps = 1 epoch.
+
+### 2. Launch stage 2 — explicit `docker run`
+
+Same image; loads the stage-1 (or a vit+adapter) checkpoint via `STAGE1_CKPT`, trains vit+adapter with Muon:
+
+```bash
+cd /ov2/feilong/Megatron-Bridge
+OUT=/ov2/feilong/Megatron-Bridge/ov2_1_4b/stage2_alignment_p16m3_muon_vit_adapter; mkdir -p "$OUT"
+
+docker run -d --name ov2_s2 \
+  --gpus '"device=1,2,3,4,5,6,7"' --ipc=host --shm-size=32g \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e STAGE1_CKPT=/ov2/feilong/Megatron-Bridge/ov2_1_4b/stage1_alignment_p16m3_adapter_only/iter_0002155/mp_rank_00/model_optim_rng.pt \
+  -e OUT="$OUT" -e DATA=/vlm/data/llava_next_full_mega -e SEQ=32000 -e ACCUM=18 \
+  -e LR=2e-5 -e WARMUP=0 -e CLIP_GRAD=1.0 -e MUON_RMS=0.2 -e TOTAL_SAMPLES=779111 \
+  -e PYTHONPATH=/ov2/feilong/Megatron-Bridge/3rdparty/Megatron-LM:/ov2/feilong/Megatron-Bridge/src:/ov2/feilong/Megatron-Bridge/aiak_shim \
+  -v /ov2:/ov2 -v /vlm:/vlm -w /ov2/feilong/Megatron-Bridge \
+  mbridge:qwen35 \
+  bash -lc "torchrun --standalone --nproc_per_node=7 examples/models/LLaVA_OV_2_1/train_stage2_mp.py >> $OUT/train.log 2>&1"
+```
+
+**Or** `bash examples/models/LLaVA_OV_2_1/ax_stage_2_alignment_p16m3_muon_vit_adapter.sh` (non-packed, matches AIAK date0523), or `…_packed.sh` for online sequence-packing (run `train_stage2_pack_mp.py`; faster on few GPUs — see notes). Expected starting `lm loss ≈ 1.1–1.3`.
+
+### 3. Interactive shell (debugging)
+
+```bash
+docker run -it --rm --gpus '"device=0"' --ipc=host --shm-size=32g \
+  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e PYTHONPATH=/ov2/feilong/Megatron-Bridge/3rdparty/Megatron-LM:/ov2/feilong/Megatron-Bridge/src:/ov2/feilong/Megatron-Bridge/aiak_shim \
+  -v /ov2:/ov2 -v /vlm:/vlm -w /ov2/feilong/Megatron-Bridge \
+  mbridge:qwen35 bash
+# inside: torchrun --standalone --nproc_per_node=1 examples/models/LLaVA_OV_2_1/train_stage1_mp.py
+```
+
+> **PYTHONPATH order matters**: `3rdparty/Megatron-LM` must come **first** (the image's installed mcore lacks `SelfAttentionSubmodules.apply_rotary_fn` that the OV2 vision layer-spec needs). All launch scripts already set this. Every hyper-parameter is an overridable env var at the top of each `.sh`.
+
+---
+
+## Stage 1 — adapter-only alignment
+
+| | value |
+|---|---|
+| trainable | adapter only (LLM + ViT frozen, adapter random-init) |
+| optimizer | **AdamW** β(0.9, 0.99), eps 1e-5, wd 0 |
+| LR | 2e-5 → **cosine** → 1e-6, warmup-fraction 0.002 |
+| clip-grad / loss | 1.0 / **token-weighted** mean |
+| batch | gbs **256** (mbs 1 + grad-accum), seq 32000 |
+| data / epochs | 558k blip_laion_cc_sbu, 1 epoch (~2155 steps) |
+
+`train_stage1_mp.py` · launch `ax_stage_1_alignment_p16m3_adapter_only.sh`.
+
+## Stage 2 — vit + adapter SFT
+
+| | value |
+|---|---|
+| trainable | adapter + vision_model (LLM frozen) |
+| optimizer | **Muon** (mom 0.95, ns-steps 5, matched-adamw-rms 0.2, β 0.9/0.99, eps 1e-5) |
+| LR | 2e-5 **constant** (min-lr == lr, warmup 0) |
+| clip-grad / loss | 1.0 / token-weighted mean |
+| batch | gbs ~128, seq 32000 |
+| data / epochs | 780k llava_next_full_mega (multi-turn), 1 epoch |
+
+`train_stage2_mp.py` (non-packed) · `train_stage2_pack_mp.py` (online packing) · launch `ax_stage_2_alignment_p16m3_muon_vit_adapter[_packed].sh`.
+
+---
+
+## Implementation notes (don't skip — these cost real debugging)
+
+- **Next-token label shift is mandatory.** mcore's `compute_language_model_loss` does **not** shift labels internally; the trainers do `labels = torch.roll(labels, -1)` + mask the last position (packed: mask every `cu_seqlens` boundary). Without it the loss starts **>random (~16)** instead of ~4–6. This was the single biggest bug.
+- **Token-weighted loss** (sum per-token loss / total supervised tokens across DP), not per-microbatch mean — matches Megatron/AIAK and keeps grad scaling stable.
+- **Recompute is LLM-only** (`recompute_granularity=full, method=uniform, num_layers=1`); the ViT/adapter are not recomputed (vision recompute hits an `attn_mask_type` error). Toggle with `RECOMPUTE=0` only if memory allows.
+- **Full-model checkpoints**: each `iter_NNNN/mp_rank_00/model_optim_rng.pt` holds all 588 keys (LLM+vision+adapter) so the next stage loads in one shot. Resume is automatic from the latest `iter_*` in the output dir.
+- **NCCL timeout** raised to 7200s (`NCCL_TIMEOUT_S`) so a long-sample step can't trip the 10-min watchdog.
+- **Online packing** (`train_stage2_pack_mp.py`): greedy-knapsack packs short samples into uniform `PACK_CAP`-token bins with **block-diagonal** attention (`PackedSeqParams`, `cu_seqlens` at *sample* boundaries — within-conversation causal context preserved, cross-sample blocked). Samples longer than `PACK_CAP` get their **own bin**. Caveat: dense packs raise GPU memory; on 80 GB cards keep `PACK_CAP≈8000`, and very long (~32000-token) single-conversation singletons can still OOM — fall back to the non-packed trainer for the long tail if needed.
+
+## Layout
+
+```
+examples/models/LLaVA_OV_2_1/
+  ax_stage_1_alignment_p16m3_adapter_only.sh          # stage-1 launch
+  ax_stage_2_alignment_p16m3_muon_vit_adapter.sh      # stage-2 launch (non-packed)
+  ax_stage_2_alignment_p16m3_muon_vit_adapter_packed.sh  # stage-2 launch (online packing)
+  train_stage1_mp.py  train_stage2_mp.py  train_stage2_pack_mp.py
+  README.md
+src/megatron/bridge/models/qwen_vl_ov2/
+  llava_ov2_4b.py         # LlavaOnevision2 model + build + checkpoint loader
+  onevision_encoder_model.py  adapter.py  layer_spec.py  vision_config.py  ...
+  muon_standalone.py      # standalone Muon (used by the stage-2 trainers)
+```

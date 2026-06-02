@@ -11,8 +11,7 @@ import numpy as np
 from datetime import timedelta
 from PIL import Image
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from muon_standalone import Muon
+from megatron.bridge.models.qwen_vl_ov2.muon_standalone import Muon
 
 
 def greedy_knapsack(sizes, items, cap):
