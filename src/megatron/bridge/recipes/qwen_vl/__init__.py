@@ -15,6 +15,11 @@
 # Qwen2.5-VL models
 # Qwen3-VL models
 from .qwen3_vl import (
+    qwen3_vl_4b_peft_config,
+    qwen3_vl_4b_peft_energon_config,
+    qwen3_vl_4b_pretrain_mock_config,
+    qwen3_vl_4b_sft_config,
+    qwen3_vl_4b_sft_energon_config,
     qwen3_vl_8b_peft_config,
     qwen3_vl_8b_peft_energon_config,
     qwen3_vl_8b_pretrain_mock_config,
@@ -101,14 +106,19 @@ __all__ = [
     "qwen25_vl_32b_peft_config",
     "qwen25_vl_72b_peft_config",
     # Qwen3-VL pretrain configs
+    "qwen3_vl_4b_pretrain_mock_config",
     "qwen3_vl_8b_pretrain_mock_config",
     "qwen3_vl_30b_a3b_pretrain_mock_config",
     "qwen3_vl_235b_a22b_pretrain_mock_config",
     # Qwen3-VL SFT configs
+    "qwen3_vl_4b_sft_config",
+    "qwen3_vl_4b_sft_energon_config",
     "qwen3_vl_8b_sft_config",
     "qwen3_vl_30b_a3b_sft_config",
     "qwen3_vl_235b_a22b_sft_config",
     # Qwen3-VL PEFT configs
+    "qwen3_vl_4b_peft_config",
+    "qwen3_vl_4b_peft_energon_config",
     "qwen3_vl_8b_peft_config",
     "qwen3_vl_8b_peft_energon_config",
     "qwen3_vl_30b_a3b_peft_config",

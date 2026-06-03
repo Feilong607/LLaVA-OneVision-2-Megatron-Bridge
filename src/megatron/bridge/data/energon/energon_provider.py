@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -19,6 +20,9 @@ from torch import int_repr
 
 from megatron.bridge.data.energon.base_energon_datamodule import EnergonMultiModalDataModule
 from megatron.bridge.data.utils import DatasetBuildContext, DatasetProvider
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
@@ -55,8 +59,19 @@ class EnergonProvider(DatasetProvider):
             num_workers=self.num_workers,
             pg_collection=context.pg_collection,
         )
-        return (
-            iter(dataset.train_dataloader()),
-            iter(dataset.val_dataloader()),
-            iter(dataset.val_dataloader()),
-        )
+        train_iter = iter(dataset.train_dataloader())
+        # Datasets prepared with only a 'train' split (e.g. the original
+        # blip_laion_cc_sbu_558k_wds) have an empty/missing 'val' split, which
+        # would otherwise raise EmptyDatasetError here. Fall back to the train
+        # dataloader for val/test so the run proceeds; set validation.eval_iters=0
+        # to skip evaluation entirely.
+        try:
+            val_iter = iter(dataset.val_dataloader())
+        except Exception as e:
+            logger.warning(
+                "EnergonProvider: no usable 'val' split (%s); reusing the train "
+                "dataloader for val/test. Set validation.eval_iters=0 to skip eval.",
+                e,
+            )
+            val_iter = iter(dataset.train_dataloader())
+        return (train_iter, val_iter, val_iter)
