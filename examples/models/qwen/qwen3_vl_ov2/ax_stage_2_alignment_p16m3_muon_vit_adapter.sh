@@ -25,9 +25,15 @@ IMAGE="${IMAGE:-mbridge:qwen35-muon}"     # Muon needs emerging_optimizers (NVID
 GPUS="${GPUS:-0,1,2,3,4,5,6,7}"; NPROC="${NPROC:-8}"
 DATA_PATH="${DATA_PATH:-/vlm/data/llava_next_full_mega}"
 INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/results/ov2_1_stage1_native}"   # trained stage-1 (model-only load)
-SAVE="${SAVE:-/ov2/feilong/gb200/results/ov2_1_stage2_native}"
+SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/llava_ov2_4b_stage2}"   # mirror stage-1 layout
 ITERS="${ITERS:-6094}"          # 1 epoch over 780k @ gbs 128
-LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
+LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-500}"
+# Fail fast if INIT_CKPT is set but missing (stage-2 inits from a TRAINED stage-1 ckpt).
+# Use INIT_CKPT=null to skip the pretrained load (from-scratch / stitch-base smoke).
+if [[ "$INIT_CKPT" != "null" && -n "$INIT_CKPT" && ! -e "$INIT_CKPT" ]]; then
+  echo "[ov2-native] ERROR: INIT_CKPT=$INIT_CKPT not found. Run stage-1 first and set INIT_CKPT to its output dir, or set INIT_CKPT=null to skip the pretrained load." >&2
+  exit 1
+fi
 mkdir -p "$SAVE"
 docker rm -f ov2_s2 2>/dev/null || true
 # GPU access on these hosts (A100-22/26): `--privileged` is needed for NVML init, and the docker
@@ -42,7 +48,7 @@ docker run -d --name ov2_s2 --privileged --gpus all -e CUDA_VISIBLE_DEVICES="$GP
      --recipe ov2_1_stage2_vit_adapter_muon_config --dataset vlm-energon --step_func ov2_step \
      dataset.path=$DATA_PATH \
      checkpoint.save=$SAVE checkpoint.load=$SAVE checkpoint.pretrained_checkpoint=$INIT_CKPT \
-     dataset.dataloader_save=$SAVE \
+     dataset.dataloader_save=$SAVE/dataloader logger.tensorboard_dir=$SAVE/tensorboard \
      checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS \
      validation.eval_iters=0 logger.log_interval=$LOG_EVERY \
      > $SAVE/train.log 2>&1"
