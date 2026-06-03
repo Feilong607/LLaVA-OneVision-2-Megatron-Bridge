@@ -32,6 +32,10 @@ from megatron.bridge.training.config import ConfigContainer
 OV2_LLM_HF = "/ov2/pretrain_models/Qwen3-4B-Instruct-2507"
 OV2_MCORE_CKPT = "/ov2/pretrain_models/lmms-lab/LLaVA-OneVision-2-4B-p16m33-mcore-tp1-pp1"
 OV2_HF_PROC = "/ov2/pretrain_models/lmms-lab/LLaVA-OneVision-2-4B-p16m33"
+# AIAK date0511 stage-1 (adapter-only) mcore ckpt — the reference stage-1 the dev-clone aligned to.
+# Stage-2 inits from this KNOWN-GOOD trained adapter (load_ov2_adapter=True) to remove any doubt
+# about the stage-1. Dir holds release/mp_rank_00/model_optim_rng.pt + latest_checkpointed_iteration.txt.
+AIAK_STAGE1_CKPT = "/vlm/yinxie/code/OV2/OV2_public_main/checkpoints/date0511-LLaVA-OneVision-2-4B-p16m33-mcore-tp1-pp1-stage1-alignment-adapter-only/ax_stage_1_alignment_p16m3_adapter_only"
 N_SAMPLES = 558128
 SEQ_LEN = 32000
 
@@ -202,8 +206,8 @@ def ov2_1_stage2_vit_adapter_muon_config() -> ConfigContainer:
     # ---- Model provider: freeze LLM, TRAIN vision + adapter ----
     cfg.model = LlavaOnevision2Provider.from_llm(
         OV2_LLM_HF,
-        ov2_mcore_ckpt_path=OV2_MCORE_CKPT,
-        load_ov2_adapter=False,                    # merge-3 adapter comes from the stage-1 ckpt, not the stitch base
+        ov2_mcore_ckpt_path=AIAK_STAGE1_CKPT,      # init from the AIAK date0511 stage-1 (adapter-only)
+        load_ov2_adapter=True,                     # load the TRAINED merge-3 adapter (the point of chaining)
         load_ov2_vision=True,
         load_llm_weights=False,
         freeze_language_model=True,

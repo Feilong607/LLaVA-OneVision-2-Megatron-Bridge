@@ -81,27 +81,112 @@ class OV2TaskEncoder(DefaultTaskEncoder):
         self.seq_length = self.seq_len = int(seq_length)
         self.default_system = default_system
 
+    # Qwen2-VL / Qwen3 special-token ids (verified on the p16m33 processor).
+    IMG_PAD_ID = 151655
+    VIS_START_ID = 151652
+    VIS_END_ID = 151653
+
     def encode_sample(self, s) -> OV2TaskSample:
         try:
             msgs = s.messages or []
-            user = next(m["content"] for m in msgs if m.get("role") == "user")
-            ans = next(m["content"] for m in msgs if m.get("role") == "assistant")
+            # Split optional system; collect user/assistant turns in order.
+            system = None
+            turns = []
+            for m in msgs:
+                role = m.get("role")
+                content = m.get("content", "")
+                if role == "system":
+                    system = content
+                elif role in ("user", "assistant"):
+                    turns.append((role, content))
+            if not system:
+                system = getattr(s, "system", None) or self.default_system
+
+            # MULTI-TURN: llava_next is ~65% multi-turn; AIAK (encode_multiturn) supervises EVERY
+            # assistant response, so we must too (loss-口径 alignment). Pair consecutive user->assistant.
+            pairs = []
+            i = 0
+            while i < len(turns) - 1:
+                if turns[i][0] == "user" and turns[i + 1][0] == "assistant":
+                    pairs.append((turns[i][1], turns[i + 1][1]))
+                    i += 2
+                else:
+                    i += 1
+            if not pairs:
+                raise SkipSample()
+
             imgs = [_to_pil(x) for x in (s.image or [])]
-            user = user.replace("<image>", self.VISION) if "<image>" in user else (
-                self.VISION + "\n" + user if imgs else user
-            )
-            _sys = getattr(s, "system", None) or self.default_system
-            prompt = (
-                f"<|im_start|>system\n{_sys}<|im_end|>\n"
-                f"<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
-            )
-            ft = self.proc(text=[prompt + ans + "<|im_end|>"], images=imgs or None, return_tensors="pt")
-            pt = self.proc(text=[prompt], images=imgs or None, return_tensors="pt")
-            ids = ft["input_ids"][0]
+            # Image features + per-image expanded token counts (grid//merge^2, merge=3) — replicates
+            # the full processor's <|image_pad|> expansion so masked_scatter gets the right #tokens.
+            pixel_values = None
+            image_grid_thw = None
+            img_counts = []
+            if imgs:
+                ip = getattr(self.proc, "image_processor", None)
+                img_out = ip(images=imgs, return_tensors="pt")
+                pixel_values = img_out["pixel_values"]
+                image_grid_thw = img_out["image_grid_thw"]
+                merge = int(getattr(ip, "merge_size", 2))
+                img_counts = [
+                    int(image_grid_thw[k].prod().item()) // (merge * merge)
+                    for k in range(image_grid_thw.shape[0])
+                ]
+
+            tok = getattr(self.proc, "tokenizer", self.proc)
+
+            def _enc(text):
+                return tok(text, add_special_tokens=False)["input_ids"]
+
+            # Reconcile <image> markers with len(imgs): more markers than images is malformed; fewer
+            # (image with no marker) -> prepend the missing to turn 0. Guarantees #<|image_pad|>==#imgs.
+            n_img = len(imgs)
+            total_markers = sum(str(uc).count("<image>") for uc, _ac in pairs)
+            if total_markers > n_img:
+                raise SkipSample()
+            missing = n_img - total_markers
+
+            # Build SEGMENT-WISE (matches AIAK encode_multiturn): mask system + every user/assistant
+            # header; supervise each assistant response + closing <|im_end|>.
+            input_ids, labels = [], []
+            seg = _enc(f"<|im_start|>system\n{system}<|im_end|>\n")
+            input_ids += seg
+            labels += [IGNORE_INDEX] * len(seg)
+            for ti, (user_c, asst_c) in enumerate(pairs):
+                user_c = str(user_c)
+                if ti == 0 and missing > 0:
+                    user_c = self.VISION * missing + "\n" + user_c
+                if "<image>" in user_c:
+                    user_c = user_c.replace("<image>", self.VISION)
+                sep = "" if ti == 0 else "\n"
+                src = _enc(f"{sep}<|im_start|>user\n{user_c}<|im_end|>\n<|im_start|>assistant\n")
+                input_ids += src
+                labels += [IGNORE_INDEX] * len(src)
+                tgt = _enc(f"{asst_c}<|im_end|>")
+                input_ids += tgt
+                labels += tgt
+
+            # Expand each single <|image_pad|> placeholder to its real token count.
+            if img_counts:
+                e_ids, e_lab, k = [], [], 0
+                for tid, lab in zip(input_ids, labels):
+                    if tid == self.IMG_PAD_ID:
+                        cnt = img_counts[k] if k < len(img_counts) else 1
+                        k += 1
+                        e_ids += [self.IMG_PAD_ID] * cnt
+                        e_lab += [IGNORE_INDEX] * cnt
+                    else:
+                        e_ids.append(tid)
+                        e_lab.append(lab)
+                input_ids, labels = e_ids, e_lab
+                if k != len(img_counts):
+                    raise SkipSample()
+
+            ids = torch.tensor(input_ids, dtype=torch.long)
+            labels = torch.tensor(labels, dtype=torch.long)
+            for vid in (self.VIS_START_ID, self.IMG_PAD_ID, self.VIS_END_ID):
+                labels[ids == vid] = IGNORE_INDEX
             if ids.shape[0] > self.seq_length:
                 raise SkipSample()
-            labels = ids.clone()
-            labels[: pt["input_ids"].shape[1]] = IGNORE_INDEX           # mask system+user+image prompt
             labels = torch.roll(labels, shifts=-1, dims=0)              # next-token shift (mcore does NOT shift)
             labels[-1] = IGNORE_INDEX
             return OV2TaskSample(
@@ -109,8 +194,8 @@ class OV2TaskEncoder(DefaultTaskEncoder):
                 __subflavors__=getattr(s, "__subflavors__", None),
                 text=ids,
                 target=labels,
-                pixel_values=ft.get("pixel_values"),
-                image_grid_thw=ft.get("image_grid_thw"),
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
             )
         except SkipSample:
             raise
