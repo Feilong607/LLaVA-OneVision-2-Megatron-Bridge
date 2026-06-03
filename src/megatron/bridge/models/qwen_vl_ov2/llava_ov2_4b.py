@@ -58,6 +58,17 @@ def _fill_init(cfg, *, perform_init: bool = True):
         cfg.init_method = init_method_normal(std)
     if getattr(cfg, "output_layer_init_method", None) is None:
         cfg.output_layer_init_method = scaled_init_method_normal(std, cfg.num_layers)
+    # Newer mcore separates embedding_init_method (and friends) from init_method; the
+    # provider __post_init__ ran with init_method=None (load_weights=False) so they stayed
+    # None. Default any remaining *_init_method field to init_method (output_layer keeps its
+    # scaled variant set above). Without this, VocabParallelEmbedding gets init_method=None.
+    for _name in dir(cfg):
+        if _name.endswith("_init_method") and _name != "output_layer_init_method":
+            if getattr(cfg, _name, None) is None:
+                try:
+                    setattr(cfg, _name, cfg.init_method)
+                except Exception:
+                    pass
     if hasattr(cfg, "perform_initialization"):
         cfg.perform_initialization = perform_init
     return cfg
@@ -116,6 +127,10 @@ class LlavaOnevision2(MegatronModule):
         self.vision_model = vision_model
         self.adapter = adapter
         self.image_token_id = image_token_id
+        # This forward assumes context_parallel_size==1 (no get_inputs_on_this_cp_rank split).
+        assert getattr(language_model.config, "context_parallel_size", 1) == 1, (
+            "LlavaOnevision2.forward assumes context_parallel_size==1; add a CP split before enabling CP."
+        )
         self.share_embeddings_and_output_weights = getattr(
             language_model, "share_embeddings_and_output_weights", False
         )
@@ -160,7 +175,13 @@ class LlavaOnevision2(MegatronModule):
             image_embeddings = self.adapter(ve)
             n_tok = (input_ids == self.image_token_id).sum().item()
             n_feat = image_embeddings.shape[0]
-            if n_feat > n_tok:  # trim ViT SP-padding overflow
+            # Without sequence-parallel there is no ViT SP-padding, so features must match tokens
+            # exactly; a mismatch here means a processor/grid bug and must be loud, not silently trimmed.
+            if not getattr(self.config, "sequence_parallel", False):
+                assert n_feat == n_tok, (
+                    f"image features {n_feat} != image tokens {n_tok} (SP off; expected exact match)"
+                )
+            if n_feat > n_tok:  # trim ViT SP-padding overflow (only expected under sequence_parallel)
                 image_embeddings = image_embeddings[:n_tok]
             elif n_feat < n_tok:
                 raise ValueError(f"image features {n_feat} < image tokens {n_tok}")
@@ -211,6 +232,7 @@ def build_llava_ov2_4b(
     recompute: bool = False,
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    load_llm_weights: bool = False,
 ) -> LlavaOnevision2:
     """Build the OV2.1-4B model (untied Qwen3-4B LLM + OV2 p16m33 vision + m33 adapter).
 
@@ -225,10 +247,20 @@ def build_llava_ov2_4b(
         get_vision_layer_spec,
     )
 
-    prov = AutoBridge.from_hf_pretrained(llm_hf_path).to_megatron_provider(load_weights=False)
+    bridge = AutoBridge.from_hf_pretrained(llm_hf_path)
+    # Always build the LLM with load_weights=False (the random/cpu-init path known to work
+    # with the bare prov.provide() below). The load_weights=True provider path loads HF
+    # weights only via a pre_wrap_hook fired by provide_distributed_model()/get_model() --
+    # NOT by prov.provide() -- so HF LLM weights are streamed in explicitly after provide().
+    prov = bridge.to_megatron_provider(load_weights=False)
     prov.tensor_model_parallel_size = tensor_model_parallel_size
     prov.pipeline_model_parallel_size = pipeline_model_parallel_size
     prov.share_embeddings_and_output_weights = False  # OV2 ckpt has a separate output_layer.weight
+    # AIAK sets scatter_embedding_sequence_parallel=False: the VLM does its own SP scatter on the
+    # fused (text+image) embeddings (see forward step 3), so the LLM embedding must NOT pre-scatter.
+    # No-op at TP=1; prevents double-scatter / layout corruption when TP>1.
+    if hasattr(prov, "scatter_embedding_sequence_parallel"):
+        prov.scatter_embedding_sequence_parallel = False
     if hasattr(prov, "use_cpu_initialization"):
         prov.use_cpu_initialization = use_cpu_init
     # grad_accum_fusion=False is needed when running OUTSIDE the Megatron DDP wrapper
@@ -240,6 +272,19 @@ def build_llava_ov2_4b(
         prov.recompute_granularity = "full"; prov.recompute_method = "uniform"; prov.recompute_num_layers = 1
     _fill_init(prov, perform_init=perform_init)
     language_model = prov.provide(pre_process=pre_process, post_process=post_process)
+    if load_llm_weights:  # stream HF Qwen3-4B weights into the freshly-built LLM (cpu params)
+        bridge.load_hf_weights([language_model])
+        # Qwen3-4B-Instruct ties input/output embeddings (no lm_head.weight in HF), but the
+        # OV2 mcore model is untied (share_embeddings_and_output_weights=False), so the
+        # output_layer was left at random init by load_hf_weights. Mirror AIAK: duplicate the
+        # input embedding into output_layer so the stitched ckpt is byte-identical to AIAK's.
+        _hf_cfg = getattr(getattr(bridge, "hf_pretrained", None), "config", None)
+        if getattr(_hf_cfg, "tie_word_embeddings", False):
+            _emb = getattr(getattr(language_model, "embedding", None), "word_embeddings", None)
+            _out = getattr(language_model, "output_layer", None)
+            if _emb is not None and _out is not None:
+                with torch.no_grad():
+                    _out.weight.copy_(_emb.weight)
     llm_cfg = language_model.config
 
     vis_cfg = _fill_init(_vision_config_from(llm_cfg), perform_init=perform_init)

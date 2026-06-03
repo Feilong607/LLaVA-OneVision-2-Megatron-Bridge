@@ -107,7 +107,7 @@ class TransformerBlock(MegatronTransformerBlock):
         else:
             fp8_context = nullcontext()
 
-        with rng_context and fp8_context:
+        with rng_context, fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == "full" and self.training:
                 hidden_states = self._checkpointed_forward(
@@ -246,7 +246,7 @@ class TransformerBlock(MegatronTransformerBlock):
         # Layer-by-layer outputs
         layer_outputs = {}
 
-        with rng_context and fp8_context:
+        with rng_context, fp8_context:
             for l_no, layer in enumerate(self.layers):
                 # Save input to this layer
                 layer_outputs[f"layer_{l_no}_input"] = hidden_states.clone()
@@ -255,7 +255,6 @@ class TransformerBlock(MegatronTransformerBlock):
                     hidden_states, context = layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
-                        attn_mask_type=attn_mask_type,
                         context=context,
                         context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,
@@ -323,7 +322,6 @@ class TransformerBlock(MegatronTransformerBlock):
                     hidden_states, context = layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
-                        attn_mask_type=attn_mask_type,
                         context=context,
                         context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,

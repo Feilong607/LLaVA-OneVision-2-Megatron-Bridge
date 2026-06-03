@@ -181,34 +181,17 @@ class EnergonMultiModalDataModule:
         else:
             task_encoder = self.validation_task_encoder
 
-        try:
-            _dataset = get_train_dataset(
-                self.path,
-                batch_size=self.micro_batch_size,
-                task_encoder=task_encoder,
-                worker_config=worker_config,
-                packing_buffer_size=self.packing_buffer_size,
-                split_part=split,
-                shuffle_buffer_size=self.shuffle_buffer_size,
-                max_samples_per_sequence=self.max_samples_per_sequence,
-                **self.kwargs,
-            )
-        except KeyError as _e:
-            if split == "val":
-                print(f"[base_energon_datamodule] val split missing in metadataset, falling back to train (got {_e})")
-                _dataset = get_train_dataset(
-                    self.path,
-                    batch_size=self.micro_batch_size,
-                    task_encoder=task_encoder,
-                    worker_config=worker_config,
-                    packing_buffer_size=self.packing_buffer_size,
-                    split_part="train",
-                    shuffle_buffer_size=self.shuffle_buffer_size,
-                    max_samples_per_sequence=self.max_samples_per_sequence,
-                    **self.kwargs,
-                )
-            else:
-                raise
+        _dataset = get_train_dataset(
+            self.path,
+            batch_size=self.micro_batch_size,
+            task_encoder=task_encoder,
+            worker_config=worker_config,
+            packing_buffer_size=self.packing_buffer_size,
+            split_part=split,
+            shuffle_buffer_size=self.shuffle_buffer_size,
+            max_samples_per_sequence=self.max_samples_per_sequence,
+            **self.kwargs,
+        )
 
         return _dataset
 

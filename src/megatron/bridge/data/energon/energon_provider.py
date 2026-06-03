@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -19,6 +20,9 @@ from torch import int_repr
 
 from megatron.bridge.data.energon.base_energon_datamodule import EnergonMultiModalDataModule
 from megatron.bridge.data.utils import DatasetBuildContext, DatasetProvider
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
@@ -35,20 +39,9 @@ class EnergonProvider(DatasetProvider):
     task_encoder: Optional[Any] = None
     # Enable batch-level online sequence packing
     pack_sequences_in_batch: bool = False
-    packing_buffer_size: Optional[int] = None
-    shuffle_buffer_size: Optional[int] = None
-    num_val_workers: Optional[int] = None
 
     def build_datasets(self, context: DatasetBuildContext):
         assert self.path, "EnergonProvider.path must be set. Use CLI override: dataset.path=<path>"
-
-        # Sync seq_length from the (already hydra-resolved) provider config onto
-        # the task encoder, which was constructed during recipe build before
-        # hydra CLI overrides applied. Without this, a custom task encoder
-        # carries the stale recipe-default seq_length.
-        if hasattr(self.task_encoder, "seq_length") and self.task_encoder.seq_length != self.seq_length:
-            print(f"[EnergonProvider] sync task_encoder.seq_length {self.task_encoder.seq_length} -> {self.seq_length}")
-            self.task_encoder.seq_length = self.seq_length
         if (
             self.pack_sequences_in_batch
             and self.task_encoder is not None
@@ -65,22 +58,20 @@ class EnergonProvider(DatasetProvider):
             global_batch_size=self.global_batch_size,
             num_workers=self.num_workers,
             pg_collection=context.pg_collection,
-            **({'packing_buffer_size': self.packing_buffer_size} if self.packing_buffer_size is not None else {}),
-            **({'shuffle_buffer_size': self.shuffle_buffer_size} if self.shuffle_buffer_size is not None else {}),
-            **({'num_val_workers': self.num_val_workers} if self.num_val_workers is not None else {}),
         )
         train_iter = iter(dataset.train_dataloader())
-        # Fall back to train if dataset has no val/test split (common for OV2 packed WDS).
+        # Datasets prepared with only a 'train' split (e.g. the original
+        # blip_laion_cc_sbu_558k_wds) have an empty/missing 'val' split, which
+        # would otherwise raise EmptyDatasetError here. Fall back to the train
+        # dataloader for val/test so the run proceeds; set validation.eval_iters=0
+        # to skip evaluation entirely.
         try:
-            from megatron.energon.flavors.webdataset.empty_dataset_error import EmptyDatasetError
-        except Exception:
-            EmptyDatasetError = Exception
-        def _safe(maker):
-            try:
-                return iter(maker())
-            except (EmptyDatasetError, KeyError, Exception) as _e:
-                print(f"[EnergonProvider] val/test split unavailable ({type(_e).__name__}: {_e}) -> fallback to train dataloader")
-                return iter(dataset.train_dataloader())
-        val_iter = _safe(dataset.val_dataloader)
-        test_iter = _safe(dataset.val_dataloader)
-        return (train_iter, val_iter, test_iter)
+            val_iter = iter(dataset.val_dataloader())
+        except Exception as e:
+            logger.warning(
+                "EnergonProvider: no usable 'val' split (%s); reusing the train "
+                "dataloader for val/test. Set validation.eval_iters=0 to skip eval.",
+                e,
+            )
+            val_iter = iter(dataset.train_dataloader())
+        return (train_iter, val_iter, val_iter)

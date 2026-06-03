@@ -185,7 +185,3 @@ slurm*.out
 
 # UV package manager
 .uv/
-
-# OV2 run outputs / checkpoints (do not commit)
-ov2_1_4b/
-*.bak
