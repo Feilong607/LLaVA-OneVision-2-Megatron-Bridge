@@ -1172,3 +1172,222 @@ def qwen3_vl_8b_peft_energon_config(peft_scheme: str | PEFT = "lora") -> ConfigC
         hf_path, cfg.model.seq_length, cfg.train.micro_batch_size, cfg.train.global_batch_size
     )
     return cfg
+
+
+# =============================================================================
+# Qwen3-VL 4B (dense) — added for A800-80GB bring-up.
+# Qwen3-VL-4B-Instruct is dense Qwen3-VL (arch Qwen3VLForConditionalGeneration,
+# model_type "qwen3_vl"): same code path as the 8B dense recipe, only the
+# hf_path differs. NOT Qwen3.5-VL (qwen35_vl_*). Local HF dir is used so no
+# network/HF_TOKEN is needed on any node.
+# =============================================================================
+QWEN3_VL_4B_HF_PATH = "/ov2/pretrain_models/Qwen3-VL-4B-Instruct"
+
+
+def qwen3_vl_4b_pretrain_mock_config(**user_kwargs: Unpack[Qwen3VLCommonKwargs]) -> ConfigContainer:
+    """Mock-data pretrain config for Qwen3-VL 4B (dense). Fastest smoke test (no real data)."""
+    recommended_kwargs: Qwen3VLCommonKwargs = {
+        "hf_path": QWEN3_VL_4B_HF_PATH,
+        "tensor_model_parallel_size": 2,
+        "pipeline_model_parallel_size": 1,
+        "expert_model_parallel_size": 1,
+        "freeze_language_model": True,
+        "freeze_vision_model": True,
+        "freeze_vision_projection": False,
+    }
+    combined_kwargs: Qwen3VLCommonKwargs = {**recommended_kwargs, **user_kwargs}
+    return _qwen3_vl_common(**combined_kwargs)
+
+
+def qwen3_vl_4b_sft_config() -> ConfigContainer:
+    """Full SFT config for Qwen3-VL 4B (dense). 1 node, 8 GPUs, TP=2/PP=1 (DP=4)."""
+    cfg = _sft_common_vlm()
+
+    hf_path = QWEN3_VL_4B_HF_PATH
+    cfg.model = AutoBridge.from_hf_pretrained(hf_path).to_megatron_provider(load_weights=False)
+    cfg.model.seq_length = 4096
+
+    # Parallel settings (dense 4B: heads 32 / KV 8 -> TP=2 valid)
+    cfg.model.tensor_model_parallel_size = 2
+    cfg.model.pipeline_model_parallel_size = 1
+    cfg.model.pipeline_dtype = None
+    cfg.model.virtual_pipeline_model_parallel_size = None
+    cfg.model.context_parallel_size = 1
+    cfg.model.sequence_parallel = False
+
+    # VLM full finetune (train everything)
+    cfg.model.freeze_language_model = False
+    cfg.model.freeze_vision_model = False
+    cfg.model.freeze_vision_projection = False
+
+    # Dense model: no MoE
+    cfg.model.moe_token_dispatcher_type = None
+    cfg.model.moe_flex_dispatcher_backend = None
+    cfg.model.moe_hybridep_num_sms = 16
+    apply_flex_dispatcher_backend(cfg.model, moe_flex_dispatcher_backend=None)
+
+    cfg.model.transformer_impl = "transformer_engine"
+    cfg.model.cuda_graph_impl = "none"
+    cfg.model.cuda_graph_scope = "full"
+    cfg.model.cuda_graph_warmup_steps = 3
+    cfg.model.attention_backend = "auto"
+    cfg.model.cross_entropy_loss_fusion = True
+    cfg.model.cross_entropy_fusion_impl = "native"
+    cfg.model.moe_router_fusion = False
+    cfg.model.moe_permute_fusion = False
+    cfg.model.moe_grouped_gemm = False
+    cfg.model.recompute_granularity = None
+    cfg.model.recompute_modules = None
+    cfg.model.fine_grained_activation_offloading = False
+    cfg.model.offload_modules = None
+    cfg.model.moe_shared_expert_overlap = False
+    cfg.model.moe_router_force_load_balancing = False
+    cfg.model.moe_router_padding_for_fp8 = False
+
+    cfg.train.train_iters = 100
+    cfg.train.global_batch_size = 16
+    cfg.train.micro_batch_size = 1
+    cfg.train.manual_gc = True
+    cfg.train.manual_gc_interval = 100
+    cfg.train.manual_gc_eval = 100
+
+    cfg.validation.eval_interval = 500
+    cfg.validation.eval_iters = 10
+
+    # Lower LR for full SFT of a small model
+    opt_cfg, scheduler_cfg = distributed_fused_adam_with_cosine_annealing(
+        lr_warmup_iters=10,
+        lr_decay_iters=100,
+        max_lr=5e-6,
+        min_lr=5e-7,
+    )
+    cfg.optimizer = opt_cfg
+    cfg.scheduler = scheduler_cfg
+    cfg.optimizer.use_precision_aware_optimizer = False
+    cfg.optimizer.main_grads_dtype = torch.float32
+    cfg.optimizer.main_params_dtype = torch.float32
+    cfg.optimizer.exp_avg_dtype = torch.float32
+    cfg.optimizer.exp_avg_sq_dtype = torch.float32
+
+    cfg.dataset.seq_length = 4096
+    cfg.dataset.hf_processor_path = hf_path
+
+    cfg.ddp.overlap_grad_reduce = False
+    cfg.ddp.overlap_param_gather = False
+    cfg.ddp.check_for_nan_in_grad = True
+    cfg.ddp.use_distributed_optimizer = True
+    cfg.ddp.grad_reduce_in_fp32 = True
+    cfg.ddp.average_in_collective = True
+    cfg.ddp.data_parallel_sharding_strategy = "optim_grads_params"
+
+    cfg.comm_overlap = None
+    cfg.mixed_precision = "bf16_mixed"
+    return cfg
+
+
+def qwen3_vl_4b_peft_config(peft_scheme: str | PEFT = "lora") -> ConfigContainer:
+    """LoRA/DoRA PEFT config for Qwen3-VL 4B (dense). TP=1/PP=1 (DP=8)."""
+    cfg = _peft_common_vlm()
+    if isinstance(peft_scheme, str) and peft_scheme.lower() in ["lora", "dora"]:
+        cfg.peft = default_peft_config(peft_scheme)
+    else:
+        cfg.peft = peft_scheme
+
+    hf_path = QWEN3_VL_4B_HF_PATH
+    cfg.model = AutoBridge.from_hf_pretrained(hf_path).to_megatron_provider(load_weights=False)
+    cfg.model.seq_length = 4096
+
+    cfg.model.tensor_model_parallel_size = 1
+    cfg.model.pipeline_model_parallel_size = 1
+    cfg.model.pipeline_dtype = None
+    cfg.model.virtual_pipeline_model_parallel_size = None
+    cfg.model.context_parallel_size = 1
+    cfg.model.sequence_parallel = False
+
+    cfg.model.freeze_language_model = False
+    cfg.model.freeze_vision_model = False
+    cfg.model.freeze_vision_projection = False
+
+    cfg.model.moe_token_dispatcher_type = None
+    cfg.model.moe_flex_dispatcher_backend = None
+    cfg.model.moe_hybridep_num_sms = 16
+    apply_flex_dispatcher_backend(cfg.model, moe_flex_dispatcher_backend=None)
+
+    cfg.model.transformer_impl = "transformer_engine"
+    cfg.model.cuda_graph_impl = "none"
+    cfg.model.cuda_graph_scope = "full"
+    cfg.model.cuda_graph_warmup_steps = 3
+    cfg.model.attention_backend = "auto"
+    cfg.model.cross_entropy_loss_fusion = True
+    cfg.model.cross_entropy_fusion_impl = "native"
+    cfg.model.moe_router_fusion = False
+    cfg.model.moe_permute_fusion = False
+    cfg.model.moe_grouped_gemm = False
+    cfg.model.recompute_granularity = None
+    cfg.model.recompute_modules = None
+    cfg.model.fine_grained_activation_offloading = False
+    cfg.model.offload_modules = None
+    cfg.model.moe_shared_expert_overlap = False
+    cfg.model.moe_router_force_load_balancing = False
+    cfg.model.moe_router_padding_for_fp8 = False
+
+    cfg.train.train_iters = 100
+    cfg.train.global_batch_size = 16
+    cfg.train.micro_batch_size = 1
+    cfg.train.manual_gc = True
+    cfg.train.manual_gc_interval = 100
+    cfg.train.manual_gc_eval = 100
+
+    cfg.validation.eval_interval = 500
+    cfg.validation.eval_iters = 10
+
+    opt_cfg, scheduler_cfg = distributed_fused_adam_with_cosine_annealing(
+        lr_warmup_iters=10,
+        lr_decay_iters=100,
+        max_lr=1e-4,
+        min_lr=1e-5,
+    )
+    cfg.optimizer = opt_cfg
+    cfg.scheduler = scheduler_cfg
+    cfg.optimizer.use_precision_aware_optimizer = False
+    cfg.optimizer.main_grads_dtype = torch.float32
+    cfg.optimizer.main_params_dtype = torch.float32
+    cfg.optimizer.exp_avg_dtype = torch.float32
+    cfg.optimizer.exp_avg_sq_dtype = torch.float32
+
+    cfg.dataset.seq_length = 4096
+    cfg.dataset.hf_processor_path = hf_path
+
+    cfg.ddp.overlap_grad_reduce = False
+    cfg.ddp.overlap_param_gather = False
+    cfg.ddp.check_for_nan_in_grad = True
+    cfg.ddp.use_distributed_optimizer = True
+    cfg.ddp.grad_reduce_in_fp32 = True
+    cfg.ddp.average_in_collective = True
+    cfg.ddp.data_parallel_sharding_strategy = "optim_grads_params"
+
+    cfg.comm_overlap = None
+    cfg.mixed_precision = "bf16_mixed"
+    return cfg
+
+
+def qwen3_vl_4b_sft_energon_config() -> ConfigContainer:
+    """Full SFT for Qwen3-VL 4B using an Energon ChatML dataset.
+
+    Same as qwen3_vl_4b_sft_config but swaps in a QwenVLEnergonProvider (carries
+    the QwenVLTaskEncoder). Use with: --dataset vlm-energon dataset.path=<.nv-meta dir>.
+    """
+    cfg = qwen3_vl_4b_sft_config()
+    cfg.dataset = _make_energon_dataset(
+        QWEN3_VL_4B_HF_PATH, cfg.model.seq_length, cfg.train.micro_batch_size, cfg.train.global_batch_size
+    )
+    return cfg
+
+
+def qwen3_vl_4b_peft_energon_config(peft_scheme: str | PEFT = "lora") -> ConfigContainer:
+    """LoRA PEFT for Qwen3-VL 4B using an Energon ChatML dataset."""
+    cfg = qwen3_vl_4b_peft_config(peft_scheme=peft_scheme)
+    cfg.dataset = _make_energon_dataset(
+        QWEN3_VL_4B_HF_PATH, cfg.model.seq_length, cfg.train.micro_batch_size, cfg.train.global_batch_size
+    )
+    return cfg

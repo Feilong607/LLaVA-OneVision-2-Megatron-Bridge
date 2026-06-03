@@ -261,20 +261,6 @@ def forward_step(
         force_to_pad_to_seq_len=this_pg_collection.pp.size() > 1 or this_pg_collection.ep.size() > 1,
         seq_length=config.seq_length,
     )
-    # Accumulate FLOPS metadata across micro-batches (mirrors vlm_step).
-    # Each micro-batch contributes its actual padded seq_length. Without this,
-    # Bridge falls back to assumed batch*seq_length and over-counts MFU.
-    if tokens is not None:
-        _mbs = tokens.shape[0]
-        _seq_len = tokens.shape[1]
-        state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + _mbs * _seq_len
-        state._flops_seqlen_sq_sum = getattr(state, "_flops_seqlen_sq_sum", 0) + _mbs * _seq_len * _seq_len
-    if multi_modal_inputs is not None:
-        for _attr in ("image_grid_thw", "video_grid_thw"):
-            _grid = multi_modal_inputs.get(_attr) if isinstance(multi_modal_inputs, dict) else getattr(multi_modal_inputs, _attr, None)
-            if _grid is not None and _grid.numel() > 0:
-                state._flops_vision_patches = getattr(state, "_flops_vision_patches", 0) + int(_grid.prod(dim=-1).sum().item())
-
     forward_args = {
         "input_ids": tokens,
         "labels": labels,
