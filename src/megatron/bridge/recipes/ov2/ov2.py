@@ -32,10 +32,11 @@ from megatron.bridge.training.config import ConfigContainer
 OV2_LLM_HF = "/ov2/pretrain_models/Qwen3-4B-Instruct-2507"
 OV2_MCORE_CKPT = "/ov2/pretrain_models/lmms-lab/LLaVA-OneVision-2-4B-p16m33-mcore-tp1-pp1"
 OV2_HF_PROC = "/ov2/pretrain_models/lmms-lab/LLaVA-OneVision-2-4B-p16m33"
-# AIAK date0511 stage-1 (adapter-only) mcore ckpt — the reference stage-1 the dev-clone aligned to.
-# Stage-2 inits from this KNOWN-GOOD trained adapter (load_ov2_adapter=True) to remove any doubt
-# about the stage-1. Dir holds release/mp_rank_00/model_optim_rng.pt + latest_checkpointed_iteration.txt.
-AIAK_STAGE1_CKPT = "/vlm/yinxie/code/OV2/OV2_public_main/checkpoints/date0511-LLaVA-OneVision-2-4B-p16m33-mcore-tp1-pp1-stage1-alignment-adapter-only/ax_stage_1_alignment_p16m3_adapter_only"
+# Stage-1 the AIAK date0523 stage-2 ACTUALLY chains from (its .sh CHECKPOINT_PATH): the date0513
+# "corrected Muon stage-1 vit-adapter" — trains BOTH the vision tower and the adapter (Muon), so
+# stage-2 starts from a TRAINED vit (-> aligns to ~1.27). NOT date0511 (adapter-only, vit frozen at
+# the OV2 base -> stage-2 plateaus ~1.5). mcore dir: release/mp_rank_00 + latest_checkpointed_iteration.txt.
+AIAK_STAGE1_CKPT = "/vlm/yinxie/code/OV2/OV2_public_main/checkpoints/date0513-corrected-muon-stage1-vit-adapter/date0511_ax_stage_1_alignment_p16m3_packed_new16_muon"
 N_SAMPLES = 558128
 SEQ_LEN = 32000
 
@@ -50,6 +51,11 @@ class OV2EnergonProvider(EnergonProvider):
 
     tokenizer: Optional[Any] = None
     dataloader_save: Optional[str] = None
+    # Energon's default shuffle_buffer_size is only 100 — far too small for 558k samples sharded
+    # across many DP ranks (each rank reads few tar shards; a 100-sample window barely mixes across
+    # them). The adapter-only stage-1 is hyper-sensitive to early-batch diversity, so at 16 ranks the
+    # tiny buffer left the run ~0.35 above AIAK. Raise it (set in _make_ov2_energon_dataset).
+    shuffle_buffer_size: int = 100
 
     def build_datasets(self, context: DatasetBuildContext):
         from megatron.bridge.data.energon.base_energon_datamodule import EnergonMultiModalDataModule
@@ -67,6 +73,7 @@ class OV2EnergonProvider(EnergonProvider):
             micro_batch_size=self.micro_batch_size,
             global_batch_size=self.global_batch_size,
             num_workers=self.num_workers,
+            shuffle_buffer_size=self.shuffle_buffer_size,
             pg_collection=context.pg_collection,
         )
         train_loader = dataset.train_dataloader()
@@ -84,6 +91,7 @@ class OV2EnergonProvider(EnergonProvider):
 def _make_ov2_energon_dataset(
     hf_processor_path: str, seq_length: int, micro_batch_size: int, global_batch_size: int,
     dataloader_save: Optional[str] = None,
+    num_workers: int = 2, shuffle_buffer_size: int = 100,   # original/safe defaults (small samples + buffer)
 ) -> OV2EnergonProvider:
     from megatron.bridge.recipes.ov2.data.energon.task_encoder import OV2TaskEncoder
 
@@ -94,7 +102,9 @@ def _make_ov2_energon_dataset(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
         global_batch_size=global_batch_size,
-        num_workers=2,
+        num_workers=num_workers,                  # per-stage: stage-1/blip uses 4 (1 shard/worker across 64
+        shuffle_buffer_size=shuffle_buffer_size,  # shards) + buffer 2000; stage-2/llava_next keeps 2/100
+                                                  # (samples ~10x larger -> a big buffer OOMs the host)
         dataloader_type="external",
         task_encoder=te,
         pack_sequences_in_batch=False,
@@ -164,6 +174,7 @@ def ov2_1_stage1_adapter_only_config() -> ConfigContainer:
         micro_batch_size=cfg.train.micro_batch_size,
         global_batch_size=cfg.train.global_batch_size,
         dataloader_save=cfg.checkpoint.save,      # activates maybe_save_dataloader_state
+        num_workers=4, shuffle_buffer_size=2000,  # blip 16-rank diversity fix (small samples -> mem-safe)
     )
 
     # ---- Token-weighted loss (AIAK): loss = sum(token losses)/sum(tokens) over DP+grad-accum.
