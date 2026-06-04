@@ -121,6 +121,24 @@ class LlavaOnevision2Provider(GPTModelProvider):
                 freeze_vision_model=self.freeze_vision_model,
                 freeze_adapter=self.freeze_adapter,
             )
+
+        # --- CRITICAL multi-node grad-normalization fix ---
+        # LlavaOnevision2.__init__ does super().__init__(config=language_model.config), so the
+        # RUNTIME config the schedule reads (get_model_config(model) == model.config) is the LLM's
+        # config object -- NOT this provider (cfg.model). setup.py's _update_model_config_funcs sets
+        # calculate_per_token_loss / finalize_model_grads_func on cfg.model, which therefore never
+        # reach the runtime config for this custom multimodal model. Result: at runtime
+        # calc_ptl=False + finalize_func=None -> the recipe's token-weighted GLOBAL normalization is
+        # bypassed; a fallback divides loss by the LOCAL per-rank token count, which is correct
+        # intra-node (single-node aligns ~3.07) but mis-scales the gradient ~10x across 2 nodes
+        # (grad norm ~11 vs AIAK/single ~1.3). Set them on model.config HERE (before DDP wrap, so the
+        # DDP also picks up calc_ptl -> gradient_scaling_factor=1.0). pg_collection=None makes
+        # finalize_model_grads all-reduce num_tokens over the FULL data-parallel group (all ranks,
+        # both nodes) -> correct global normalization (matches AIAK).
+        from functools import partial as _partial
+        from megatron.core.distributed.finalize_model_grads import finalize_model_grads as _finalize_model_grads
+        model.config.calculate_per_token_loss = bool(getattr(self, "calculate_per_token_loss", False))
+        model.config.finalize_model_grads_func = _partial(_finalize_model_grads, pg_collection=None)
         return model
 
     # ------------------------------------------------------------------ #
