@@ -659,6 +659,24 @@ def _build_moe_metric_writer(
     return _MoeMetricFanoutWriter(tb_writer, comet_logger, mlflow_logger)
 
 
+def _mfu_suffix(per_gpu_tf: float) -> str:
+    """Return " MFU: XX.X%" from the achieved MODEL_TFLOP/s/GPU, or "" if peak<=0.
+
+    MFU = achieved model TFLOP/s/GPU / hardware BF16 peak. Peak from env MFU_PEAK_TFLOPS
+    (default 312 = A100/A800; H100 = 989; GB200 bf16 ~= 2250). Reuses Bridge
+    num_floating_point_operations, which for the OV2 step is NOT THD/packing-aware
+    (ov2_step feeds padded seq_len**2) and counts full fwd+bwd even when params are frozen,
+    so MFU can read high (>100%) on vision-heavy / long-packed runs — treat as upper bound.
+    """
+    try:
+        peak = float(os.environ.get("MFU_PEAK_TFLOPS", "312"))
+    except (TypeError, ValueError):
+        return ""
+    if peak <= 0:
+        return ""
+    return f" MFU: {100.0 * per_gpu_tf / peak:.1f}%"
+
+
 def training_log(
     loss_dict: dict[str, torch.Tensor],
     total_loss_dict: dict[str, Any],
@@ -1132,6 +1150,7 @@ def training_log(
             per_gpu_tf = num_flops / elapsed_time_per_iteration / get_world_size_safe() / 1e12
             print_rank_0(
                 f"Step Time : {elapsed_time_per_iteration:.2f}s GPU utilization: {per_gpu_tf:.1f}MODEL_TFLOP/s/GPU"
+                + _mfu_suffix(per_gpu_tf)
             )
 
         # throughput
@@ -1178,6 +1197,9 @@ def training_log(
 
         if num_flops is not None and logger_config.log_throughput:
             log_string += f" throughput per GPU (TFLOP/s/GPU): {per_gpu_tf:.1f} |"
+            _mfu = _mfu_suffix(per_gpu_tf)
+            if _mfu:
+                log_string += f"{_mfu} |"
 
         if energy_monitor is not None:
             energy = (energy_monitor.lap() / total_iterations) / get_world_size_safe()

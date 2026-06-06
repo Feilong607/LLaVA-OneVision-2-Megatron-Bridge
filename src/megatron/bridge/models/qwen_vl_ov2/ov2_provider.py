@@ -147,7 +147,7 @@ class LlavaOnevision2Provider(GPTModelProvider):
 
     # ------------------------------------------------------------------ #
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> MegatronModule:
-        from megatron.bridge.models.qwen_vl_ov2.llava_ov2_4b import build_llava_ov2
+        from megatron.bridge.models.qwen_vl_ov2.llava_ov2 import build_llava_ov2
 
         pre = True if pre_process is None else pre_process
         post = True if post_process is None else post_process
@@ -237,7 +237,7 @@ class LlavaOnevision2Provider(GPTModelProvider):
                 except Exception:
                     pass
             assert len(model_list) == 1, "OV2 stitch-load assumes PP=1 single chunk"
-            from megatron.bridge.models.qwen_vl_ov2.llava_ov2_4b import load_ov2_mcore_checkpoint
+            from megatron.bridge.models.qwen_vl_ov2.llava_ov2 import load_ov2_mcore_checkpoint
 
             summary = load_ov2_mcore_checkpoint(
                 model_list[0], ckpt, load_adapter=load_adapter, load_vision=load_vision

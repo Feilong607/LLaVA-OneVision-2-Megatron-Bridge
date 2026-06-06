@@ -44,7 +44,9 @@ class EnergonMultiModalDataModule:
     pin_memory (bool): Whether to pin memory in the DataLoader.
     multimodal_sample_config (MultiModalSampleConfig): Configuration object for multimodal samples.
     task_encoder (MultiModalTaskEncoder): Encoder responsible for encoding and batching samples.
-    init_global_step (int): The initial global step for the trainer, used for resuming training.
+    dataloader_load (Optional[str]): On a genuine resume, the checkpoint dir to restore the energon
+    stream position from (per-DP-rank dprank state via _maybe_restore_dataloader_state). None = start
+    fresh from the shuffle start (e.g. a cold start from a prior-stage / pretrained checkpoint).
     train_dataloader_object (Optional): The DataLoader object for training data.
     val_dataloader_object (Optional): The DataLoader object for validation data.
     """
@@ -113,7 +115,6 @@ class EnergonMultiModalDataModule:
         self.shuffle_buffer_size = shuffle_buffer_size
         self.max_samples_per_sequence = max_samples_per_sequence
         self.task_encoder = task_encoder
-        self.init_global_step = 0
         self.train_dataloader_object = None
         self.val_dataloader_object = None
         self.packing_buffer_size = packing_buffer_size
@@ -211,7 +212,10 @@ class EnergonMultiModalDataModule:
         TRAIN_DATALOADERS: The DataLoader for the training dataset.
         """
 
-        logger.info(f"Multimodal train dataloader initializing with init_global_step {self.init_global_step}")
+        logger.info(
+            "Multimodal train dataloader initializing (%s)",
+            "resume: will restore stream position" if self.dataloader_load else "fresh: from shuffle start",
+        )
         if self.train_dataloader_object:
             return self.train_dataloader_object
         worker_config = self._build_worker_config(self.num_workers, split="train")

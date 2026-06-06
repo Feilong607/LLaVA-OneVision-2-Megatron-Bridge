@@ -58,4 +58,17 @@ class MultiMixQASample(Sample):
         return self.video
 
 
-__all__ = ["MultiMixQASample"]
+@dataclass
+class PackedCaptioningSample(Sample):
+    """Offline-packed multi-image captioning sample (mirrors AIAK PackedCaptioningSample).
+    One energon sample = N sub-samples: images[sample_idx][img_idx], prompts[i], captions[i]."""
+
+    images: List
+    prompts: Optional[List] = None
+    captions: Optional[List] = None
+    patch_positions: Optional[List] = None
+    fps: Optional[List] = None
+    timestamp_decimal: Optional[List] = None
+
+
+__all__ = ["MultiMixQASample", "PackedCaptioningSample"]

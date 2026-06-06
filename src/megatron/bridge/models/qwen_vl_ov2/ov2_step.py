@@ -13,6 +13,7 @@ Assumes TP/PP/CP = 1 (LlavaOnevision2.forward asserts CP==1) and no sequence pac
 qwen3_vl_step there is no pack_or_pad / cp-split here.
 """
 import logging
+import os
 from typing import Iterable
 
 import torch
@@ -37,9 +38,10 @@ def get_batch(data_iterator: Iterable):
     attention_mask = _cuda(batch.get("attention_mask"))
     pixel_values = _cuda(batch.get("pixel_values"))
     image_grid_thw = _cuda(batch.get("image_grid_thw"))
+    cu_seqlens = _cuda(batch.get("cu_seqlens"))
     if pixel_values is not None and pixel_values.dtype == torch.float32:
         pixel_values = pixel_values.to(torch.bfloat16)  # match bf16 weights (vision tower)
-    return tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw
+    return tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw, cu_seqlens
 
 
 def forward_step(
@@ -56,18 +58,34 @@ def forward_step(
     """
     timers = state.timers
     timers("batch-generator", log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw = get_batch(data_iterator)
+    tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw, cu_seqlens = get_batch(data_iterator)
     timers("batch-generator").stop()
 
-    # Accumulate FLOPS metadata across micro-batches (mirrors vlm_step.forward_step). Each
-    # micro-batch contributes its ACTUAL padded seq_length (not cfg.model.seq_length). train.py
-    # resets these before each step and reads them after; without this the throughput logger
-    # assumes every sample is the full padded seq_length -> MODEL_TFLOP/s exceeds hardware peak.
+    # THD block-diagonal packed attention when the task encoder emitted segment boundaries
+    # (offline-packed data, e.g. PackedCaptioningSample). OV2_PACK_FULL_CAUSAL=1 instead runs ONE
+    # full-causal sequence over the whole pack (later sub-samples see earlier ones).
+    packed_seq_params = None
+    if cu_seqlens is not None and os.environ.get("OV2_PACK_FULL_CAUSAL", "0") != "1":
+        from megatron.core.packed_seq_params import PackedSeqParams
+        cu = cu_seqlens.to(torch.int32)
+        seglens = cu[1:] - cu[:-1]
+        msl = int(seglens.max().item()) if seglens.numel() > 0 else int(tokens.shape[1])
+        packed_seq_params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                                            max_seqlen_q=msl, max_seqlen_kv=msl)
+
+    # FLOPS metadata. Packed attention is O(Sum Li^2) over per-sub-sample lengths (block-diagonal),
+    # NOT O((Sum Li)^2) -> feed the REAL Sum Li / Sum Li^2 so MODEL_TFLOP/s and the MFU line are not
+    # inflated. Non-packed falls back to mbs * padded seq_len.
     if tokens is not None:
         mbs = tokens.shape[0]
         seq_len = tokens.shape[1]
-        state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + mbs * seq_len
-        state._flops_seqlen_sq_sum = getattr(state, "_flops_seqlen_sq_sum", 0) + mbs * seq_len**2
+        if cu_seqlens is not None:
+            _sl = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.float64)
+            state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + int(_sl.sum().item())
+            state._flops_seqlen_sq_sum = getattr(state, "_flops_seqlen_sq_sum", 0) + int((_sl * _sl).sum().item())
+        else:
+            state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + mbs * seq_len
+            state._flops_seqlen_sq_sum = getattr(state, "_flops_seqlen_sq_sum", 0) + mbs * seq_len**2
     if image_grid_thw is not None and image_grid_thw.numel() > 0:
         state._flops_vision_patches = getattr(state, "_flops_vision_patches", 0) + int(
             image_grid_thw.prod(dim=-1).sum().item()
@@ -80,6 +98,7 @@ def forward_step(
         position_ids=None,        # LlavaOnevision2 / Qwen3 LLM compute positions internally
         attention_mask=attention_mask,
         labels=labels,            # PRE-SHIFTED by the task encoder; mcore does not shift
+        packed_seq_params=packed_seq_params,   # THD block-diagonal when offline-packed (else None)
     )
 
     check_nan = state.cfg.rerun_state_machine.check_for_nan_in_loss

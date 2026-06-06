@@ -47,6 +47,7 @@ class OV2TaskSample:
     target: torch.Tensor                     # next-token labels (rolled -1, prompt masked)
     pixel_values: Optional[torch.Tensor] = None
     image_grid_thw: Optional[torch.Tensor] = None
+    cu_seqlens: Optional[torch.Tensor] = None        # packed: per-sub-sample boundaries; None=non-packed
 
 
 @dataclass
@@ -59,6 +60,7 @@ class OV2TaskBatch(Batch):
     attention_mask: Optional[torch.Tensor]
     pixel_values: Optional[torch.Tensor]
     image_grid_thw: Optional[torch.Tensor]
+    cu_seqlens: Optional[torch.Tensor] = None
 
 
 class OV2TaskEncoder(DefaultTaskEncoder):
@@ -94,8 +96,78 @@ class OV2TaskEncoder(DefaultTaskEncoder):
     VIS_START_ID = 151652
     VIS_END_ID = 151653
 
-    def encode_sample(self, s) -> OV2TaskSample:
+    def encode_sample(self, s):
+        # Offline-packed captioning (e.g. seed85m PackedCaptioningSample): one energon sample is N
+        # sub-samples already packed together. Encode each sub-sample with the verified MultiMix path,
+        # concatenate into ONE sequence, and emit per-sub-sample cu_seqlens so ov2_step builds THD
+        # block-diagonal attention. Non-packed MultiMixQASample is unchanged.
+        if type(s).__name__ == "PackedCaptioningSample":
+            return self._encode_packed(s)
+        return self._encode_multimix(s)
+
+    def _encode_packed(self, s) -> OV2TaskSample:
+        from types import SimpleNamespace
+        n = len(getattr(s, "images", []) or [])
+        if n == 0:
+            raise SkipSample()
+        prompts = getattr(s, "prompts", None)
+        captions = getattr(s, "captions", None)
+        subs = []
+        for i in range(n):
+            ca = captions[i] if (captions is not None and i < len(captions)) else None
+            if ca is None:
+                continue
+            pr = prompts[i] if (prompts is not None and i < len(prompts)) else ""
+            pr = [pr] if isinstance(pr, str) else list(pr)
+            ca = [ca] if isinstance(ca, str) else list(ca)
+            msgs = []
+            for p, c in zip(pr, ca):
+                msgs.append({"role": "user", "content": p})
+                msgs.append({"role": "assistant", "content": c})
+            imgs_i = s.images[i]
+            if imgs_i is None:
+                imgs_i = []
+            elif not isinstance(imgs_i, list):
+                imgs_i = [imgs_i]
+            syn = SimpleNamespace(messages=msgs, system=None, image=imgs_i,
+                                  __key__=f"{getattr(s, '__key__', '?')}.sub{i:03d}",
+                                  __subflavors__=getattr(s, "__subflavors__", None))
+            try:
+                subs.append(self._encode_multimix(syn))
+            except SkipSample:
+                continue
+        if not subs:
+            raise SkipSample()
+        # Keep whole sub-samples until the seq_length budget is exhausted (preserve boundaries).
+        texts, targs, kept_pvs, kept_grids, cu = [], [], [], [], [0]
+        total = 0
+        for t in subs:
+            L = int(t.text.shape[0])
+            if total + L > self.seq_length:
+                break
+            texts.append(t.text)
+            targs.append(t.target)
+            if t.pixel_values is not None:
+                kept_pvs.append(t.pixel_values)
+            if t.image_grid_thw is not None:
+                kept_grids.append(t.image_grid_thw)
+            total += L
+            cu.append(total)
+        if len(texts) == 0:
+            raise SkipSample()
+        return OV2TaskSample(
+            __key__=getattr(s, "__key__", "?"),
+            __subflavors__=getattr(s, "__subflavors__", None),
+            text=torch.cat(texts, dim=0),
+            target=torch.cat(targs, dim=0),
+            pixel_values=torch.cat(kept_pvs, dim=0) if kept_pvs else None,
+            image_grid_thw=torch.cat(kept_grids, dim=0) if kept_grids else None,
+            cu_seqlens=torch.tensor(cu, dtype=torch.int32),
+        )
+
+    def _encode_multimix(self, s) -> OV2TaskSample:
         try:
+
             msgs = s.messages or []
             # Split optional system; collect user/assistant turns in order.
             system = None
@@ -252,6 +324,7 @@ class OV2TaskEncoder(DefaultTaskEncoder):
             attention_mask=None,                       # mcore builds causal mask
             pixel_values=torch.cat(pvs, dim=0) if pvs else None,
             image_grid_thw=torch.cat(grids, dim=0) if grids else None,
+            cu_seqlens=(samples[0].cu_seqlens if (n == 1 and samples[0].cu_seqlens is not None) else None),
         )
 
     def encode_batch(self, batch: OV2TaskBatch) -> dict:
@@ -263,4 +336,5 @@ class OV2TaskEncoder(DefaultTaskEncoder):
             "attention_mask": batch.attention_mask,
             "pixel_values": batch.pixel_values,
             "image_grid_thw": batch.image_grid_thw,
+            "cu_seqlens": batch.cu_seqlens,
         }
