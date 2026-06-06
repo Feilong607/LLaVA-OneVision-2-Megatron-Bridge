@@ -221,7 +221,9 @@ class EnergonMultiModalDataModule:
         worker_config = self._build_worker_config(self.num_workers, split="train")
         train_dataset = self.datasets_provider(worker_config, split="train")
         energon_dataloader = get_savable_loader(train_dataset, worker_config=worker_config)
+        logger.warning("[energon DEBUG] train_dataloader BUILD reached get_savable_loader; dataloader_load=%r; calling _maybe_restore now", self.dataloader_load)
         self._maybe_restore_dataloader_state(energon_dataloader)
+        logger.warning("[energon DEBUG] train_dataloader BUILD: _maybe_restore returned")
         self.train_dataloader_object = energon_dataloader
         return EnergonDataloader(self.train_dataloader_object)
 
@@ -268,7 +270,7 @@ class EnergonMultiModalDataModule:
             )
             return
         try:
-            state = torch.load(state_path, map_location="cpu")
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
             energon_loader.restore_state_rank(state["dataloader_state_dict"])
             logger.info("[energon resume] restored dataloader state from %s", state_path)
         except Exception as e:  # noqa: BLE001 - fail safe to fresh data, never crash resume
