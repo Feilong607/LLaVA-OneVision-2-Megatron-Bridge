@@ -340,6 +340,17 @@ def setup(
     if "pg_collection" in inspect.signature(train_valid_test_datasets_provider).parameters:
         train_valid_test_datasets_provider = partial(train_valid_test_datasets_provider, pg_collection=pg_collection)
 
+    # Resume the Energon dataloader stream position ONLY on a genuine checkpoint resume
+    # (cfg.checkpoint.load), never on a pretrained/finetune load (cfg.checkpoint.pretrained_checkpoint),
+    # which would wrongly restore the data position from a prior stage. Set at RUNTIME here so the
+    # CLI-overridden checkpoint.load is used (capturing it at recipe-build time grabs a stale default).
+    if hasattr(cfg.dataset, "dataloader_load"):
+        cfg.dataset.dataloader_load = (
+            cfg.checkpoint.load
+            if (cfg.checkpoint.load is not None and checkpoint_exists(cfg.checkpoint.load))
+            else None
+        )
+
     train_data_iterator, valid_data_iterator, test_data_iterator = setup_data_iterators(
         cfg=cfg,
         train_state=state.train_state,

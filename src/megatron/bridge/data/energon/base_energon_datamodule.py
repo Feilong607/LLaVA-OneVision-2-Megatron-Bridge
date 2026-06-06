@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import logging
+import os
 from typing import Any, Literal, Optional
+
+import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.energon import WorkerConfig, get_savable_loader, get_train_dataset
@@ -65,6 +68,7 @@ class EnergonMultiModalDataModule:
         packing_buffer_size: Optional[int] = None,
         validation_task_encoder: Optional[Any] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        dataloader_load: Optional[str] = None,
         **kwargs,
     ) -> None:
         """
@@ -116,6 +120,7 @@ class EnergonMultiModalDataModule:
         self.validation_task_encoder = validation_task_encoder or self.task_encoder
         self.num_val_workers = num_val_workers or self.num_workers
         self.pg_collection = pg_collection
+        self.dataloader_load = dataloader_load
         self.kwargs = kwargs
 
     def _build_worker_config(self, num_workers: int, split: str = "train") -> WorkerConfig:
@@ -212,8 +217,52 @@ class EnergonMultiModalDataModule:
         worker_config = self._build_worker_config(self.num_workers, split="train")
         train_dataset = self.datasets_provider(worker_config, split="train")
         energon_dataloader = get_savable_loader(train_dataset, worker_config=worker_config)
+        self._maybe_restore_dataloader_state(energon_dataloader)
         self.train_dataloader_object = energon_dataloader
         return EnergonDataloader(self.train_dataloader_object)
+
+    def _maybe_restore_dataloader_state(self, energon_loader) -> None:
+        """Restore the Energon dataloader stream position on a genuine checkpoint resume.
+
+        On resume (cfg.checkpoint.load) the training counters are restored but the Energon stream
+        would otherwise rebuild from scratch and re-read data from the start. Reload the per-DP-rank
+        state written by maybe_save_dataloader_state and call restore_state_rank BEFORE the loader is
+        iterated. Fail-safe: if state is missing or the DP/worker topology changed since save, log a
+        warning and let data start fresh (never crash the resume).
+        """
+        load_dir = self.dataloader_load
+        if not load_dir:
+            return
+        tracker = os.path.join(load_dir, "latest_checkpointed_iteration.txt")
+        if not os.path.exists(tracker):
+            logger.warning("[energon resume] tracker %s not found; data starts from scratch", tracker)
+            return
+        with open(tracker) as f:
+            tok = f.read().strip()
+        try:
+            iteration = int(tok)
+        except ValueError:
+            logger.warning("[energon resume] non-numeric iteration %r; skipping dataloader restore", tok)
+            return
+        dp_rank = (
+            self.pg_collection.dp.rank()
+            if (self.pg_collection is not None and self.pg_collection.dp is not None)
+            else 0
+        )
+        state_path = os.path.join(load_dir, f"iter_{iteration:07d}", f"train_dataloader_dprank{dp_rank:03d}.pt")
+        if not os.path.exists(state_path):
+            logger.warning(
+                "[energon resume] dataloader state %s not found; data starts from scratch "
+                "(check DP size / num_workers match the saved run)",
+                state_path,
+            )
+            return
+        try:
+            state = torch.load(state_path, map_location="cpu")
+            energon_loader.restore_state_rank(state["dataloader_state_dict"])
+            logger.info("[energon resume] restored dataloader state from %s", state_path)
+        except Exception as e:  # noqa: BLE001 - fail safe to fresh data, never crash resume
+            logger.warning("[energon resume] failed to restore %s: %s; data starts from scratch", state_path, e)
 
     def val_dataloader(self):
         """
