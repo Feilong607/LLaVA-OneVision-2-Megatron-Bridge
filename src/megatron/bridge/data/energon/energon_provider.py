@@ -36,6 +36,7 @@ class EnergonProvider(DatasetProvider):
     global_batch_size: int
     num_workers: int_repr
     dataloader_type: str = "external"
+    dataloader_load: Optional[str] = None
     task_encoder: Optional[Any] = None
     # Enable batch-level online sequence packing
     pack_sequences_in_batch: bool = False
@@ -58,6 +59,7 @@ class EnergonProvider(DatasetProvider):
             global_batch_size=self.global_batch_size,
             num_workers=self.num_workers,
             pg_collection=context.pg_collection,
+            dataloader_load=self.dataloader_load,
         )
         train_iter = iter(dataset.train_dataloader())
         # Datasets prepared with only a 'train' split (e.g. the original

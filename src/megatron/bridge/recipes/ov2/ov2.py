@@ -204,6 +204,7 @@ class OV2EnergonProvider(EnergonProvider):
             num_workers=self.num_workers,
             shuffle_buffer_size=self.shuffle_buffer_size,
             pg_collection=context.pg_collection,
+            dataloader_load=self.dataloader_load,
         )
         train_loader = dataset.train_dataloader()
         try:
