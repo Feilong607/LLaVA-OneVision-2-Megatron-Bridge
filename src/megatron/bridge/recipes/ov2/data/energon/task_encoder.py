@@ -67,7 +67,8 @@ class OV2TaskEncoder(DefaultTaskEncoder):
     VISION = "<|vision_start|><|image_pad|><|vision_end|>"
 
     def __init__(self, hf_processor_path: str, seq_length: int = 32000,
-                 default_system: str = "You are a helpful assistant.", **_unused):
+                 default_system: str = "You are a helpful assistant.",
+                 spatial_merge_size: Optional[int] = None, **_unused):
         super().__init__()
         from transformers import AutoProcessor
 
@@ -80,6 +81,13 @@ class OV2TaskEncoder(DefaultTaskEncoder):
         self.pad_id = int(getattr(tok, "pad_token_id", None) or getattr(tok, "eos_token_id", 0) or 0)
         self.seq_length = self.seq_len = int(seq_length)
         self.default_system = default_system
+        # Explicit per-backbone merge override. The <|image_pad|> expansion count MUST match the
+        # vision tower's spatial_merge_size (img_counts = grid.prod // merge^2). All three backbones
+        # currently share the 4B p16m33 processor (merge_size=3), which is WRONG for 8B/35B (merge=2):
+        # leaving merge=3 would expand too few image tokens vs the merge=2 tower's features and trip
+        # LlavaOnevision2.forward's "image features != image tokens" assert. When set, this overrides
+        # the processor's merge_size. None => read merge_size from the processor (4B path, unchanged).
+        self.spatial_merge_size = spatial_merge_size
 
     # Qwen2-VL / Qwen3 special-token ids (verified on the p16m33 processor).
     IMG_PAD_ID = 151655
@@ -116,6 +124,15 @@ class OV2TaskEncoder(DefaultTaskEncoder):
                 raise SkipSample()
 
             imgs = [_to_pil(x) for x in (s.image or [])]
+            if not imgs:
+                # Text-only sample (no image): OV2 stage-1/stage-2 FREEZE the LLM, so the only trainable
+                # params (vision tower + adapter) are absent from this sample's autograd graph -> the loss
+                # has requires_grad=False -> backward() is a no-op on this rank -> it issues NONE of the
+                # backward MoE expert-parallel all-to-alls and runs ahead to the next microbatch's forward,
+                # while ranks holding image samples execute the backward -> cross-rank EP collective desync
+                # -> NCCL ALLTOALL_BASE deadlock (mbs=1: one text-only sample on one rank hangs the job).
+                # A text-only sample also trains nothing in these stages. Skip it.
+                raise SkipSample()
             # Image features + per-image expanded token counts (grid//merge^2, merge=3) — replicates
             # the full processor's <|image_pad|> expansion so masked_scatter gets the right #tokens.
             pixel_values = None
@@ -126,7 +143,9 @@ class OV2TaskEncoder(DefaultTaskEncoder):
                 img_out = ip(images=imgs, return_tensors="pt")
                 pixel_values = img_out["pixel_values"]
                 image_grid_thw = img_out["image_grid_thw"]
-                merge = int(getattr(ip, "merge_size", 2))
+                # Per-backbone merge override wins; else read from the processor (4B path unchanged).
+                merge = int(self.spatial_merge_size if self.spatial_merge_size is not None
+                            else getattr(ip, "merge_size", 2))
                 img_counts = [
                     int(image_grid_thw[k].prod().item()) // (merge * merge)
                     for k in range(image_grid_thw.shape[0])
@@ -189,6 +208,13 @@ class OV2TaskEncoder(DefaultTaskEncoder):
                 raise SkipSample()
             labels = torch.roll(labels, shifts=-1, dims=0)              # next-token shift (mcore does NOT shift)
             labels[-1] = IGNORE_INDEX
+            if int((labels != IGNORE_INDEX).sum()) == 0:
+                # No supervised tokens left (image pads + the next-token shift can leave a sample with
+                # zero learnable positions) -> the per-token loss becomes sum/0 = 0/0 = NaN, which
+                # crashes the whole step. This is a real cause of the OV2-30B-A3B iter-2 NaN: its
+                # patch14/merge2 processor expands each image to MORE tokens than 4B's patch16/merge3,
+                # so a short-caption sample can end up all-image/no-text. Skip it.
+                raise SkipSample()
             return OV2TaskSample(
                 __key__=getattr(s, "__key__", "?"),
                 __subflavors__=getattr(s, "__subflavors__", None),

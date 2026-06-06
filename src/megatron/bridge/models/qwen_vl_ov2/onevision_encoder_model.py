@@ -288,9 +288,11 @@ class OneVisionEncoderModel(VisionModule):
         # without SP-aware parameter marking the per-rank gradients would not be
         # reduced, leading to incorrect weight updates).  eps=1e-4 matches the
         # original torch.nn.LayerNorm value.
+        # VERIFIED: get_vision_config sets config.normalization="LayerNorm" and config.hidden_size
+        # to the per-backbone vision width, so TENorm initializes correctly (smoke-tested 4B/8B/30B).
         self.pre_layernorm = TENorm(
             config, config.hidden_size, eps=1e-4
-        )  # TODO: Confirm that config.normalization and hidden_size are correctly set for TENorm.
+        )
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """
