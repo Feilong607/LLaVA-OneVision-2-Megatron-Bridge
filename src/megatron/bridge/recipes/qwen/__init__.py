@@ -80,6 +80,12 @@ from .qwen3_moe import (
     qwen3_235b_a22b_sft_config,
 )
 
+# Local / A100 (offline, no-DeepEP) + GB200 (HybridEP, MXFP8) variants of the Qwen3-30B-A3B MoE recipes.
+from .qwen3_moe_local import (
+    qwen3_30b_a3b_pretrain_a100_config,
+    qwen3_30b_a3b_pretrain_gb200_config,
+)
+
 # Qwen3-Next models
 from .qwen3_next import (
     qwen3_next_80b_a3b_peft_config,
@@ -146,6 +152,8 @@ __all__ = [
     "qwen3_30b_a3b_pretrain_config",
     "qwen3_30b_a3b_sft_config",
     "qwen3_30b_a3b_peft_config",
+    "qwen3_30b_a3b_pretrain_a100_config",  # local/offline A100 variant (alltoall, no DeepEP)
+    "qwen3_30b_a3b_pretrain_gb200_config",  # GB200 variant (HybridEP, MXFP8, comm overlap)
     "qwen3_235b_a22b_pretrain_config",
     "qwen3_235b_a22b_sft_config",
     "qwen3_235b_a22b_peft_config",

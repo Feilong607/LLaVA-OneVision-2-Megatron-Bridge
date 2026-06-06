@@ -65,7 +65,13 @@ class Qwen3MoEBridge(MegatronModelBridge):
         provider.moe_aux_loss_coeff = 1e-3
         provider.moe_router_pre_softmax = False
         provider.moe_token_dispatcher_type = "alltoall"
-        provider.moe_permute_fusion = True
+        # OV2: env-gate the TE Triton-JIT fused-permute kernel. Default OFF — it intermittently wedges
+        # OV2-30B-A3B (Qwen3-30B-A3B MoE): one EP rank stalls in the fused permute -> NCCL collective
+        # timeout. NVIDIA perf docs disable it for this exact model. Set OV2_MOE_PERMUTE_FUSION=1 to
+        # re-enable for A/B. This is the authoritative build-time setter (provider_bridge runs during
+        # prov.provide(), before the MoE layers are built), so the value bakes into the layers.
+        import os
+        provider.moe_permute_fusion = os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
 
         return provider
 

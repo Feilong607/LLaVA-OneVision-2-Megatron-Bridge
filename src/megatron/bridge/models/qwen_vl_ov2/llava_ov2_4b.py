@@ -74,12 +74,44 @@ def _fill_init(cfg, *, perform_init: bool = True):
     return cfg
 
 
-def _vision_config_from(llm_cfg):
-    """Build the OV2.1 p16m33 vision TransformerConfig by overlaying VisionConfig on the LLM cfg."""
+def _vision_config_from(
+    llm_cfg,
+    *,
+    patch_size: int = OV2_PATCH_SIZE,
+    vision_hidden_size: int = OV2_VISION_HIDDEN,
+    vision_num_layers: int = OV2_VISION_LAYERS,
+    vision_model_name: Optional[str] = None,
+):
+    """Build the OV2 vision TransformerConfig by overlaying VisionConfig on the LLM cfg.
+
+    Defaults reproduce the VERIFIED 4B p16m33 tower (patch16 / hidden1024 / 24L) exactly. Per-backbone
+    callers pass patch_size / vision_hidden_size / vision_num_layers (and, for the larger 35B-A3B
+    ``vision-2b`` tower, vision_model_name="...vision-2b...") so the tower geometry follows the
+    backbone instead of being hardcoded to patch16.
+
+    ``vision_model_name`` selects the named base/variant geometry inside get_vision_config (kv_channels,
+    ffn_hidden_size, num_attention_heads). The explicit patch/hidden/layers args are then applied on
+    top via get_vision_config's keyword overrides AND re-pinned below (kept for byte-identical 4B
+    parity and to override any field the deepcopied llm_cfg would otherwise leak).
+    """
     from megatron.bridge.models.qwen_vl_ov2 import get_vision_config
 
+    # When vision_model_name is None, fall back to get_vision_config's own default model_name so the
+    # 4B path's asdict(get_vision_config()) overlay is byte-identical to before.
+    gv_kwargs = dict(
+        patch_size=patch_size,
+        hidden_size=vision_hidden_size,
+        num_layers=vision_num_layers,
+    )
+    if vision_model_name is not None:
+        gv_kwargs["model_name"] = vision_model_name
     vc = deepcopy(llm_cfg)
-    for k, v in asdict(get_vision_config()).items():
+    for k, v in asdict(get_vision_config(**gv_kwargs)).items():
+        # spatial_merge_size is a VisionConfig-only bookkeeping field (the tower's
+        # TransformerConfig/TransformerBlock does not use it; merge is applied by the Adapter), so do
+        # NOT stamp it onto the TransformerConfig — keeps the overlaid cfg identical to the original.
+        if k == "spatial_merge_size":
+            continue
         setattr(vc, k, v)
     vc.pipeline_model_parallel_size = 1
     vc.context_parallel_size = 1
@@ -94,9 +126,9 @@ def _vision_config_from(llm_cfg):
     ):
         if hasattr(vc, f):
             setattr(vc, f, d)
-    vc.patch_size = OV2_PATCH_SIZE
-    vc.hidden_size = OV2_VISION_HIDDEN
-    vc.num_layers = OV2_VISION_LAYERS
+    vc.patch_size = patch_size
+    vc.hidden_size = vision_hidden_size
+    vc.num_layers = vision_num_layers
     return vc
 
 
@@ -191,6 +223,13 @@ class LlavaOnevision2(MegatronModule):
         if image_embeddings is None or self.image_token_id not in input_ids:
             combined = language_embeddings
         else:
+            # masked_scatter fills True positions row-major over [seq, batch, hidden]; for batch>1 this
+            # interleaves samples incorrectly (image_embeddings are concatenated per-sample). OV2 trains
+            # at micro_batch_size==1 everywhere -> assert it so a future mbs>1 fails loud, not silent-wrong.
+            assert language_embeddings.size(1) == 1, (
+                f"OV2 masked_scatter fuse assumes micro_batch_size==1, got batch={language_embeddings.size(1)}; "
+                "scatter per-sample before raising mbs."
+            )
             mask = (
                 (input_ids == self.image_token_id)
                 .transpose(0, 1)
@@ -221,7 +260,7 @@ class LlavaOnevision2(MegatronModule):
         )
 
 
-def build_llava_ov2_4b(
+def build_llava_ov2(
     llm_hf_path: str = "/ov2/pretrain_models/Qwen3-4B-Instruct-2507",
     *,
     pre_process: bool = True,
@@ -232,9 +271,28 @@ def build_llava_ov2_4b(
     recompute: bool = False,
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
+    expert_model_parallel_size: int = 1,
+    expert_tensor_parallel_size: Optional[int] = None,
+    sequence_parallel: bool = False,
     load_llm_weights: bool = False,
+    # Per-backbone vision-tower geometry. Defaults == the VERIFIED 4B p16m33 tower, so an
+    # un-parameterized call (and the 4B recipe) build the exact same vision_model/adapter as before.
+    patch_size: int = OV2_PATCH_SIZE,
+    spatial_merge_size: int = OV2_SPATIAL_MERGE,
+    vision_hidden_size: int = OV2_VISION_HIDDEN,
+    vision_num_layers: int = OV2_VISION_LAYERS,
+    vision_model_name: Optional[str] = None,
 ) -> LlavaOnevision2:
-    """Build the OV2.1-4B model (untied Qwen3-4B LLM + OV2 p16m33 vision + m33 adapter).
+    """Build the OV2 model (untied Qwen3-family LLM + OV2 vision tower + adapter).
+
+    LLM-agnostic: the LLM config (dense vs. MoE, width, layers, hybrid GDN attention) flows
+    entirely from the HF dir via ``AutoBridge`` — only ``llm_hf_path`` selects the backbone.
+    The adapter ``output_size`` is set to ``llm_cfg.hidden_size``, so it auto-adapts to any LLM
+    width. For an MoE backbone (e.g. Qwen3.5-35B-A3B, model_type ``qwen3_5_moe``) the bridge sets
+    ``transformer_layer_spec`` to the hybrid GDN+MoE experimental-attention spec and the MoE
+    config (num_experts / topk / shared-expert / grouped-gemm / dispatcher) on the provider, so
+    ``prov.provide()`` builds the correct MoE language model. Expert-parallel / sequence-parallel
+    knobs are propagated to the LLM provider below (they are no-ops for dense backbones).
 
     ``perform_init=False`` + ``use_cpu_init=True`` is the cheap structure-only build used
     for checkpoint-stitch validation (weights get overwritten by the ckpt load anyway).
@@ -255,6 +313,19 @@ def build_llava_ov2_4b(
     prov = bridge.to_megatron_provider(load_weights=False)
     prov.tensor_model_parallel_size = tensor_model_parallel_size
     prov.pipeline_model_parallel_size = pipeline_model_parallel_size
+    # Expert/sequence parallel for MoE backbones (no-op fields for dense). Only override
+    # expert_tensor_parallel_size when explicitly requested; otherwise leave the bridge default.
+    if hasattr(prov, "expert_model_parallel_size"):
+        prov.expert_model_parallel_size = expert_model_parallel_size
+    if expert_tensor_parallel_size is not None and hasattr(prov, "expert_tensor_parallel_size"):
+        prov.expert_tensor_parallel_size = expert_tensor_parallel_size
+    if hasattr(prov, "sequence_parallel"):
+        prov.sequence_parallel = sequence_parallel
+    # MoE router numerical stability: with many experts (Qwen3-30B-A3B has 128) the routing
+    # softmax/top-k in bf16 can overflow to NaN (mcore warns: ">=32 experts without fp32 routing").
+    # Observed: OV2-30B-A3B stage-1 NaN'd at iter 2 on all ranks. fp32 routing is the fix.
+    if getattr(prov, "num_moe_experts", None):
+        prov.moe_router_dtype = "fp32"
     prov.share_embeddings_and_output_weights = False  # OV2 ckpt has a separate output_layer.weight
     # AIAK sets scatter_embedding_sequence_parallel=False: the VLM does its own SP scatter on the
     # fused (text+image) embeddings (see forward step 3), so the LLM embedding must NOT pre-scatter.
@@ -268,10 +339,36 @@ def build_llava_ov2_4b(
     # Leave None in real training so the framework default applies.
     if grad_accum_fusion is not None and hasattr(prov, "gradient_accumulation_fusion"):
         prov.gradient_accumulation_fusion = grad_accum_fusion
-    if recompute:  # activation recompute for long-seq stage-2 (full/uniform/1)
-        prov.recompute_granularity = "full"; prov.recompute_method = "uniform"; prov.recompute_num_layers = 1
+    if recompute:  # activation recompute. stage-2 (LLM/experts FROZEN) -> SELECTIVE core_attn:
+        # recomputing the whole frozen MoE block (the old full/uniform/1) is wasted compute, so only
+        # recompute the memory-heavy/compute-light attention. midtrain (LLM UNFROZEN, tight memory at
+        # seq 32000) can keep full/uniform/1 via OV2_RECOMPUTE_FULL=1. NB: selective REQUIRES
+        # recompute_method/recompute_num_layers = None (TransformerConfig.__post_init__ raises otherwise).
+        import os
+        if os.environ.get("OV2_RECOMPUTE_FULL", "0") == "1":
+            prov.recompute_granularity = "full"; prov.recompute_method = "uniform"; prov.recompute_num_layers = 1
+        else:
+            prov.recompute_granularity = "selective"; prov.recompute_modules = ["core_attn"]
+            prov.recompute_method = None; prov.recompute_num_layers = None
+    # moe_permute_fusion: force OFF on the BUILT LLM config — set on `prov` BEFORE prov.provide()
+    # (the reliable spot, exactly like recompute above). The post-build model.config force-set in
+    # provide() does NOT reach the built MoE layers (verified: it still dumps True). Disables the TE
+    # Triton-JIT fused-permute kernel that intermittently wedges OV2-30B-A3B. Re-enable with
+    # OV2_MOE_PERMUTE_FUSION=1.
+    if hasattr(prov, "moe_permute_fusion"):
+        import os
+        prov.moe_permute_fusion = os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
     _fill_init(prov, perform_init=perform_init)
     language_model = prov.provide(pre_process=pre_process, post_process=post_process)
+    # moe_permute_fusion override (MUST be post-provide): the qwen3_(5_)moe bridge's provider_bridge()
+    # re-sets moe_permute_fusion=True DURING prov.provide(), clobbering any pre-provide set. Override on
+    # the BUILT config here — language_model.config is the runtime TransformerConfig the MoE token
+    # dispatcher reads. Default OFF (fixes the TE Triton-JIT fused-permute wedge on OV2-30B/35B-A3B);
+    # set OV2_MOE_PERMUTE_FUSION=1 to re-enable for A/B. Bridge-agnostic + unconditional (no num_experts
+    # guard) so it always lands; no-op on dense backbones (field just flips False->False).
+    if hasattr(language_model.config, "moe_permute_fusion"):
+        import os as _os
+        language_model.config.moe_permute_fusion = _os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
     if load_llm_weights:  # stream HF Qwen3-4B weights into the freshly-built LLM (cpu params)
         bridge.load_hf_weights([language_model])
         # Qwen3-4B-Instruct ties input/output embeddings (no lm_head.weight in HF), but the
@@ -287,13 +384,22 @@ def build_llava_ov2_4b(
                     _out.weight.copy_(_emb.weight)
     llm_cfg = language_model.config
 
-    vis_cfg = _fill_init(_vision_config_from(llm_cfg), perform_init=perform_init)
+    vis_cfg = _fill_init(
+        _vision_config_from(
+            llm_cfg,
+            patch_size=patch_size,
+            vision_hidden_size=vision_hidden_size,
+            vision_num_layers=vision_num_layers,
+            vision_model_name=vision_model_name,
+        ),
+        perform_init=perform_init,
+    )
     adp_cfg = _fill_init(_adapter_config_from(llm_cfg), perform_init=perform_init)
     # Recompute applies to the LLM ONLY (seq 32000 × 36 layers dominates memory). vis_cfg
     # deepcopies llm_cfg, so explicitly DISABLE recompute on the vision encoder — its ported
     # _checkpointed_forward passes attn_mask_type, incompatible with this mcore's TransformerLayer
     # (the encoder is small: 24L / bounded patches, so it needn't recompute anyway).
-    for _a in ("recompute_granularity", "recompute_method", "recompute_num_layers"):
+    for _a in ("recompute_granularity", "recompute_method", "recompute_num_layers", "recompute_modules"):
         if hasattr(vis_cfg, _a):
             setattr(vis_cfg, _a, None)
     if grad_accum_fusion is not None:
@@ -301,15 +407,21 @@ def build_llava_ov2_4b(
             if hasattr(c, "gradient_accumulation_fusion"):
                 c.gradient_accumulation_fusion = grad_accum_fusion
 
-    vision_model = OneVisionEncoderModel(vis_cfg, get_vision_layer_spec(), spatial_merge_size=OV2_SPATIAL_MERGE)
+    vision_model = OneVisionEncoderModel(vis_cfg, get_vision_layer_spec(), spatial_merge_size=spatial_merge_size)
     adapter = Adapter(
         adp_cfg,
         get_adapter_layer_spec(),
-        input_size=OV2_VISION_HIDDEN,
-        output_size=llm_cfg.hidden_size,
-        spatial_merge_size=OV2_SPATIAL_MERGE,
+        input_size=vision_hidden_size,           # adapter merges input_size * merge^2 (4B 1024*9=9216; 8B 1024*4=4096)
+        output_size=llm_cfg.hidden_size,         # auto-sizes to ANY LLM width (4B=2560, 8B=4096, 35B-A3B=2048)
+        spatial_merge_size=spatial_merge_size,
     )
     return LlavaOnevision2(language_model, vision_model, adapter)
+
+
+# Back-compat alias: the 4B-specific name kept so older callers / running scripts still import it.
+# The builder has always been LLM-agnostic (adapter output_size = llm_cfg.hidden_size); only the
+# default llm_hf_path points at 4B. New code should call build_llava_ov2.
+build_llava_ov2_4b = build_llava_ov2
 
 
 def convert_hf_onevision_to_mcore(hf_sd, *, num_query_groups: int = 16, head_dim: int = 64, hidden: int = 1024) -> dict:
@@ -379,22 +491,51 @@ def _resolve_ckpt_file(p: str) -> str:
     return p
 
 
-def load_ov2_4b_mcore_checkpoint(model: LlavaOnevision2, ckpt_path: str, *, load_adapter: bool = True,
-                                 load_vision: bool = True) -> dict:
+def load_ov2_mcore_checkpoint(model: LlavaOnevision2, ckpt_path: str, *, load_adapter: bool = True,
+                              load_vision: bool = True) -> dict:
     """Stitch-load the assembled AIAK mcore ckpt into the model.
 
     Args:
         ckpt_path: dir containing ``release/mp_rank_00/model_optim_rng.pt`` (or that file).
         load_adapter: if False, leave the adapter at its (random) init — stage-1 trains it fresh.
 
-    VERIFIED: 588/588 params, 0 missing / 0 unexpected for the p16m33 4B ckpt.
+    Backbone-agnostic loader: ``strict=False`` matches whatever sibling-prefixed keys
+    (``language_model.`` / ``vision_model.`` / ``adapter.``) exist in the ckpt. VERIFIED 588/588
+    params, 0 missing / 0 unexpected for the p16m33 4B ckpt; 8B / 35B-A3B ckpts have a different
+    language_model param count and are NOT yet verified here (flagged in the report).
     """
-    import os
+    import os, glob
 
     p = ckpt_path
     if os.path.isdir(p):
-        cand = os.path.join(p, "release", "mp_rank_00", "model_optim_rng.pt")
-        p = cand if os.path.exists(cand) else p
+        rel = os.path.join(p, "release")
+        # Single-chunk (4B / 8B): release/mp_rank_00/model_optim_rng.pt
+        single = os.path.join(rel, "mp_rank_00", "model_optim_rng.pt")
+        # EP-sharded (35B-A3B MoE): release/mp_rank_00_{ep:03d}/model_optim_rng.pt — one shard per
+        # expert-parallel rank. Verified layout (stage_0_tp1_pp1_ep8): every shard replicates the
+        # non-expert weights (attention/router/embed/norm) + vision_model (291) + adapter (6); each
+        # shard carries ONLY its own 16 local_experts (indexed locally 0..15). The model built with
+        # expert_model_parallel_size=8 also exposes local_experts.0..15 per rank, so THIS rank's
+        # experts match by index. (The ckpt is PER-EXPERT, SequentialMLP-style keys, while the built
+        # model is TE-grouped; the keys are remapped per-expert -> grouped below, before load.)
+        ep_shards = sorted(glob.glob(os.path.join(rel, "mp_rank_00_[0-9][0-9][0-9]")))
+        if os.path.exists(single):
+            p = single
+        elif ep_shards:
+            try:
+                from megatron.core import parallel_state as _ps
+                ep_rank = _ps.get_expert_model_parallel_rank()
+                ep_size = _ps.get_expert_model_parallel_world_size()
+            except Exception:
+                ep_rank, ep_size = 0, len(ep_shards)
+            if len(ep_shards) != ep_size:
+                logger.warning(
+                    "[ov2 load] EP-sharded ckpt has %d shards but EP world size is %d; build with "
+                    "expert_model_parallel_size=%d to match", len(ep_shards), ep_size, len(ep_shards),
+                )
+            cand = os.path.join(rel, f"mp_rank_00_{ep_rank:03d}", "model_optim_rng.pt")
+            p = cand if os.path.exists(cand) else (ep_shards[ep_rank] if ep_rank < len(ep_shards) else single)
+            logger.info("[ov2 load] EP-sharded ckpt: ep_rank=%d/%d -> %s", ep_rank, ep_size, p)
     blob = torch.load(p, map_location="cpu", mmap=True, weights_only=False)
     sd = {k: v for k, v in blob["model"].items() if not k.endswith("._extra_state")}
 
@@ -405,6 +546,30 @@ def load_ov2_4b_mcore_checkpoint(model: LlavaOnevision2, ckpt_path: str, *, load
         dst = tuple(msd[pe].shape)
         if tuple(sd[pe].shape) != dst and sd[pe].numel() == int(torch.tensor(list(dst)).prod()):
             sd[pe] = sd[pe].reshape(dst)
+
+    # MoE expert-key reconciliation. The legacy EP ckpt stores experts PER-EXPERT (SequentialMLP):
+    #   ...mlp.experts.local_experts.{i}.linear_fc{1,2}.weight
+    # A TE-grouped model (moe_grouped_gemm=True — the build_llava_ov2/HF default that actually gets
+    # built; the provider field does not propagate through the HF rebuild) instead names them:
+    #   ...mlp.experts.linear_fc{1,2}.weight{i}
+    # Remap per-expert -> grouped ONLY when the built model is grouped, so each EP rank's 16 local
+    # experts load key-for-key. Without this they stay random (loss ~20, grad norm ~1800). Keeping
+    # the model grouped preserves the faster grouped-GEMM path (no SequentialMLP fallback needed).
+    import re as _re
+    if any(_re.search(r"\.experts\.linear_fc[12]\.weight\d+$", k) for k in msd):
+        _pe_re = _re.compile(r"^(.*\.experts)\.local_experts\.(\d+)\.(linear_fc[12])\.weight$")
+        _remapped, _n = {}, 0
+        for k, v in sd.items():
+            m = _pe_re.match(k)
+            if m:
+                _remapped[f"{m.group(1)}.{m.group(3)}.weight{m.group(2)}"] = v
+                _n += 1
+            else:
+                _remapped[k] = v
+        if _n:
+            logger.info("[ov2 load] remapped %d per-expert ckpt keys -> TE-grouped "
+                        "(experts.linear_fcX.weightI)", _n)
+        sd = _remapped
 
     if not load_adapter:
         sd = {k: v for k, v in sd.items() if not k.startswith("adapter.")}
@@ -422,7 +587,11 @@ def load_ov2_4b_mcore_checkpoint(model: LlavaOnevision2, ckpt_path: str, *, load
         "adapter_loaded": load_adapter,
     }
     logger.info(
-        "[ov2_4b load] loaded=%d missing=%d unexpected=%d adapter_loaded=%s",
+        "[ov2 load] loaded=%d missing=%d unexpected=%d adapter_loaded=%s",
         len(sd), len(real_missing), len(real_unexpected), load_adapter,
     )
     return summary
+
+
+# Back-compat alias for the old 4B-specific name (running scripts / provider import it).
+load_ov2_4b_mcore_checkpoint = load_ov2_mcore_checkpoint
