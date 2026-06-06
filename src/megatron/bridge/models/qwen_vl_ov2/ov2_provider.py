@@ -2,25 +2,36 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-"""Bridge ModelProvider for OV2.1-4B (p16m33).
+"""Bridge ModelProvider for OV2 (p16m33), backbone-agnostic.
 
 `LlavaOnevision2Provider` subclasses `GPTModelProvider` (TransformerConfig + ModelProviderMixin),
 so setup()/get_model() can consume it like any Bridge provider (it carries the parallelism /
 precision / DDP config fields). `.provide()` returns ONE `LlavaOnevision2` (built by the verified
-`build_llava_ov2_4b`), and the legacy 3-sibling mcore stitch-load runs as a `pre_wrap_hook` — the
+`build_llava_ov2`), and the legacy 3-sibling mcore stitch-load runs as a `pre_wrap_hook` — the
 same slot Bridge's HF loader uses (auto_bridge.py:1519) — so Bridge's torch_dist loader is never
 needed for the OV2 ckpt.
 
 Construct via `LlavaOnevision2Provider.from_llm(llm_hf_path, ...)`, which copies the populated
-TransformerConfig fields from the Qwen3-4B AutoBridge provider (GPTModelProvider requires
-num_layers/hidden_size/... at construction).
+TransformerConfig fields from the LLM's AutoBridge provider (GPTModelProvider requires
+num_layers/hidden_size/... at construction). Because the OV2 vision encoder + m33 adapter + step
+function are LLM-agnostic and the adapter auto-sizes to `llm_cfg.hidden_size`, the same provider
+serves all three backbones:
+
+  * Qwen3-4B-Instruct-2507  (dense, model_type qwen3,        36L, hidden 2560)
+  * Qwen3-8B                (dense, model_type qwen3,        36L, hidden 4096)
+  * Qwen3.5-35B-A3B         (MoE,   model_type qwen3_5_moe,  40L, hidden 2048; GDN hybrid attn)
+
+For the MoE backbone use `LlavaOnevision2MoEProvider` (or `from_llm(..., is_moe=True)`): it adds
+expert-parallel / sequence-parallel knobs that `provide()` forwards to `build_llava_ov2`. The MoE
+*architecture* itself (experts/topk/grouped-gemm/dispatcher/GDN spec) is set by the qwen3_5_moe
+bridge on the copied provider, so no separate model class is needed — only the parallel wiring.
 """
 from __future__ import annotations
 
 import dataclasses
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 from megatron.core.transformer.module import MegatronModule
 
@@ -57,7 +68,12 @@ def _init_ov2_adapter(adapter) -> None:
 
 @dataclass
 class LlavaOnevision2Provider(GPTModelProvider):
-    """Provider for the 3-sibling OV2.1 model (language_model + vision_model + adapter)."""
+    """Provider for the 3-sibling OV2 model (language_model + vision_model + adapter).
+
+    Backbone-agnostic for dense Qwen3-family LLMs (4B / 8B). For the MoE backbone
+    (Qwen3-30B-A3B) use the `LlavaOnevision2MoEProvider` subclass, which carries the
+    expert/sequence-parallel knobs forwarded to the model builder.
+    """
 
     # --- OV2-specific config (recipe sets these) ---
     llm_hf_path: str = "/ov2/pretrain_models/Qwen3-4B-Instruct-2507"
@@ -66,6 +82,18 @@ class LlavaOnevision2Provider(GPTModelProvider):
     load_ov2_vision: bool = True
     load_llm_weights: bool = False                # LLM weights come from the stitch ckpt, not HF
     image_token_id: int = 151655
+    recompute_activations: bool = False           # LLM activation recompute (full/uniform/1) — cuts
+                                                  # peak memory (~71GB->~35GB for 30B-A3B) at ~30% speed
+                                                  # cost; set via recipe/CLI to fit busy/coexisting GPUs
+
+    # --- Per-backbone vision-tower geometry (recipe sets these from _OV2_BACKBONES) ---
+    # Defaults == the VERIFIED 4B p16m33 tower; the 4B recipe leaves them at these values so the
+    # built vision_model/adapter are byte-identical to before. 8B/35B-A3B override via from_llm.
+    vision_patch_size: int = 16
+    vision_spatial_merge_size: int = 3
+    vision_hidden_size: int = 1024
+    vision_num_layers: int = 24
+    vision_model_name: Optional[str] = None       # selects a named vision variant; currently unused (all backbones use the base 1024/24 tower)
 
     # OV2 ckpt is untied; the VLM does its own SP scatter on the fused embeddings.
     share_embeddings_and_output_weights: bool = False
@@ -80,15 +108,35 @@ class LlavaOnevision2Provider(GPTModelProvider):
 
     # ------------------------------------------------------------------ #
     @classmethod
-    def from_llm(cls, llm_hf_path: str, **ov2_kwargs) -> "LlavaOnevision2Provider":
-        """Build a provider whose TransformerConfig fields are copied from the Qwen3-4B
-        AutoBridge provider (so all required GPTModelProvider fields are populated)."""
+    def from_llm(cls, llm_hf_path: str, *, is_moe: Optional[bool] = None, **ov2_kwargs) -> "LlavaOnevision2Provider":
+        """Build a provider whose TransformerConfig fields are copied from the LLM's
+        AutoBridge provider (so all required GPTModelProvider fields are populated).
+
+        Works for any Qwen3-family backbone — the copied provider carries the right
+        num_layers/hidden_size/MoE/GDN config from the HF dir. ``is_moe`` selects which
+        provider class is instantiated:
+          * is_moe=None  -> auto-detect from the base provider (num_moe_experts set).
+          * is_moe=True  -> force ``LlavaOnevision2MoEProvider`` (EP/SP wiring).
+          * is_moe=False -> force the dense ``LlavaOnevision2Provider``.
+        Calling on the subclass directly (``LlavaOnevision2MoEProvider.from_llm(...)``) keeps
+        that subclass regardless of is_moe.
+        """
         from megatron.bridge import AutoBridge
 
         base = AutoBridge.from_hf_pretrained(llm_hf_path).to_megatron_provider(load_weights=False)
-        own = {f.name for f in dataclasses.fields(cls)}
+
+        # Pick the concrete provider class. Only redirect when called on the base class so an
+        # explicit subclass call is respected; auto-detect MoE from the copied base provider.
+        target_cls = cls
+        if cls is LlavaOnevision2Provider:
+            detected_moe = bool(getattr(base, "num_moe_experts", None))
+            use_moe = detected_moe if is_moe is None else is_moe
+            if use_moe:
+                target_cls = LlavaOnevision2MoEProvider
+
+        own = {f.name for f in dataclasses.fields(target_cls)}
         init = {f.name: getattr(base, f.name) for f in dataclasses.fields(base) if f.name in own}
-        self = cls(**init)
+        self = target_cls(**init)
         self.llm_hf_path = llm_hf_path
         self.share_embeddings_and_output_weights = False
         if hasattr(self, "scatter_embedding_sequence_parallel"):
@@ -99,11 +147,11 @@ class LlavaOnevision2Provider(GPTModelProvider):
 
     # ------------------------------------------------------------------ #
     def provide(self, pre_process=None, post_process=None, vp_stage=None) -> MegatronModule:
-        from megatron.bridge.models.qwen_vl_ov2.llava_ov2_4b import build_llava_ov2_4b
+        from megatron.bridge.models.qwen_vl_ov2.llava_ov2_4b import build_llava_ov2
 
         pre = True if pre_process is None else pre_process
         post = True if post_process is None else post_process
-        model = build_llava_ov2_4b(
+        model = build_llava_ov2(
             self.llm_hf_path,
             pre_process=pre,
             post_process=post,
@@ -113,7 +161,18 @@ class LlavaOnevision2Provider(GPTModelProvider):
                                        # copies the CPU ckpt tensors into the GPU params fine.
             tensor_model_parallel_size=self.tensor_model_parallel_size,
             pipeline_model_parallel_size=self.pipeline_model_parallel_size,
+            # MoE parallel knobs (no-op for dense backbones; the MoE subclass sets EP>1 / SP).
+            expert_model_parallel_size=getattr(self, "expert_model_parallel_size", 1) or 1,
+            expert_tensor_parallel_size=getattr(self, "expert_tensor_parallel_size", None),
+            sequence_parallel=bool(getattr(self, "sequence_parallel", False)),
             load_llm_weights=self.load_llm_weights,
+            recompute=bool(getattr(self, "recompute_activations", False)),
+            # Per-backbone vision-tower geometry (4B defaults reproduce the verified p16m33 tower).
+            patch_size=getattr(self, "vision_patch_size", 16),
+            spatial_merge_size=getattr(self, "vision_spatial_merge_size", 3),
+            vision_hidden_size=getattr(self, "vision_hidden_size", 1024),
+            vision_num_layers=getattr(self, "vision_num_layers", 24),
+            vision_model_name=getattr(self, "vision_model_name", None),
         )
         if self.freeze_language_model or self.freeze_vision_model or self.freeze_adapter:
             model.freeze(
@@ -139,6 +198,18 @@ class LlavaOnevision2Provider(GPTModelProvider):
         from megatron.core.distributed.finalize_model_grads import finalize_model_grads as _finalize_model_grads
         model.config.calculate_per_token_loss = bool(getattr(self, "calculate_per_token_loss", False))
         model.config.finalize_model_grads_func = _partial(_finalize_model_grads, pg_collection=None)
+        # MoE router fp32 (stability): set on the RUNTIME config too — the build-time set on the LLM
+        # provider doesn't always propagate (the bridge rebuilds the config), same as the calc_ptl fix.
+        if getattr(model.config, "num_moe_experts", None):
+            model.config.moe_router_dtype = "fp32"
+            # moe_permute_fusion: the TE Triton-JIT fused token-permute kernel intermittently wedges
+            # OV2-30B-A3B (one EP rank stalls -> NCCL collective timeout). NVIDIA perf docs confirm
+            # disabling it for this exact Qwen3-30B-A3B MoE due to the Triton/TE fused-permutation
+            # failure. Like calc_ptl / moe_router_dtype, the cfg.model field does NOT propagate
+            # (build_llava_ov2 rebuilds the LLM from HF and never sets it), so force it on the RUNTIME
+            # LLM config here. Default OFF; re-enable with OV2_MOE_PERMUTE_FUSION=1 for A/B testing.
+            import os
+            model.config.moe_permute_fusion = os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
         return model
 
     # ------------------------------------------------------------------ #
@@ -166,9 +237,9 @@ class LlavaOnevision2Provider(GPTModelProvider):
                 except Exception:
                     pass
             assert len(model_list) == 1, "OV2 stitch-load assumes PP=1 single chunk"
-            from megatron.bridge.models.qwen_vl_ov2.llava_ov2_4b import load_ov2_4b_mcore_checkpoint
+            from megatron.bridge.models.qwen_vl_ov2.llava_ov2_4b import load_ov2_mcore_checkpoint
 
-            summary = load_ov2_4b_mcore_checkpoint(
+            summary = load_ov2_mcore_checkpoint(
                 model_list[0], ckpt, load_adapter=load_adapter, load_vision=load_vision
             )
             logger.info("[ov2 provider] stitch-load: %s", summary)
@@ -178,3 +249,60 @@ class LlavaOnevision2Provider(GPTModelProvider):
             return model_list
 
         self.register_pre_wrap_hook(_ov2_load_hook)
+
+
+@dataclass
+class LlavaOnevision2MoEProvider(LlavaOnevision2Provider):
+    """OV2 provider for an MoE LLM backbone (Qwen3.5-35B-A3B, model_type ``qwen3_5_moe``).
+
+    Inherits ALL OV2 behavior from ``LlavaOnevision2Provider`` (``from_llm`` field-copy, the
+    3-sibling ``build_llava_ov2`` build, the stitch ``pre_wrap_hook``, and the CRITICAL
+    calc_ptl/finalize fix in ``provide()``). The MoE *architecture* (num_experts / topk /
+    shared-expert / grouped-gemm / dispatcher / GDN hybrid ``transformer_layer_spec``) is set by
+    the qwen3_5_moe bridge on the copied provider in ``from_llm`` — this subclass only adds the
+    expert-parallel / sequence-parallel wiring (mirrors qwen35_vl_provider's MoE provider) that
+    ``provide()`` forwards to the builder.
+
+    NOTE: ``num_query_groups``, ``num_moe_experts``, ``moe_router_topk``, GDN head dims, rope, etc.
+    are NOT redeclared here on purpose — they come from the HF config via the bridge, so this stays
+    correct if Qwen3.5-35B-A3B's exact MoE/GDN config differs from the 397B reference defaults.
+    """
+
+    # Expert / sequence parallel (recipe sets these for 35B-A3B). expert_model_parallel_size is a
+    # TransformerConfig field; declare expert_tensor_parallel_size default here for clarity.
+    expert_tensor_parallel_size: Optional[int] = 1
+
+    # MoE kernel defaults (match qwen35_vl MoE recipe). The bridge already sets grouped_gemm /
+    # dispatcher / permute_fusion; these are harmless re-affirmations + the SP-driven router fusion.
+    moe_token_dispatcher_type: str = "alltoall"
+    moe_grouped_gemm: bool = True
+    # NOTE: this cfg.model field is DEAD at runtime — build_llava_ov2 rebuilds the LLM from HF and
+    # never propagates it. The EFFECTIVE knob is the env-gated force-set on model.config in provide()
+    # (OV2_MOE_PERMUTE_FUSION; default OFF to avoid the Triton-JIT permute wedge on OV2-30B-A3B).
+    # Default here mirrors that for consistency; do NOT rely on this field to change behavior.
+    moe_permute_fusion: bool = False
+
+    mlp_only_layers: List[int] = dataclasses.field(default_factory=list)
+
+    def finalize(self) -> None:
+        # Mirror qwen35_vl: SP requires TP>1; CP>1 forces global per-token loss. The OV2
+        # token-weighted loss already sets calculate_per_token_loss via the recipe + the
+        # provide() fix, so we only add the parallel-consistency guards here.
+        if (self.context_parallel_size or 1) > 1:
+            self.calculate_per_token_loss = True
+        if (self.tensor_model_parallel_size or 1) > 1:
+            self.sequence_parallel = True
+        # NOTE on MoE expert format: the built model uses TE-grouped experts (moe_grouped_gemm=True,
+        # the HF/bridge default — the perf-preferred path). The legacy EP-sharded OV2-30B-A3B ckpt
+        # stores experts PER-EXPERT (SequentialMLP keys), so load_ov2_mcore_checkpoint remaps
+        # per-expert -> grouped at load time. We deliberately KEEP grouped GEMM here (no SequentialMLP
+        # override) since build_llava_ov2 rebuilds the LLM from HF and would ignore the field anyway.
+        # expert_tensor_parallel_size > 1 is UNVALIDATED for OV2 (the verified MoE config is EP=8 /
+        # ETP=1 on one 8-GPU node). Warn loudly rather than fail, so it stays usable for experiments.
+        if (getattr(self, "expert_tensor_parallel_size", 1) or 1) > 1:
+            logger.warning(
+                "[ov2 MoE] expert_tensor_parallel_size=%s is UNVALIDATED for OV2; only EP=8/ETP=1 has "
+                "been smoke-tested. Verify gradients/outputs before trusting such runs.",
+                self.expert_tensor_parallel_size,
+            )
+        super().finalize()

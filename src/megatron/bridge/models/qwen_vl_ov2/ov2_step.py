@@ -59,6 +59,20 @@ def forward_step(
     tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw = get_batch(data_iterator)
     timers("batch-generator").stop()
 
+    # Accumulate FLOPS metadata across micro-batches (mirrors vlm_step.forward_step). Each
+    # micro-batch contributes its ACTUAL padded seq_length (not cfg.model.seq_length). train.py
+    # resets these before each step and reads them after; without this the throughput logger
+    # assumes every sample is the full padded seq_length -> MODEL_TFLOP/s exceeds hardware peak.
+    if tokens is not None:
+        mbs = tokens.shape[0]
+        seq_len = tokens.shape[1]
+        state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + mbs * seq_len
+        state._flops_seqlen_sq_sum = getattr(state, "_flops_seqlen_sq_sum", 0) + mbs * seq_len**2
+    if image_grid_thw is not None and image_grid_thw.numel() > 0:
+        state._flops_vision_patches = getattr(state, "_flops_vision_patches", 0) + int(
+            image_grid_thw.prod(dim=-1).sum().item()
+        )
+
     output_tensor = model(
         images=pixel_values,
         image_grid_thw=image_grid_thw,
