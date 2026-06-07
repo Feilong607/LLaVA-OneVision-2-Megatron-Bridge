@@ -262,7 +262,7 @@ class EnergonMultiModalDataModule:
             )
             return
         try:
-            state = torch.load(state_path, map_location="cpu")
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
             energon_loader.restore_state_rank(state["dataloader_state_dict"])
             logger.info("[energon resume] restored dataloader state from %s", state_path)
         except Exception as e:  # noqa: BLE001 - fail safe to fresh data, never crash resume

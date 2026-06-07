@@ -78,7 +78,7 @@ class OV2TaskEncoder(DefaultTaskEncoder):
         # MODEL config, not needed for the processor, and compiling it concurrently across DP ranks
         # races on the shared HF dynamic-module cache. The processor is a standard Qwen2_5_VLProcessor
         # (verified: merge_size=3, <|image_pad|> expands to grid.prod//merge^2 either way).
-        self.proc = AutoProcessor.from_pretrained(hf_processor_path, trust_remote_code=False)
+        self.proc = AutoProcessor.from_pretrained(hf_processor_path, trust_remote_code=False, local_files_only=True)
         tok = getattr(self.proc, "tokenizer", self.proc)
         self.pad_id = int(getattr(tok, "pad_token_id", None) or getattr(tok, "eos_token_id", 0) or 0)
         self.seq_length = self.seq_len = int(seq_length)

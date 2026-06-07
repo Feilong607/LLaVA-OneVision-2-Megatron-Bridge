@@ -198,6 +198,25 @@ class LlavaOnevision2Provider(GPTModelProvider):
         from megatron.core.distributed.finalize_model_grads import finalize_model_grads as _finalize_model_grads
         model.config.calculate_per_token_loss = bool(getattr(self, "calculate_per_token_loss", False))
         model.config.finalize_model_grads_func = _partial(_finalize_model_grads, pg_collection=None)
+        # --- fp8 / MXFP8 (Phase-2): build_llava_ov2 rebuilds the LLM from HF, so the fp8 fields that
+        # cfg.mixed_precision.setup() wrote onto THIS provider (cfg.model == self) never reached the
+        # RUNTIME LLM config -> MXFP8 was a SILENT NO-OP (ran bf16). Copy them across (same dead-field
+        # issue as calc_ptl / moe_router_dtype). Gated on self.fp8 (None in bf16 Phase-1 -> no-op).
+        if getattr(self, "fp8", None):
+            # Runtime-compute fp8 fields ONLY: get_fp8_context(config) reads these at FORWARD time
+            # (mcore fp8_utils), so a post-build set engages MXFP8 GEMMs (the main speedup). We do NOT
+            # copy fp8 PARAM-STORAGE flags (fp8_param / fp8_param_gather / reuse_grad_buf_for_mxfp8_*):
+            # those need a build-time fp8_model_init the OV2 HF-rebuild path doesn't do -> params stay
+            # bf16 (standard MXFP8 = fp8 compute + bf16 master weights), which is correct + safe.
+            for _f in ("fp8", "fp8_recipe", "fp8_margin", "fp8_interval", "fp8_amax_history_len",
+                       "fp8_amax_compute_algo", "fp8_wgrad", "fp8_output_proj",
+                       "fp8_dot_product_attention", "fp8_multi_head_attention",
+                       "first_last_layers_bf16", "num_layers_at_start_in_bf16", "num_layers_at_end_in_bf16"):
+                if hasattr(self, _f) and hasattr(model.config, _f):
+                    setattr(model.config, _f, getattr(self, _f))
+            logger.info("[ov2 provider] fp8 wired onto runtime LLM config: fp8=%s recipe=%s param_gather=%s",
+                        getattr(model.config, "fp8", None), getattr(model.config, "fp8_recipe", None),
+                        getattr(model.config, "fp8_param_gather", getattr(model.config, "fp8_param", None)))
         # MoE router fp32 (stability): set on the RUNTIME config too — the build-time set on the LLM
         # provider doesn't always propagate (the bridge rebuilds the config), same as the calc_ptl fix.
         if getattr(model.config, "num_moe_experts", None):
@@ -210,6 +229,31 @@ class LlavaOnevision2Provider(GPTModelProvider):
             # LLM config here. Default OFF; re-enable with OV2_MOE_PERMUTE_FUSION=1 for A/B testing.
             import os
             model.config.moe_permute_fusion = os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
+            # --- HybridEP / flex dispatcher (Phase-2b, GB200 NVL72): same dead-field issue. The
+            # recipe/launch set moe_token_dispatcher_type on cfg.model, which never reaches the
+            # rebuilt LLM (stays the bridge default 'alltoall'). Wire it on the RUNTIME config via the
+            # helper (sets type='flex' + backend + disables shared-expert-overlap; self-gates on GPU
+            # arch & MoE). Env-gated: OV2_FLEX_BACKEND unset -> no-op (keeps verified alltoall).
+            _flex = os.environ.get("OV2_FLEX_BACKEND") or None
+            if _flex:
+                # MXFP8 + HybridEP fp8-dispatch is unsupported (mcore asserts in fused_a2a); fail loud
+                # here instead of crashing deep in the first MoE layer. They are SEPARATE Phase-2 modes.
+                if getattr(model.config, "fp8", None) and _flex == "hybridep":
+                    raise SystemExit(
+                        "[ov2 provider] MXFP8 + HybridEP fp8-dispatch is unsupported. Pick ONE: MXFP8 "
+                        "with alltoall (unset OV2_FLEX_BACKEND), OR HybridEP with bf16 (unset fp8 / use "
+                        "MIXED_PRECISION=bf16). See ax_ov2_30b_a3b_gb200.sh ACCEL=1 vs ACCEL=2.")
+                from megatron.bridge.training.flex_dispatcher_backend import apply_flex_dispatcher_backend
+                apply_flex_dispatcher_backend(model.config, _flex)
+                if getattr(model.config, "moe_token_dispatcher_type", None) != "flex":
+                    raise SystemExit(
+                        "[ov2 provider] OV2_FLEX_BACKEND={!r} did NOT engage -- apply_flex_dispatcher_backend "
+                        "silently no-op'd (GPU arch not in [8,9,10], or non-MoE). Refusing to run with a "
+                        "misleading 'alltoall' config; unset OV2_FLEX_BACKEND to use alltoall.".format(_flex))
+                logger.info("[ov2 provider] flex dispatcher wired: type=%s backend=%s shared_overlap=%s",
+                            model.config.moe_token_dispatcher_type,
+                            getattr(model.config, "moe_flex_dispatcher_backend", None),
+                            getattr(model.config, "moe_shared_expert_overlap", None))
         return model
 
     # ------------------------------------------------------------------ #
