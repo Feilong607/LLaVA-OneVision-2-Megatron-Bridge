@@ -13,12 +13,20 @@
 # =============================================================================
 set -uo pipefail   # NOT -e: run ALL checks, then tally.
 
-REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
+# Auto-detect the repo root from THIS script's location (.../examples/models/qwen/qwen3_vl_ov2/gb200/)
+# so it works on A100-2 (/ov2/...) AND GB200 (/home/<user>/LLaVA-OneVision-2-Megatron-Bridge) with no
+# hardcoding. Override REPO=... to force a different checkout.
+_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
+[[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/LLaVA-OneVision-2-Megatron-Bridge" >&2; exit 1; }
 RECIPE="${RECIPE:-ov2_35b_a3b_midtrain}"
+# HF models root (LLM arch + energon processor). Default A100-2 layout; override on GB200 to wherever
+# Qwen3-30B-A3B-Instruct-2507/ and llava_onevision2/llava_onevision2_30b_a3b/auto_model/ actually live.
+OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-$([[ -d /ov2/pretrain_models ]] && echo /ov2/pretrain_models || echo "$HOME/pretrain_models")}"
 ACCEL="${ACCEL:-0}"
-INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_stage2}"
+INIT_CKPT="${INIT_CKPT:-$([[ -d /ov2/feilong ]] && echo /ov2/feilong/gb200 || echo "$HOME/ov2")/ckpts_video_sft/ov2_30b_a3b_stage2}"
 DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"
-SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_gb200}"
+SAVE="${SAVE:-$([[ -d /ov2/feilong ]] && echo /ov2/feilong/gb200 || echo "$HOME/ov2")/ckpts_video_sft/ov2_30b_a3b_gb200}"
 export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"
@@ -78,9 +86,9 @@ if [[ -f "$DATA_PATH" ]]; then
 fi
 
 sec "3. HF dirs (LLM arch + processor) — MUST be local (no internet at runtime)"
-exdir "/ov2/pretrain_models/Qwen3-30B-A3B-Instruct-2507"                              "LLM HF dir (AutoBridge arch/weights)"
-exfile "/ov2/pretrain_models/Qwen3-30B-A3B-Instruct-2507/config.json"                 "LLM HF config.json"
-exdir "/ov2/pretrain_models/llava_onevision2/llava_onevision2_30b_a3b/auto_model"     "HF processor dir (energon task encoder)"
+exdir "$OV2_PRETRAIN_ROOT/Qwen3-30B-A3B-Instruct-2507"                              "LLM HF dir (AutoBridge arch/weights)"
+exfile "$OV2_PRETRAIN_ROOT/Qwen3-30B-A3B-Instruct-2507/config.json"                 "LLM HF config.json"
+exdir "$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b/auto_model"     "HF processor dir (energon task encoder)"
 
 sec "4. disk space for SAVE (ckpts ~60GB each, model-only; more with optimizer)"
 sdir="$SAVE"; while [[ ! -d "$sdir" && "$sdir" != "/" ]]; do sdir="$(dirname "$sdir")"; done

@@ -16,11 +16,12 @@
 # =============================================================================
 set -euo pipefail
 
-REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
+REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
+[[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/LLaVA-OneVision-2-Megatron-Bridge" >&2; exit 1; }
 RECIPE="${RECIPE:-ov2_35b_a3b_midtrain}"
 DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"  # seed85m offline-packed metadataset
 INIT_CKPT="${INIT_CKPT:-null}"     # smoke: skip the trained-stage load (base ckpt is still stitched). Set a stage1 dir to also test load.
-SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_gb200_smoke}"
+SAVE="${SAVE:-$([[ -d /ov2/feilong ]] && echo /ov2/feilong/gb200 || echo "$HOME/ov2")/ckpts_video_sft/ov2_30b_a3b_gb200_smoke}"
 NPROC="${NPROC:-4}"                # single node = 4 GPU
 
 # --- smoke-sized overrides (tiny + fast + memory-safe on 4 GPU) ---

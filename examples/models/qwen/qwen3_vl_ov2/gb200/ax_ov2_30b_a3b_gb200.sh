@@ -30,11 +30,14 @@
 # =============================================================================
 set -euo pipefail
 
-REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
+# Auto-detect repo root from this script's location (works on A100-2 /ov2 AND GB200 ~/LLaVA-...).
+_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
+[[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/LLaVA-OneVision-2-Megatron-Bridge" >&2; exit 1; }
 RECIPE="${RECIPE:-ov2_35b_a3b_midtrain}"        # full-model midtrain (use ov2_35b_a3b_stage2 for frozen-LLM SFT)
 DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"  # seed85m offline-packed metadataset
-INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_stage2}"
-SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_gb200}"
+INIT_CKPT="${INIT_CKPT:-$([[ -d /ov2/feilong ]] && echo /ov2/feilong/gb200 || echo "$HOME/ov2")/ckpts_video_sft/ov2_30b_a3b_stage2}"
+SAVE="${SAVE:-$([[ -d /ov2/feilong ]] && echo /ov2/feilong/gb200 || echo "$HOME/ov2")/ckpts_video_sft/ov2_30b_a3b_gb200}"
 ITERS="${ITERS:-6094}"; LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-500}"
 # NPROC (GPUs/node) is set by the HARDWARE PROFILE block below (GB200=4, A100/H100=8); override via NPROC=.
 

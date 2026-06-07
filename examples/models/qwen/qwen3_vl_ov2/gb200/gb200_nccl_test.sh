@@ -6,7 +6,8 @@
 # Set NCCL_DEBUG=INFO to dump the topology/transport NCCL chose (confirms NVLink/NVLS vs IB).
 # =============================================================================
 set -uo pipefail
-REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
+REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
+[[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/LLaVA-OneVision-2-Megatron-Bridge" >&2; exit 1; }
 NPROC="${NPROC:-4}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
