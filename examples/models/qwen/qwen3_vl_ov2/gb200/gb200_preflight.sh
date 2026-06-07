@@ -157,6 +157,23 @@ if ACCEL == "2":
         ok("HybridEP fully importable (deep_ep + HybridEPBuffer + HAVE_HYBRIDEP) -> ACCEL=2 usable offline")
     except Exception as e:
         bad("ACCEL=2 (HybridEP) NOT importable offline: %s -> use ACCEL=0/1 (alltoall) on this container" % e)
+# Triton x Blackwell: Triton<3.3 has no mature sm_100 codegen. The fla '>=3.3' warning is benign for
+# qwen3_moe (no GDN at runtime), but TE/grouped-GEMM Triton kernels still JIT on Blackwell. The fix is
+# the right CONTAINER (cu13/Blackwell ships Triton>=3.3) -- do NOT pip-upgrade Triton (ABI-pinned to torch/TE).
+try:
+    import triton
+    _tv = tuple(int(x) for x in triton.__version__.split(".")[:2])
+    if cc[0] >= 10 and _tv < (3, 3):
+        bad("Triton %s on Blackwell (cc=%s): no mature sm_100 codegen -> you are likely on a cu12 container; "
+            "use the cu13/Blackwell image (Triton>=3.3). Do NOT pip-upgrade Triton (ABI-pinned to torch/TE)."
+            % (triton.__version__, cc))
+    elif cc[0] >= 10:
+        ok("Triton %s OK for Blackwell (torch cuda %s)" % (triton.__version__, torch.version.cuda))
+    else:
+        ok("Triton %s (cc=%s, torch cuda %s) -- fla>=3.3 warning is benign here (qwen3_moe has no GDN at runtime)"
+           % (triton.__version__, cc, torch.version.cuda))
+except Exception as e:
+    warn("triton/Blackwell check: %s" % e)
 print("RESULT_FAILS=%d" % len(fails))
 sys.exit(1 if fails else 0)
 PY
