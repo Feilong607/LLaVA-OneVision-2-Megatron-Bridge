@@ -119,6 +119,10 @@ def _vision_config_from(
         ("first_pipeline_num_layers", None),
         ("last_pipeline_num_layers", None),
         ("tp_comm_overlap", False),
+        ("expert_model_parallel_size", 1),
+        ("expert_tensor_parallel_size", 1),
+        ("tensor_model_parallel_size", 1),
+        ("sequence_parallel", False),
         ("num_moe_experts", None),
         ("moe_router_topk", None),
         ("qk_layernorm", False),
@@ -142,6 +146,14 @@ def _adapter_config_from(llm_cfg):
     ac.activation_func = torch.nn.functional.gelu
     ac.gated_linear_unit = False
     ac.bias_activation_fusion = False
+    # Dense PatchMerger MLP: do not let the deep-copied MoE-LLM cfg leak expert/parallel knobs onto it
+    # (inert at TP1/EP8 today since the adapter spec is dense, but a landmine if TP/EP ever change).
+    for _f, _d in (("num_moe_experts", None), ("moe_router_topk", None),
+                   ("expert_model_parallel_size", 1), ("expert_tensor_parallel_size", 1),
+                   ("tensor_model_parallel_size", 1), ("sequence_parallel", False),
+                   ("pipeline_model_parallel_size", 1), ("context_parallel_size", 1)):
+        if hasattr(ac, _f):
+            setattr(ac, _f, _d)
     return ac
 
 
@@ -529,10 +541,14 @@ def load_ov2_mcore_checkpoint(model: LlavaOnevision2, ckpt_path: str, *, load_ad
             except Exception:
                 ep_rank, ep_size = 0, len(ep_shards)
             if len(ep_shards) != ep_size:
-                logger.warning(
-                    "[ov2 load] EP-sharded ckpt has %d shards but EP world size is %d; build with "
-                    "expert_model_parallel_size=%d to match", len(ep_shards), ep_size, len(ep_shards),
-                )
+                # FATAL (was a warning): index-based ep_rank->shard mapping would load the WRONG experts
+                # / drop half of them at EP!=8 (silent corruption -> loss/grad blow up). The AIAK base is
+                # EP8; the only safe path is EP8 (>=2 GB200 nodes), or from_base at EP8 then `reshard`.
+                raise SystemExit(
+                    "[ov2 load] EP-sharded base has {} shards but EP world size is {} -> each rank would "
+                    "load the WRONG experts (silent corruption). Build/run at expert_model_parallel_size={} "
+                    "(EP8 on >=2 GB200 nodes), or from_base at EP8 then reshard to the target EP.".format(
+                        len(ep_shards), ep_size, len(ep_shards)))
             cand = os.path.join(rel, f"mp_rank_00_{ep_rank:03d}", "model_optim_rng.pt")
             p = cand if os.path.exists(cand) else (ep_shards[ep_rank] if ep_rank < len(ep_shards) else single)
             logger.info("[ov2 load] EP-sharded ckpt: ep_rank=%d/%d -> %s", ep_rank, ep_size, p)

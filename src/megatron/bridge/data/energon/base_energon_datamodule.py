@@ -221,9 +221,7 @@ class EnergonMultiModalDataModule:
         worker_config = self._build_worker_config(self.num_workers, split="train")
         train_dataset = self.datasets_provider(worker_config, split="train")
         energon_dataloader = get_savable_loader(train_dataset, worker_config=worker_config)
-        logger.warning("[energon DEBUG] train_dataloader BUILD reached get_savable_loader; dataloader_load=%r; calling _maybe_restore now", self.dataloader_load)
         self._maybe_restore_dataloader_state(energon_dataloader)
-        logger.warning("[energon DEBUG] train_dataloader BUILD: _maybe_restore returned")
         self.train_dataloader_object = energon_dataloader
         return EnergonDataloader(self.train_dataloader_object)
 
@@ -236,13 +234,8 @@ class EnergonMultiModalDataModule:
         iterated. Fail-safe: if state is missing or the DP/worker topology changed since save, log a
         warning and let data start fresh (never crash the resume).
         """
-        logger.warning(
-            "[energon DEBUG] _maybe_restore ENTER: dataloader_load=%r train_obj_set=%s pg=%s",
-            self.dataloader_load, self.train_dataloader_object is not None, self.pg_collection is not None,
-        )
         load_dir = self.dataloader_load
         if not load_dir:
-            logger.warning("[energon DEBUG] load_dir falsy (%r) -> skipping restore", load_dir)
             return
         tracker = os.path.join(load_dir, "latest_checkpointed_iteration.txt")
         if not os.path.exists(tracker):
@@ -261,7 +254,6 @@ class EnergonMultiModalDataModule:
             else 0
         )
         state_path = os.path.join(load_dir, f"iter_{iteration:07d}", f"train_dataloader_dprank{dp_rank:03d}.pt")
-        logger.warning("[energon DEBUG] dp_rank=%s state_path=%s exists=%s", dp_rank, state_path, os.path.exists(state_path))
         if not os.path.exists(state_path):
             logger.warning(
                 "[energon resume] dataloader state %s not found; data starts from scratch "

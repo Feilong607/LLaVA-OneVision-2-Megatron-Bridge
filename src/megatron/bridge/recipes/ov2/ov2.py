@@ -384,7 +384,7 @@ def _ov2_common(
         # AIAK stage-1: AdamW(0.9,0.99,eps1e-5,wd0), lr 2e-5 -> cosine -> 1e-6, warmup-frac 0.002,
         # clip 1.0, bf16, 1 epoch over 558k.  (stage-2-AdamW: constant lr via min_lr==max_lr.)
         opt_cfg, sched_cfg = distributed_fused_adam_with_cosine_annealing(
-            lr_warmup_iters=max(1, int(0.002 * train_iters)),
+            lr_warmup_iters=(max(1, int(0.002 * train_iters)) if stage == "stage1" else 0),  # AIAK: stage2/midtrain = constant LR, no warmup ramp
             lr_decay_iters=train_iters,
             max_lr=max_lr,
             min_lr=min_lr,

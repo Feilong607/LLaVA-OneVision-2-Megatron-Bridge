@@ -74,4 +74,37 @@ PY
 sec "6. Multi-precision GEMM peaks (calibrate MFU_PEAK_TFLOPS: bf16=Phase1, fp8=Phase2)"
 python "$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/gb200_flops.py" 2>/dev/null || echo "flops sweep skipped/failed"
 
+sec "7. Phase-2 (ACCEL=1/2) no-internet preflight: MXFP8 recipe + flex/HybridEP backend import"
+python - <<'PY'
+def ok(m): print("  [OK]   "+m)
+def bad(m): print("  [FAIL] "+m)
+def warn(m): print("  [WARN] "+m)
+# (a) MXFP8 recipe present (ACCEL=1 sets mixed_precision=bf16_with_mxfp8_mixed -> ov2_provider copies
+#     these fp8 fields onto the RUNTIME LLM config; cfg.model alone is dead).
+try:
+    from megatron.bridge.training.mixed_precision import bf16_with_mxfp8_mixed
+    r = bf16_with_mxfp8_mixed()
+    ok("MXFP8 recipe: fp8=%s recipe=%s param_gather=%s" % (r.fp8, r.fp8_recipe, getattr(r, "fp8_param_gather", None)))
+except Exception as e: bad("MXFP8 recipe import: %s" % e)
+# (b) flex dispatcher helper (ACCEL=2 -> ov2_provider calls apply_flex_dispatcher_backend on runtime config).
+try:
+    from megatron.bridge.training.flex_dispatcher_backend import apply_flex_dispatcher_backend  # noqa
+    ok("apply_flex_dispatcher_backend import (HybridEP wired via this in ov2_provider.provide)")
+except Exception as e: bad("flex_dispatcher_backend import: %s" % e)
+# (c) HybridEP/DeepEP RUNTIME package: MUST import offline for ACCEL=2. A missing pkg crashes BEFORE
+#     iter 1 and CANNOT be pip-installed on GB200 (no internet). If [WARN], stay on ACCEL=0/1 (alltoall).
+import importlib
+try:
+    importlib.import_module("deep_ep")
+    from deep_ep import HybridEPBuffer  # the actual buffer mcore's HybridEP dispatcher imports
+    from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
+    assert HAVE_HYBRIDEP, "deep_ep imports but mcore HAVE_HYBRIDEP is False (HybridEPBuffer/hybrid_ep_cpp missing)"
+    ok("HybridEP fully importable (deep_ep + HybridEPBuffer + HAVE_HYBRIDEP) -> ACCEL=2 usable offline")
+except Exception as e:
+    warn("runtime pkg 'deep_ep' NOT importable: %s -> ACCEL=2 (HybridEP) WILL FAIL at runtime; "
+         "use ACCEL=0/1 (alltoall) unless deep_ep is baked into the container." % e)
+PY
+echo "  NOTE: after a real run, confirm Phase-2 ENGAGED (it silently no-ops if the provider wiring regresses):"
+echo "        grep train log for '[ov2 provider] fp8 wired' (ACCEL=1) and '[ov2 provider] flex dispatcher wired' (ACCEL=2)"
+
 echo; echo "========== gb200_check done =========="
