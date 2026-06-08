@@ -589,11 +589,17 @@ def load_ov2_mcore_checkpoint(model: LlavaOnevision2, ckpt_path: str, *, load_ad
 
     if not load_adapter:
         sd = {k: v for k, v in sd.items() if not k.startswith("adapter.")}
+    # load_vision=False: drop vision_model.* from the primary stitch so a separate p16m33 vision
+    # source (load_hf_encoder_into_tower) is authoritative (was a dead param; now honored).
+    if not load_vision:
+        sd = {k: v for k, v in sd.items() if not k.startswith("vision_model.")}
 
     missing, unexpected = model.load_state_dict(sd, strict=False)
     real_missing = [
         k for k in missing
-        if not k.endswith("._extra_state") and not (not load_adapter and k.startswith("adapter."))
+        if not k.endswith("._extra_state")
+        and not (not load_adapter and k.startswith("adapter."))
+        and not (not load_vision and k.startswith("vision_model."))
     ]
     real_unexpected = [k for k in unexpected if not k.endswith("._extra_state")]
     summary = {

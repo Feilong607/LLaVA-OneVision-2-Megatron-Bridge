@@ -22,11 +22,27 @@ REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ 
 RECIPE="${RECIPE:-ov2_35b_a3b_midtrain}"
 # HF models root (LLM arch + energon processor). Default A100-2 layout; override on GB200 to wherever
 # Qwen3-30B-A3B-Instruct-2507/ and llava_onevision2/llava_onevision2_30b_a3b/auto_model/ actually live.
-OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-$([[ -d /ov2/pretrain_models ]] && echo /ov2/pretrain_models || echo "$HOME/pretrain_models")}"
+# --- CARD PATH PROFILE: A100 (/ov2) <-> GB200 (/datasets). Per-card path DEFAULTS; all env-overridable.
+#     The recipe reads OV2_PRETRAIN_ROOT (llava processor+stage_0 ckpt root) and OV2_LLM_HF_30B (Qwen LLM). ---
+if [[ "${HWNAME:-}" == "gb200" || -d /datasets/qwen-models-ea5jyi ]]; then
+  OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/datasets/qwen-models-ea5jyi/Qwen3-30B-A3B-Instruct-2507}"
+  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # GB200: now only the processor root (stage_0 SKIPPED); better set OV2_HF_PROC_30B directly — PENDING from you
+  DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"   # /datasets/llava/11May data
+  INIT_CKPT="${INIT_CKPT:-/datasets/stage2}"                           # stage2 resume ckpt (GB200, user-set)
+  SAVE="${SAVE:-/home/ftan0055/ckpts_video_sft/ov2_30b_a3b_gb200}"     # output dir (GB200, user-set)
+  OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # GB200: mid-train from stage2 -> skip the stage_0 stitch
+else
+  OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/ov2/pretrain_models/Qwen3-30B-A3B-Instruct-2507}"
+  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/ov2/pretrain_models}"
+  DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/mid_training_seed85m.yaml}"         # /ov2/dataset_sft data (backup yaml)
+  INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_stage2}"
+  SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_gb200}"
+  OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-0}"   # A100: keep the stage_0 stitch
+fi
+OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b/auto_model}"
+export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B
+export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before skipping the stitch
 ACCEL="${ACCEL:-0}"
-INIT_CKPT="${INIT_CKPT:-$([[ -d /ov2/feilong ]] && echo /ov2/feilong/gb200 || echo "$HOME/ov2")/ckpts_video_sft/ov2_30b_a3b_stage2}"
-DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"
-SAVE="${SAVE:-$([[ -d /ov2/feilong ]] && echo /ov2/feilong/gb200 || echo "$HOME/ov2")/ckpts_video_sft/ov2_30b_a3b_gb200}"
 export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"
@@ -86,9 +102,9 @@ if [[ -f "$DATA_PATH" ]]; then
 fi
 
 sec "3. HF dirs (LLM arch + processor) — MUST be local (no internet at runtime)"
-exdir "$OV2_PRETRAIN_ROOT/Qwen3-30B-A3B-Instruct-2507"                              "LLM HF dir (AutoBridge arch/weights)"
-exfile "$OV2_PRETRAIN_ROOT/Qwen3-30B-A3B-Instruct-2507/config.json"                 "LLM HF config.json"
-exdir "$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b/auto_model"     "HF processor dir (energon task encoder)"
+exdir "$OV2_LLM_HF_30B"                                                             "LLM HF dir (AutoBridge arch/weights)"
+exfile "$OV2_LLM_HF_30B/config.json"                                                "LLM HF config.json"
+exdir "$OV2_HF_PROC_30B"                                                            "HF processor dir (energon task encoder)"
 
 sec "4. disk space for SAVE (ckpts ~60GB each, model-only; more with optimizer)"
 sdir="$SAVE"; while [[ ! -d "$sdir" && "$sdir" != "/" ]]; do sdir="$(dirname "$sdir")"; done

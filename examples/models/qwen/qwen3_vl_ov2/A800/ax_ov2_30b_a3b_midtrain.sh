@@ -20,7 +20,7 @@ REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge-refactor}"
 IMAGE="${IMAGE:-mbridge:qwen35-muon}"                            # superset image (AdamW path used for MoE)
 DATA_PATH="${DATA_PATH:-/vlm/data/llava_next_full_mega}"         # mid-train SFT data (override with the real corpus)
 INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_stage2}"  # trained stage-2 (model-only load)
-SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_midtrain}"
+SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_midtrain}"
 NPROC="${NPROC:-8}"
 ITERS="${ITERS:-6094}"          # 1 epoch over 780k @ gbs 128 (override for the real mid-train corpus)
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-500}"
@@ -53,15 +53,15 @@ NCCL_ENV="-e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0} \
 
 PRELOAD=""; [[ "$INIT_CKPT" != "null" && -n "$INIT_CKPT" ]] && PRELOAD="checkpoint.pretrained_checkpoint=$INIT_CKPT"
 
-mkdir -p "$SAVE"; docker rm -f ov2_30b_mid 2>/dev/null || true
+mkdir -p "$SAVE"; docker rm -f ov2_30b_p16m33_mid 2>/dev/null || true
 echo "[ov2-30b-midtrain] nnodes=${NNODES:-1} init=$INIT_CKPT save=$SAVE (FULL model, AdamW for MoE)"
-docker run -d --name ov2_30b_mid --network=host --privileged --gpus all -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+docker run -d --name ov2_30b_p16m33_mid --network=host --privileged --gpus all -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   --ipc=host --shm-size=32g --ulimit memlock=-1 --ulimit stack=67108864 $NCCL_ENV \
   -e PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim" \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e OMP_NUM_THREADS=8 \
   -v /ov2:/ov2 -v /vlm:/vlm -w "$REPO" "$IMAGE" bash -lc "
     python -m torch.distributed.run $RDZV --nproc_per_node=$NPROC scripts/training/run_recipe.py \
-      --recipe ov2_35b_a3b_midtrain --dataset vlm-energon --step_func ov2_step \
+      --recipe ov2_30b_a3b_p16m33_midtrain --dataset vlm-energon --step_func ov2_step \
       dataset.path=$DATA_PATH $PRELOAD \
       checkpoint.save=$SAVE checkpoint.load=$SAVE dataset.dataloader_save=$SAVE \
       checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS \

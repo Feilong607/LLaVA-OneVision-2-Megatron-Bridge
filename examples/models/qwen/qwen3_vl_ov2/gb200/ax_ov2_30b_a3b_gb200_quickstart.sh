@@ -19,9 +19,20 @@ set -euo pipefail
 REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
 [[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/LLaVA-OneVision-2-Megatron-Bridge" >&2; exit 1; }
 RECIPE="${RECIPE:-ov2_35b_a3b_midtrain}"
-DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"  # seed85m offline-packed metadataset
-INIT_CKPT="${INIT_CKPT:-null}"     # smoke: skip the trained-stage load (base ckpt is still stitched). Set a stage1 dir to also test load.
-SAVE="${SAVE:-$([[ -d /ov2/feilong ]] && echo /ov2/feilong/gb200 || echo "$HOME/ov2")/ckpts_video_sft/ov2_30b_a3b_gb200_smoke}"
+INIT_CKPT="${INIT_CKPT:-null}"     # smoke: skip the trained-stage load (base ckpt is still stitched)
+# --- CARD PATH PROFILE (smoke): A100 (/ov2) <-> GB200 (/datasets); INIT_CKPT stays null. ---
+if [[ "${HWNAME:-}" == "gb200" || -d /datasets/qwen-models-ea5jyi ]]; then
+  OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/datasets/qwen-models-ea5jyi/Qwen3-30B-A3B-Instruct-2507}"
+  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # TODO-GB200
+  DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"
+  SAVE="${SAVE:-/home/ftan0055/ckpts_video_sft/ov2_30b_a3b_gb200_smoke}"
+else
+  OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/ov2/pretrain_models/Qwen3-30B-A3B-Instruct-2507}"
+  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/ov2/pretrain_models}"
+  DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/mid_training_seed85m.yaml}"
+  SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_gb200_smoke}"
+fi
+export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT
 NPROC="${NPROC:-4}"                # single node = 4 GPU
 
 # --- smoke-sized overrides (tiny + fast + memory-safe on 4 GPU) ---

@@ -73,7 +73,7 @@ MIDTRAIN_N_SAMPLES = 780000   # default: LLaVA-Next 780k (date0528, NON-packed).
 # 4B values are VERIFIED (the running recipe). 8B / 35B-A3B values are the documented dirs; the
 # exact mcore-ckpt SUBPATH, processor dir, and a real trained stage-1 for those two are NOT
 # verifiable from the local copy and MUST be confirmed on the server (see report).
-_OV2_PRETRAIN_ROOT = "/ov2/pretrain_models"
+_OV2_PRETRAIN_ROOT = os.environ.get("OV2_PRETRAIN_ROOT", "/ov2/pretrain_models")
 
 _OV2_BACKBONES: dict[str, dict[str, Any]] = {
     "qwen3-4b": {
@@ -130,7 +130,7 @@ _OV2_BACKBONES: dict[str, dict[str, Any]] = {
     # the OV2 vision tower from this ckpt's vision_model + fresh adapter (no aligned ckpt -> stage-1).
     "qwen3-30b-a3b": {
         "is_moe": True,
-        "llm_hf": f"{_OV2_PRETRAIN_ROOT}/Qwen3-30B-A3B-Instruct-2507",   # qwen3_moe: 128 experts, ffn 768, 48L
+        "llm_hf": os.environ.get("OV2_LLM_HF_30B", f"{_OV2_PRETRAIN_ROOT}/Qwen3-30B-A3B-Instruct-2507"),   # qwen3_moe: 128 experts, ffn 768, 48L
         # OV2-30B-A3B mcore ckpt is EP8-SHARDED (release/mp_rank_00_000 .. _007). Each shard replicates
         # non-expert + vision_model(291) + adapter(6) and carries its own 16 local_experts (128/8). The
         # EP-aware branch in load_ov2_mcore_checkpoint loads THIS rank's shard; build with EP=8. The
@@ -140,7 +140,7 @@ _OV2_BACKBONES: dict[str, dict[str, Any]] = {
         "mcore_ckpt": f"{_OV2_PRETRAIN_ROOT}/llava_onevision2/llava_onevision2_30b_a3b/stage_0_tp1_pp1_ep8",
         # OWN processor (auto_model, NOTE underscore): standard Qwen2_5_VLProcessor, patch14 / merge2
         # (same reason as 8B; the 4B p16m33 processor patchifies at patch16 and crashes a patch14 tower).
-        "hf_proc": f"{_OV2_PRETRAIN_ROOT}/llava_onevision2/llava_onevision2_30b_a3b/auto_model",
+        "hf_proc": os.environ.get("OV2_HF_PROC_30B", f"{_OV2_PRETRAIN_ROOT}/llava_onevision2/llava_onevision2_30b_a3b/auto_model"),
         # Vision tower = patch14 / merge2 / hidden 1024 / 24L — IDENTICAL size class to 8B (NOT a larger
         # 1664/48 "vision-2b"). CONFIRMED by the ckpt config (vision hidden_size=1024, num_hidden_layers
         # =24) and the 291 vision keys/shard (~12/layer x 24). adapter merges 1024 * 2^2 = 4096.
@@ -150,6 +150,28 @@ _OV2_BACKBONES: dict[str, dict[str, Any]] = {
         "vision_num_layers": 24,
         "vision_model_name": None,
         "stage1_ckpt": None,   # no verified trained stage-1 yet; set via CLI for stage-2 chaining.
+    },
+    # p16m33 variant of the 30B-A3B backbone: SAME Qwen3-30B-A3B MoE LLM, vision tower is patch16 /
+    # merge3 (OV2.1 p16m33 OneVisionEncoder); adapter merges 1024*3^2=9216 -> 2048. Vision weights are
+    # baked from the standalone HF OneVisionEncoder (onevision_encoder_patch16_0507-tf57) into the
+    # combined mcore stitch at build time via A800/convert from_base --vision_hf. hf_proc = p16m33 proc.
+    "qwen3-30b-a3b-p16m33": {
+        "is_moe": True,
+        "llm_hf": os.environ.get("OV2_LLM_HF_30B", f"{_OV2_PRETRAIN_ROOT}/Qwen3-30B-A3B-Instruct-2507"),
+        "mcore_ckpt": os.environ.get(
+            "OV2_MCORE_30B_P16M33",
+            f"{_OV2_PRETRAIN_ROOT}/llava_onevision2/llava_onevision2_30b_a3b_p16_m33/stage_0_tp1_pp1_ep8",
+        ),
+        "hf_proc": os.environ.get(
+            "OV2_HF_PROC_30B_P16M33",
+            f"{_OV2_PRETRAIN_ROOT}/llava_onevision2/llava_onevision2_30b_a3b_p16_m33/auto_model",
+        ),
+        "vision_patch_size": 16,
+        "vision_spatial_merge_size": 3,
+        "vision_hidden_size": 1024,
+        "vision_num_layers": 24,
+        "vision_model_name": None,
+        "stage1_ckpt": None,
     },
 }
 
@@ -249,6 +271,29 @@ def _make_ov2_energon_dataset(
 # =============================================================================
 # Shared recipe builder
 # =============================================================================
+def _ckpt_is_torch_dist(path) -> bool:
+    """True if `path` is a Bridge torch_dist checkpoint (iter_<N>/.metadata, no AIAK release/mp_rank).
+
+    The OV2 stitch loader (load_ov2_mcore_checkpoint) reads ONLY the AIAK .pt layout
+    (release/mp_rank_00[_NNN]/model_optim_rng.pt). A torch_dist ckpt (e.g. built by A800/convert
+    from_base, saved via save_megatron_model) must instead load as checkpoint.pretrained_checkpoint.
+    Detect the format so _ov2_common routes it correctly (else: IsADirectoryError/FileNotFoundError).
+    """
+    if not path or not os.path.isdir(path):
+        return False
+    if os.path.isdir(os.path.join(path, "release")):
+        return False  # AIAK stitch base (release/mp_rank_*/model_optim_rng.pt)
+    if os.path.exists(os.path.join(path, ".metadata")):
+        return True   # direct dist-checkpoint dir
+    try:
+        for d in os.listdir(path):
+            if d.startswith("iter_") and os.path.exists(os.path.join(path, d, ".metadata")):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def _ov2_common(
     backbone: str,
     stage: str,
@@ -314,6 +359,37 @@ def _ov2_common(
         freeze_vision_model = False                # TRAIN the vision tower
         freeze_language_model = stage != "midtrain"  # midtrain unfreezes the LLM; stage2 keeps it frozen
 
+    # OV2_SKIP_BASE_STITCH=1 (set by the GB200 launcher): mid-train resumes straight from a FULL
+    # stage-2 ckpt, so skip the stage_0 base stitch entirely (no stage_0 needed on the box). SAFE-
+    # GUARDED: a real OV2_INIT_CKPT must exist, else building on random weights -> refuse (the exact
+    # NaN trap the always-stitch default guarded against). ckpt_path=None makes register_ov2_ckpt_hook
+    # a no-op; checkpoint.pretrained_checkpoint then loads ALL weights from the stage-2 ckpt.
+    if os.environ.get("OV2_SKIP_BASE_STITCH") == "1":
+        _init = os.environ.get("OV2_INIT_CKPT", "")
+        if not (_init and os.path.exists(_init)):
+            raise FileNotFoundError(
+                f"OV2_SKIP_BASE_STITCH=1 but OV2_INIT_CKPT not found: {_init!r}. Refusing to skip the "
+                f"stage_0 stitch without a loadable resume (would train on RANDOM weights -> NaN)."
+            )
+        logging.getLogger(__name__).warning(
+            "OV2_SKIP_BASE_STITCH=1: skipping stage_0 stitch; ALL weights come from OV2_INIT_CKPT=%s "
+            "(verify iter-1 loss is finite, not NaN).", _init,
+        )
+        ckpt_path = None
+
+    # Format/role auto-route (fixes torch_dist-vs-AIAK mismatch): a torch_dist mcore_ckpt/stage1_ckpt
+    # (iter_*/.metadata; e.g. A800/convert from_base output) is a FULL Bridge ckpt and MUST load via
+    # checkpoint.pretrained_checkpoint, NOT the AIAK release/mp_rank stitch (load_ov2_mcore_checkpoint
+    # reads only .pt). Detect + route so stage1/2/mid work whether the base is AIAK (stitch) or
+    # torch_dist (pretrained_checkpoint). AIAK backbones (4B/8B release/ ckpts) are unaffected.
+    _pretrained_ckpt = None
+    if ckpt_path is not None and _ckpt_is_torch_dist(ckpt_path):
+        logging.getLogger(__name__).warning(
+            "[ov2 recipe] mcore_ckpt %s is torch_dist -> loading via checkpoint.pretrained_checkpoint "
+            "(skipping the AIAK release/mp_rank stitch).", ckpt_path)
+        _pretrained_ckpt = ckpt_path
+        ckpt_path = None
+
     cfg.model = LlavaOnevision2Provider.from_llm(
         paths["llm_hf"],
         is_moe=is_moe,
@@ -360,6 +436,9 @@ def _ov2_common(
     # weights (observed: OV2-30B-A3B NaN at iter 2 on all ranks). Always stitching is robust; the
     # extra ~30s load on a real resume is harmless.
     cfg.model.register_ov2_ckpt_hook()
+    # torch_dist base (auto-routed above) loads as the pretrained_checkpoint default (CLI overrides win).
+    if _pretrained_ckpt is not None:
+        cfg.checkpoint.pretrained_checkpoint = _pretrained_ckpt
 
     # ---- Train / validation ----
     cfg.train.train_iters = train_iters
@@ -560,6 +639,31 @@ def ov2_35b_a3b_stage2() -> ConfigContainer:
     )
 
 
+def ov2_30b_a3b_p16m33_stage1() -> ConfigContainer:
+    """OV2 A3B-MoE p16m33 stage-1 adapter-only alignment. Backbone qwen3-30b-a3b-p16m33:
+    Qwen3-30B-A3B MoE LLM + OV2.1 patch16/merge3 vision tower (HF onevision_encoder_patch16 baked into
+    the combined mcore stitch) + FRESH merge3 adapter (1024*3^2=9216 -> 2048). EP=8. Build the combined
+    ckpt first via A800/convert from_base --vision_hf <encoder>."""
+    return _ov2_common(
+        "qwen3-30b-a3b-p16m33",
+        "stage1",
+        expert_model_parallel_size=8,
+        sequence_parallel=False,
+    )
+
+
+def ov2_30b_a3b_p16m33_stage2() -> ConfigContainer:
+    """OV2 A3B-MoE p16m33 stage-2 vit+adapter SFT (distributed Muon, EP=8). Backbone
+    qwen3-30b-a3b-p16m33. Needs a trained p16m33 stage-1 ckpt to chain from
+    (set via CLI checkpoint.pretrained_checkpoint=<stage1>)."""
+    return _ov2_common(
+        "qwen3-30b-a3b-p16m33",
+        "stage2",
+        expert_model_parallel_size=8,
+        sequence_parallel=False,
+    )
+
+
 # =============================================================================
 # Mid-train (stage 1.5) recipe functions — train the FULL model (LLM+vision+adapter)
 # =============================================================================
@@ -585,6 +689,18 @@ def ov2_35b_a3b_midtrain() -> ConfigContainer:
     vit+adapter stage-2 (validate on GPU). Chain via CLI checkpoint.pretrained_checkpoint."""
     return _ov2_common(
         "qwen3-30b-a3b",
+        "midtrain",
+        expert_model_parallel_size=8,
+        sequence_parallel=False,
+    )
+
+
+def ov2_30b_a3b_p16m33_midtrain() -> ConfigContainer:
+    """OV2 A3B-MoE p16m33 mid-train: FULL-model SFT (LLM+vision+adapter), EP=8, AdamW (MoE).
+    Backbone qwen3-30b-a3b-p16m33. Chain from a trained p16m33 stage via CLI
+    checkpoint.pretrained_checkpoint=<ckpt>."""
+    return _ov2_common(
+        "qwen3-30b-a3b-p16m33",
         "midtrain",
         expert_model_parallel_size=8,
         sequence_parallel=False,

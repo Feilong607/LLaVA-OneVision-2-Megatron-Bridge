@@ -14,10 +14,13 @@ from .ov2 import (
     ov2_8b_stage2,
     ov2_35b_a3b_stage1,
     ov2_35b_a3b_stage2,
+    ov2_30b_a3b_p16m33_stage1,
+    ov2_30b_a3b_p16m33_stage2,
     # mid-train (stage 1.5) — full-model SFT
     ov2_4b_midtrain,
     ov2_8b_midtrain,
     ov2_35b_a3b_midtrain,
+    ov2_30b_a3b_p16m33_midtrain,
     # back-compat aliases (original 4B names)
     ov2_1_stage1_adapter_only_config,
     ov2_1_stage2_vit_adapter_muon_config,
@@ -33,9 +36,12 @@ __all__ = [
     "ov2_8b_stage2",
     "ov2_35b_a3b_stage1",
     "ov2_35b_a3b_stage2",
+    "ov2_30b_a3b_p16m33_stage1",
+    "ov2_30b_a3b_p16m33_stage2",
     "ov2_4b_midtrain",
     "ov2_8b_midtrain",
     "ov2_35b_a3b_midtrain",
+    "ov2_30b_a3b_p16m33_midtrain",
     "ov2_1_stage1_adapter_only_config",
     "ov2_1_stage2_vit_adapter_muon_config",
 ]
