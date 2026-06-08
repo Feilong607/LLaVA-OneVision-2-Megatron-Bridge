@@ -12,6 +12,7 @@
 set -euo pipefail
 
 REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
+bash "$REPO/3rdparty/apply_megatron_patch.sh" 2>/dev/null || true   # fresh-clone safety: apply OV2 mcore submodule patch (apply_rotary_fn hook)
 IMAGE="${IMAGE:-mbridge:qwen35-muon}"                            # stage-2 = distributed Muon (needs emerging_optimizers)
 DATA_PATH="${DATA_PATH:-/vlm/data/llava_next_full_mega}"         # stage-2 SFT data (LLaVA-Next 780k)
 INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_stage1}"  # trained stage-1 (model-only load)

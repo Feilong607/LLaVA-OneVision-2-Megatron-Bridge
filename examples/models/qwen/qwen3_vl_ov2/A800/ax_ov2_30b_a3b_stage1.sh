@@ -12,6 +12,7 @@
 set -euo pipefail
 
 REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"   # OV2 multi-backbone code + ov2_35b_a3b_* recipes
+bash "$REPO/3rdparty/apply_megatron_patch.sh" 2>/dev/null || true   # fresh-clone safety: apply OV2 mcore submodule patch (apply_rotary_fn hook)
 IMAGE="${IMAGE:-mbridge:qwen35}"                                # stage-1 = AdamW (no Muon needed)
 DATA_PATH="${DATA_PATH:-/vlm/data/blip_laion_cc_sbu_558k_wds}"  # stage-1 alignment data (558k)
 SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_stage1}"
@@ -41,6 +42,11 @@ NCCL_ENV="-e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-eth0} \
   -e NCCL_IB_HCA=${NCCL_IB_HCA:-mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8} \
   -e NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3} -e NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}"
 
+# RECOMPUTE=1 (default) enables LLM activation recompute. stage-1 freezes LLM+vision, but backprop
+# still traverses all 48 LLM layers to reach the adapter, so at SEQ_LEN=32000 the attention
+# activations OOM an 80GB card without it (same as stage-2). SELECTIVE core_attn by default;
+# OV2_RECOMPUTE_FULL=1 forces full-layer recompute.
+RECOMPUTE_FLAG=""; [[ "${RECOMPUTE:-1}" == "1" ]] && RECOMPUTE_FLAG="model.recompute_activations=true"
 mkdir -p "$SAVE"; docker rm -f ov2_30b_p16m33_s1 2>/dev/null || true
 echo "[ov2-30b-stage1] nnodes=${NNODES:-1} save=$SAVE repo=$REPO"
 docker run -d --name ov2_30b_p16m33_s1 --network=host --privileged --gpus all -e CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
@@ -48,10 +54,11 @@ docker run -d --name ov2_30b_p16m33_s1 --network=host --privileged --gpus all -e
   -e PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim" \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e OMP_NUM_THREADS=8 \
   -e OV2_SKIP_BASE_STITCH=1 -e OV2_INIT_CKPT="$INIT" \
+  -e OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}" \
   -v /ov2:/ov2 -v /vlm:/vlm -w "$REPO" "$IMAGE" bash -lc "
     python -m torch.distributed.run $RDZV --nproc_per_node=$NPROC scripts/training/run_recipe.py \
       --recipe ov2_30b_a3b_p16m33_stage1 --dataset vlm-energon --step_func ov2_step \
-      dataset.path=$DATA_PATH \
+      dataset.path=$DATA_PATH $RECOMPUTE_FLAG \
       checkpoint.pretrained_checkpoint=$INIT \
       checkpoint.save=$SAVE checkpoint.load=$SAVE dataset.dataloader_save=$SAVE \
       checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS \
