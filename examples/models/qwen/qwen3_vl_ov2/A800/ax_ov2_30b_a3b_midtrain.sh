@@ -20,7 +20,7 @@ REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
 bash "$REPO/3rdparty/apply_megatron_patch.sh" 2>/dev/null || true   # fresh-clone safety: apply OV2 mcore submodule patch (apply_rotary_fn hook)
 IMAGE="${IMAGE:-mbridge:qwen35-muon}"                            # superset image (AdamW path used for MoE)
 DATA_PATH="${DATA_PATH:-/vlm/data/llava_next_full_mega}"         # mid-train SFT data (override with the real corpus)
-INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_stage2}"  # trained stage-2 (model-only load)
+INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_stage2}"  # trained stage-2 (model-only load)
 SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_midtrain}"
 NPROC="${NPROC:-8}"
 ITERS="${ITERS:-6094}"          # 1 epoch over 780k @ gbs 128 (override for the real mid-train corpus)

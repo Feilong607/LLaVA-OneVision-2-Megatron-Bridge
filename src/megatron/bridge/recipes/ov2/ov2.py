@@ -453,7 +453,10 @@ def _ov2_common(
     # Stage-1 AdamW + distopt=True runs EP8 cleanly, and the dense 4B stage-2 runs Muon+distopt-off
     # cleanly — only Muon + MoE/EP together hang. AdamW here keeps EP8 happy (optimizer differs from the
     # AIAK Muon recipe; acceptable until distributed-Muon+EP is fixed).
-    _stage2_adamw = stage == "stage2" and os.environ.get("OV2_STAGE2_ADAMW", "0") == "1"
+    # MoE backbones AUTO-route stage-2 to AdamW: distributed Muon on EP8 deadlocks the expert-parallel
+    # backward all-to-all (see comment above) AND crashes muon_split_qkv on the trainable vision QKV.
+    # Dense 4B/8B keep Muon. OV2_STAGE2_ADAMW=1 forces AdamW on a dense backbone too.
+    _stage2_adamw = stage == "stage2" and (is_moe or os.environ.get("OV2_STAGE2_ADAMW", "0") == "1")
     # midtrain trains the FULL model -> on a MoE backbone the experts become trainable, so distributed
     # Muon (use_distributed_optimizer=False) would hit the SAME EP backward all-to-all deadlock as
     # stage-2 Muon. Default MoE midtrain to AdamW(distopt=True); dense midtrain keeps Muon (AIAK
@@ -505,6 +508,15 @@ def _ov2_common(
         _muon_rms = 0.15 if stage == "midtrain" else 0.2
         cfg.optimizer.muon_extra_scale_factor = _muon_rms   # the field mcore actually reads
         cfg.optimizer.muon_scale_mode = "spectral"          # supplies the sqrt(max(d_out,d_in)) term
+        # OV2: the vision tower's fused QKV has a DIFFERENT head/group layout than the LLM, so Muon's
+        # split_qkv (mcore default True) reshapes it with the LLM's qkv_split_shapes -> RuntimeError on
+        # a backbone whose split-sum does not divide the vision QKV numel (e.g. 30B-A3B if it ever ran
+        # Muon), or SILENT vision-QKV gradient corruption where it happens to divide (4B/8B). The LLM
+        # QKV in stage-2 is FROZEN (and in dense midtrain a single-matrix orthogonalization is fine),
+        # so orthogonalize the fused QKV as one matrix. Correct-by-construction here (previously this
+        # was only set via the launch-script CLI optimizer.muon_split_qkv=false, which direct/dense
+        # Muon runs did not get).
+        cfg.optimizer.muon_split_qkv = False
         cfg.optimizer.adam_beta1 = 0.9              # Muon's AdamW for scalar/1-D params
         cfg.optimizer.adam_beta2 = 0.99
         cfg.optimizer.adam_eps = 1e-5
