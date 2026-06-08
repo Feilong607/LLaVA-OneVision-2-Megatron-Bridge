@@ -456,7 +456,7 @@ def _ov2_common(
     # MoE backbones AUTO-route stage-2 to AdamW: distributed Muon on EP8 deadlocks the expert-parallel
     # backward all-to-all (see comment above) AND crashes muon_split_qkv on the trainable vision QKV.
     # Dense 4B/8B keep Muon. OV2_STAGE2_ADAMW=1 forces AdamW on a dense backbone too.
-    _stage2_adamw = stage == "stage2" and (is_moe or os.environ.get("OV2_STAGE2_ADAMW", "0") == "1")
+    _stage2_adamw = stage == "stage2" and os.environ.get("OV2_STAGE2_ADAMW", "0") == "1"
     # midtrain trains the FULL model -> on a MoE backbone the experts become trainable, so distributed
     # Muon (use_distributed_optimizer=False) would hit the SAME EP backward all-to-all deadlock as
     # stage-2 Muon. Default MoE midtrain to AdamW(distopt=True); dense midtrain keeps Muon (AIAK

@@ -16,7 +16,9 @@ PROBE="$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/gb200_nccl_probe.py"
 if [[ -n "${LIST_IP:-}" ]]; then read -ra list_ip <<< "$LIST_IP"; else list_ip=(); fi
 NN=${#list_ip[@]}
 if [[ "$NN" -le 1 ]]; then
-  RDZV="--standalone"
+  # static single-node rendezvous (NOT --standalone): the dynamic c10d rendezvous
+  # times out at next_rendezvous join inside GB200 containers (RendezvousTimeoutError).
+  RDZV="--nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=${MASTER_PORT:-26048}"
 else
   MASTER_ADDR="${list_ip[0]}"; MASTER_PORT="${MASTER_PORT:-26048}"
   CUR="$(hostname -I | awk '{print $1}')"; NR=-1

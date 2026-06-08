@@ -20,6 +20,9 @@ SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_stage1}"
 # A800/convert from_base --vision_hf. It is a Bridge torch_dist ckpt -> load via pretrained_checkpoint
 # with OV2_SKIP_BASE_STITCH=1 (skip the AIAK release/mp_rank stitch, which only reads .pt format).
 INIT="${INIT:-/ov2/pretrain_models/llava_onevision2/llava_onevision2_30b_a3b_p16_m33/stage_0_tp1_pp1_ep8}"
+# hf_proc = OV2 image/video processor + tokenizer dir (was a recipe default; externalized
+# so GB200 can override). A800 default = /ov2.
+OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/ov2/pretrain_models/llava_onevision2/llava_onevision2_30b_a3b_p16_m33/auto_model}"
 NPROC="${NPROC:-8}"
 ITERS="${ITERS:-2181}"          # 1 epoch over 558k @ gbs 256
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-250}"
@@ -54,6 +57,7 @@ docker run -d --name ov2_30b_p16m33_s1 --network=host --privileged --gpus all -e
   -e PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim" \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e OMP_NUM_THREADS=8 \
   -e OV2_SKIP_BASE_STITCH=1 -e OV2_INIT_CKPT="$INIT" \
+  -e OV2_HF_PROC_30B_P16M33="$OV2_HF_PROC_30B_P16M33" \
   -e OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}" \
   -v /ov2:/ov2 -v /vlm:/vlm -w "$REPO" "$IMAGE" bash -lc "
     python -m torch.distributed.run $RDZV --nproc_per_node=$NPROC scripts/training/run_recipe.py \

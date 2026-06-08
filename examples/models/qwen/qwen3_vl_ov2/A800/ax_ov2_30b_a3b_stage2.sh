@@ -17,6 +17,9 @@ IMAGE="${IMAGE:-mbridge:qwen35-muon}"                            # stage-2 = dis
 DATA_PATH="${DATA_PATH:-/vlm/data/llava_next_full_mega}"         # stage-2 SFT data (LLaVA-Next 780k)
 INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_stage1}"  # trained stage-1 (model-only load)
 SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_stage2}"
+# hf_proc = OV2 image/video processor + tokenizer dir (was a recipe default; externalized
+# so GB200 can override). A800 default = /ov2.
+OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/ov2/pretrain_models/llava_onevision2/llava_onevision2_30b_a3b_p16_m33/auto_model}"
 NPROC="${NPROC:-8}"
 ITERS="${ITERS:-6094}"          # 1 epoch over 780k @ gbs 128
 LOG_EVERY="${LOG_EVERY:-10}"; SAVE_EVERY="${SAVE_EVERY:-200}"   # log every 10; save every 200 (lose <=200 iters on a wedge)
@@ -71,7 +74,7 @@ docker run -d --name ov2_30b_p16m33_s2 --network=host --privileged --gpus all -e
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e OMP_NUM_THREADS=8 \
   -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
   -e OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}" -e OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}" \
-  -e OV2_STAGE2_ADAMW="${OV2_STAGE2_ADAMW:-0}" $FR_ENV \
+  -e OV2_STAGE2_ADAMW="${OV2_STAGE2_ADAMW:-0}" -e OV2_HF_PROC_30B_P16M33="$OV2_HF_PROC_30B_P16M33" $FR_ENV \
   -v /ov2:/ov2 -v /vlm:/vlm -w "$REPO" "$IMAGE" bash -lc "
     python -m torch.distributed.run $RDZV --nproc_per_node=$NPROC scripts/training/run_recipe.py \
       --recipe ov2_30b_a3b_p16m33_stage2 --dataset vlm-energon --step_func ov2_step \

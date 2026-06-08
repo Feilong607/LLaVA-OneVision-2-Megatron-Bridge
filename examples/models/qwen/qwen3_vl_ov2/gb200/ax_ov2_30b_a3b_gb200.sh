@@ -76,7 +76,9 @@ else
   OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-0}"   # A100: keep the stage_0 stitch
 fi
 OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b/auto_model}"
-export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B
+# p16m33 processor (patch16/merge3) - platform-aware via OV2_PRETRAIN_ROOT; override directly if GB200 puts it elsewhere.
+OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b_p16_m33/auto_model}"
+export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
 export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before skipping the stitch
 
 # --- TRAINING MODE (see ACCEL legend above). 30B-A3B is MoE -> optimizer AdamW (distributed Muon
