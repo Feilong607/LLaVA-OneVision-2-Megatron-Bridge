@@ -7,7 +7,7 @@
 # SFT, lr 2e-5, gbs 128, activation recompute ON. Unlike stage-2 (vit+adapter only), mid-train UNFREEZES
 # the LLM -> the MoE experts become trainable, so distributed Muon would deadlock the EP backward
 # all-to-all (the stage-2 hang). The recipe therefore AUTO-USES AdamW(distopt=True) for this MoE backbone
-# (no OV2_STAGE2_ADAMW needed). dense 4B mid-train keeps Muon.
+# via the is_moe auto-route (and -e OV2_MIDTRAIN_ADAMW=1 below as belt-and-suspenders). dense 4B keeps Muon.
 #
 # !! MEMORY: full-model 30B at seq 32000 is MUCH heavier than the vit+adapter stage-2 (optimizer state for
 #    ALL params). recompute is ON, but EP8/2-node may still OOM -> you likely need TP>1 (pass TP via the
@@ -20,7 +20,7 @@ REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
 bash "$REPO/3rdparty/apply_megatron_patch.sh" 2>/dev/null || true   # fresh-clone safety: apply OV2 mcore submodule patch (apply_rotary_fn hook)
 IMAGE="${IMAGE:-mbridge:qwen35-muon}"                            # superset image (AdamW path used for MoE)
 DATA_PATH="${DATA_PATH:-/vlm/data/llava_next_full_mega}"         # mid-train SFT data (override with the real corpus)
-INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_stage2}"  # trained stage-2 (model-only load)
+INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_stage2_muon}"  # trained stage-2 (model-only load)
 SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_midtrain}"
 NPROC="${NPROC:-8}"
 ITERS="${ITERS:-6094}"          # 1 epoch over 780k @ gbs 128 (override for the real mid-train corpus)
@@ -60,6 +60,7 @@ docker run -d --name ov2_30b_p16m33_mid --network=host --privileged --gpus all -
   --ipc=host --shm-size=32g --ulimit memlock=-1 --ulimit stack=67108864 $NCCL_ENV \
   -e PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim" \
   -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 -e OMP_NUM_THREADS=8 \
+  -e OV2_MIDTRAIN_ADAMW=1 \
   -v /ov2:/ov2 -v /vlm:/vlm -w "$REPO" "$IMAGE" bash -lc "
     python -m torch.distributed.run $RDZV --nproc_per_node=$NPROC scripts/training/run_recipe.py \
       --recipe ov2_30b_a3b_p16m33_midtrain --dataset vlm-energon --step_func ov2_step \

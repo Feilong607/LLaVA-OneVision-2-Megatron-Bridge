@@ -453,15 +453,19 @@ def _ov2_common(
     # Stage-1 AdamW + distopt=True runs EP8 cleanly, and the dense 4B stage-2 runs Muon+distopt-off
     # cleanly — only Muon + MoE/EP together hang. AdamW here keeps EP8 happy (optimizer differs from the
     # AIAK Muon recipe; acceptable until distributed-Muon+EP is fixed).
-    # MoE backbones AUTO-route stage-2 to AdamW: distributed Muon on EP8 deadlocks the expert-parallel
-    # backward all-to-all (see comment above) AND crashes muon_split_qkv on the trainable vision QKV.
-    # Dense 4B/8B keep Muon. OV2_STAGE2_ADAMW=1 forces AdamW on a dense backbone too.
+    # stage-2 FREEZES the LLM (experts frozen) -> distributed Muon touches ONLY the dense vision+adapter
+    # 2-D matrices, never an expert-parallel matrix, so Muon+EP8 runs cleanly here. VERIFIED: MoE p16m33
+    # stage-2 trains under dist_muon (OV2_STAGE2_ADAMW=0) with the EP8 all-to-all firing every step and
+    # NO hang. MoE stage-2 therefore KEEPS Muon by default (matches the AIAK date0523 Muon recipe);
+    # set OV2_STAGE2_ADAMW=1 to force AdamW instead. (NOT auto-routed on is_moe -- that would override an
+    # intentional Muon stage-2 and discard Muon optimizer state on resume.)
     _stage2_adamw = stage == "stage2" and os.environ.get("OV2_STAGE2_ADAMW", "0") == "1"
-    # midtrain trains the FULL model -> on a MoE backbone the experts become trainable, so distributed
-    # Muon (use_distributed_optimizer=False) would hit the SAME EP backward all-to-all deadlock as
-    # stage-2 Muon. Default MoE midtrain to AdamW(distopt=True); dense midtrain keeps Muon (AIAK
-    # date0528). Force AdamW on a dense backbone too with OV2_MIDTRAIN_ADAMW=1.
-    _midtrain_adamw = stage == "midtrain" and os.environ.get("OV2_MIDTRAIN_ADAMW", "0") == "1"
+    # midtrain trains the FULL model -> on a MoE backbone the experts UNFREEZE and become trainable, so
+    # distributed Muon (use_distributed_optimizer=False) would orthogonalize expert-parallel matrices and
+    # risks the EP backward all-to-all deadlock (UNVALIDATED), and AIAK date0528 uses AdamW for MoE
+    # midtrain anyway. AUTO-route MoE midtrain to AdamW(distopt=True) (is_moe); dense midtrain keeps Muon.
+    # OV2_MIDTRAIN_ADAMW=1 also forces AdamW on a dense backbone.
+    _midtrain_adamw = stage == "midtrain" and (is_moe or os.environ.get("OV2_MIDTRAIN_ADAMW", "0") == "1")
     if stage == "stage1" or _stage2_adamw or _midtrain_adamw:
         # AIAK stage-1: AdamW(0.9,0.99,eps1e-5,wd0), lr 2e-5 -> cosine -> 1e-6, warmup-frac 0.002,
         # clip 1.0, bf16, 1 epoch over 558k.  (stage-2-AdamW: constant lr via min_lr==max_lr.)

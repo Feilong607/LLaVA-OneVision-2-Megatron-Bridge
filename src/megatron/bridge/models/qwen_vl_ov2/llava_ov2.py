@@ -35,6 +35,7 @@ from dataclasses import asdict
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 from megatron.core import tensor_parallel, parallel_state
 from megatron.core.transformer.module import MegatronModule
 
@@ -214,21 +215,44 @@ class LlavaOnevision2(MegatronModule):
     ) -> torch.Tensor:
         # 1) vision -> adapter
         image_embeddings = None
+        # Image-feature / image-token validity is checked COLLECTIVELY (see the all_reduce below) so a
+        # malformed microbatch aborts the whole job in lockstep instead of deadlocking. A per-rank raise
+        # inside this forward would hang every downstream rendezvous: first the MoE expert-parallel
+        # all-to-all in language_model(), then the gradient all-reduce -- because the offending rank
+        # never arrives. So we (a) never raise per-rank here, and (b) reduce over the WHOLE job, not just
+        # the EP group (an EP-only abort would still hang the surviving DP replicas at the grad all-reduce).
+        _feat_bad = 0
+        _n_feat = _n_tok = -1
+        _sp = bool(getattr(self.config, "sequence_parallel", False))
         if images is not None:
             ve = self.vision_model(images, grid_thw=image_grid_thw, patch_positions=patch_positions)
             image_embeddings = self.adapter(ve)
-            n_tok = (input_ids == self.image_token_id).sum().item()
-            n_feat = image_embeddings.shape[0]
-            # Without sequence-parallel there is no ViT SP-padding, so features must match tokens
-            # exactly; a mismatch here means a processor/grid bug and must be loud, not silently trimmed.
-            if not getattr(self.config, "sequence_parallel", False):
-                assert n_feat == n_tok, (
-                    f"image features {n_feat} != image tokens {n_tok} (SP off; expected exact match)"
-                )
-            if n_feat > n_tok:  # trim ViT SP-padding overflow (only expected under sequence_parallel)
-                image_embeddings = image_embeddings[:n_tok]
-            elif n_feat < n_tok:
-                raise ValueError(f"image features {n_feat} < image tokens {n_tok}")
+            _n_tok = (input_ids == self.image_token_id).sum().item()
+            _n_feat = image_embeddings.shape[0]
+            # SP off: no ViT SP-padding -> features must match tokens EXACTLY.
+            # SP on : ViT SP-padding makes n_feat >= n_tok; overflow is trimmed, a shortfall is a bug.
+            if not _sp:
+                _feat_bad = 1 if _n_feat != _n_tok else 0
+            else:
+                _feat_bad = 1 if _n_feat < _n_tok else 0
+                if _n_feat > _n_tok:  # trim ViT SP-padding overflow (only expected under sequence_parallel)
+                    image_embeddings = image_embeddings[:_n_tok]
+        # Collective abort: EVERY rank participates -- including text-only ranks where images is None and
+        # _feat_bad stays 0 -- so the all_reduce itself can never desync. MAX => if ANY rank saw a
+        # mismatch, ALL ranks raise the same RuntimeError at this identical program point.
+        if dist.is_available() and dist.is_initialized():
+            _flag = torch.tensor([_feat_bad], dtype=torch.int32, device=input_ids.device)
+            dist.all_reduce(_flag, op=dist.ReduceOp.MAX)
+            _feat_bad = int(_flag.item())
+        if _feat_bad:
+            _local_mismatch = "yes" if (_n_feat >= 0 and _n_feat != _n_tok) else "no"
+            raise RuntimeError(
+                "OV2 image feature/token mismatch (collective abort across all ranks). "
+                f"This rank: n_feat={_n_feat} n_tok={_n_tok} sp={_sp} local_mismatch={_local_mismatch}. "
+                "At least one rank's image features did not match its <image> placeholders; the whole job "
+                "aborts in lockstep to avoid an expert-parallel all-to-all / gradient all-reduce deadlock. "
+                "Inspect the processor/grid (image_grid_thw vs inserted image tokens) on the failing rank."
+            )
 
         # 2) text embeddings + masked_scatter fuse
         language_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
@@ -612,6 +636,28 @@ def load_ov2_mcore_checkpoint(model: LlavaOnevision2, ckpt_path: str, *, load_ad
         "[ov2 load] loaded=%d missing=%d unexpected=%d adapter_loaded=%s",
         len(sd), len(real_missing), len(real_unexpected), load_adapter,
     )
+    # Fail-fast on a partial load. perform_init is OFF here, so any param NOT found in the checkpoint
+    # stays as torch.empty (uninitialized garbage) and training would silently learn from random
+    # weights -- e.g. if the MoE per-expert -> TE-grouped key remap above ever stops matching, every
+    # expert would be left random with only an INFO line. Mirror the EP-shard SystemExit above.
+    if real_missing:
+        import os
+        _preview = real_missing[:20]
+        _msg = (
+            "[ov2 load] {} model parameter(s) were NOT found in the checkpoint and remain "
+            "UNINITIALIZED (perform_init off -> torch.empty). The checkpoint format likely drifted "
+            "(e.g. the MoE expert-key remap no longer matches the built model). First {}: {}{}".format(
+                len(real_missing), len(_preview), _preview,
+                "" if len(real_missing) <= len(_preview) else " ...",
+            )
+        )
+        if os.environ.get("OV2_ALLOW_PARTIAL_LOAD", "0") == "1":
+            logger.error("%s -- OV2_ALLOW_PARTIAL_LOAD=1 set, continuing anyway.", _msg)
+        else:
+            raise SystemExit(
+                _msg + " If these params are intentionally initialized elsewhere, re-run with "
+                "OV2_ALLOW_PARTIAL_LOAD=1 to bypass this guard."
+            )
     return summary
 
 
