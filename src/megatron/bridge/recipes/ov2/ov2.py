@@ -461,7 +461,7 @@ def _ov2_common(
     # Muon (use_distributed_optimizer=False) would hit the SAME EP backward all-to-all deadlock as
     # stage-2 Muon. Default MoE midtrain to AdamW(distopt=True); dense midtrain keeps Muon (AIAK
     # date0528). Force AdamW on a dense backbone too with OV2_MIDTRAIN_ADAMW=1.
-    _midtrain_adamw = stage == "midtrain" and (is_moe or os.environ.get("OV2_MIDTRAIN_ADAMW", "0") == "1")
+    _midtrain_adamw = stage == "midtrain" and os.environ.get("OV2_MIDTRAIN_ADAMW", "0") == "1"
     if stage == "stage1" or _stage2_adamw or _midtrain_adamw:
         # AIAK stage-1: AdamW(0.9,0.99,eps1e-5,wd0), lr 2e-5 -> cosine -> 1e-6, warmup-frac 0.002,
         # clip 1.0, bf16, 1 epoch over 558k.  (stage-2-AdamW: constant lr via min_lr==max_lr.)
