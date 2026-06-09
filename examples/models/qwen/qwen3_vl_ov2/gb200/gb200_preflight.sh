@@ -26,9 +26,11 @@ RECIPE="${RECIPE:-ov2_35b_a3b_midtrain}"
 #     The recipe reads OV2_PRETRAIN_ROOT (llava processor+stage_0 ckpt root) and OV2_LLM_HF_30B (Qwen LLM). ---
 if [[ "${HWNAME:-}" == "gb200" || -d /datasets/qwen-models-ea5jyi ]]; then
   OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/datasets/qwen-models-ea5jyi/Qwen3-30B-A3B-Instruct-2507}"
-  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # GB200: now only the processor root (stage_0 SKIPPED); better set OV2_HF_PROC_30B directly — PENDING from you
+  OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"            # bundled processor (GB200)
+  OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"   # bundled processor (GB200, p16m33 recipe)
+  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # GB200: now only the processor root (stage_0 SKIPPED); OV2_HF_PROC_30B set directly above to the bundled auto_model
   DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"   # /datasets/llava/11May data
-  INIT_CKPT="${INIT_CKPT:-/datasets/stage2}"                           # stage2 resume ckpt (GB200, user-set)
+  INIT_CKPT="${INIT_CKPT:-/datasets/llava-ov2-30b-a3b-m9lvdn}"   # trained ckpt to resume (GB200; has iter_0001000 + auto_model)
   SAVE="${SAVE:-/home/ftan0055/ckpts_video_sft/ov2_30b_a3b_gb200}"     # output dir (GB200, user-set)
   OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # GB200: mid-train from stage2 -> skip the stage_0 stitch
 else
@@ -40,7 +42,7 @@ else
   OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-0}"   # A100: keep the stage_0 stitch
 fi
 OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b/auto_model}"
-export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B
+export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
 export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before skipping the stitch
 ACCEL="${ACCEL:-0}"
 export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"

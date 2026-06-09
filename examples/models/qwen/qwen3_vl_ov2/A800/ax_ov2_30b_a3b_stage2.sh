@@ -12,7 +12,7 @@
 set -euo pipefail
 
 REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
-bash "$REPO/3rdparty/apply_megatron_patch.sh" 2>/dev/null || true   # fresh-clone safety: apply OV2 mcore submodule patch (apply_rotary_fn hook)
+bash "$REPO/3rdparty/apply_megatron_patch.sh"   # fresh-clone safety: apply OV2 mcore submodule patch (apply_rotary_fn hook). FAIL LOUD (no 2>/dev/null||true): a silently-missing hook -> cryptic "unexpected keyword argument 'apply_rotary_fn'" at build. Script is idempotent (no-op if already applied).
 IMAGE="${IMAGE:-mbridge:qwen35-muon}"                            # stage-2 = distributed Muon (needs emerging_optimizers)
 DATA_PATH="${DATA_PATH:-/vlm/data/llava_next_full_mega}"         # stage-2 SFT data (LLaVA-Next 780k)
 INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_p16m33_stage1}"  # trained stage-1 (model-only load)
@@ -59,6 +59,27 @@ RECOMPUTE_FLAG=""; [[ "${RECOMPUTE:-1}" == "1" ]] && RECOMPUTE_FLAG="model.recom
 MUON_NOSPLIT="optimizer.muon_split_qkv=false"
 
 mkdir -p "$SAVE" "$SAVE/nccl"; docker rm -f ov2_30b_p16m33_s2 2>/dev/null || true
+# --- Muon resume-topology guard (Pass-6): distributed Muon (LayerWise) shards momentum across the DP
+# axis with the ckpt replica_id DP-coord forced to 0 ("fixed DP usage only") and NO reshard support, so
+# resuming a Muon ckpt at a DIFFERENT world size (e.g. A800 16-rank -> GB200 8-rank) SILENTLY loads
+# mismatched momentum (weights fine; optimizer state corrupts) with no error. This script is always
+# p16m33 stage-2 -> Muon unless OV2_STAGE2_ADAMW=1. WORLD==DP here (TP/PP/CP=1). Marker lives in $SAVE.
+WORLD=$(( NPROC * (NNODES > 1 ? NNODES : 1) ))
+_is_muon=0; [[ "${OV2_STAGE2_ADAMW:-0}" != "1" ]] && _is_muon=1
+_wf="$SAVE/.ov2_train_world"
+_has_ckpt=0; { [[ -f "$SAVE/latest_checkpointed_iteration.txt" ]] || compgen -G "$SAVE/iter_*" >/dev/null 2>&1; } && _has_ckpt=1
+if [[ "$_is_muon" == "1" && "$_has_ckpt" == "1" && -f "$_wf" ]]; then
+  _saved_world="$(cat "$_wf" 2>/dev/null || echo "")"
+  if [[ -n "$_saved_world" && "$_saved_world" != "$WORLD" ]]; then
+    if [[ "${OV2_ALLOW_DP_RESHARD:-0}" == "1" ]]; then
+      echo "[ov2-30b-stage2] WARN: Muon ckpt in $SAVE saved at WORLD=$_saved_world, resuming at WORLD=$WORLD -> DP-sharded momentum MISMATCH; OV2_ALLOW_DP_RESHARD=1 set, continuing (optimizer state WILL be wrong)." >&2
+    else
+      echo "[ov2-30b-stage2] FATAL: distributed-Muon ckpt in $SAVE was saved at WORLD=$_saved_world but you are resuming at WORLD=$WORLD. Muon momentum is DP-sharded with NO reshard support -> resuming silently loads MISMATCHED optimizer state. Resume at WORLD=$_saved_world, OR set OV2_ALLOW_DP_RESHARD=1 to override (momentum garbage; expect a loss/grad-norm bump)." >&2
+      exit 1
+    fi
+  fi
+fi
+[[ "${NODE_RANK:-0}" -eq 0 ]] && { echo "$WORLD" > "$_wf" 2>/dev/null || true; }
 # NCCL flight recorder + desync debug (default ON; set NCCL_TRACE=0 to disable). On a watchdog timeout
 # it dumps per-rank collective traces to $SAVE/nccl, so an intermittent expert-parallel-group hang is
 # precisely diagnosable (which rank diverged on which collective). Negligible overhead otherwise.

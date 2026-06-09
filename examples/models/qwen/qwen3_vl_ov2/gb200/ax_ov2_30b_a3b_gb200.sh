@@ -33,9 +33,9 @@ set -euo pipefail
 # Auto-detect repo root from this script's location (works on A100-2 /ov2 AND GB200 ~/LLaVA-...).
 _SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
-bash "$REPO/3rdparty/apply_megatron_patch.sh" 2>/dev/null || true   # fresh-clone safety: apply OV2 mcore submodule patch (apply_rotary_fn hook)
 [[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/LLaVA-OneVision-2-Megatron-Bridge" >&2; exit 1; }
-RECIPE="${RECIPE:-ov2_35b_a3b_midtrain}"        # full-model midtrain (use ov2_35b_a3b_stage2 for frozen-LLM SFT)
+bash "$REPO/3rdparty/apply_megatron_patch.sh"   # fresh-clone safety: apply OV2 mcore submodule patch (apply_rotary_fn hook). FAIL LOUD (no 2>/dev/null||true): a silently-missing hook -> cryptic "unexpected keyword argument 'apply_rotary_fn'" at build. Script is idempotent (no-op if already applied).
+RECIPE="${RECIPE:-ov2_30b_a3b_p16m33_midtrain}"  # p16m33 full-model midtrain; for frozen-LLM SFT use ov2_30b_a3b_p16m33_stage2. NB: /datasets/llava-ov2-30b-a3b-m9lvdn is a p16m33 ckpt -> MUST use a p16m33 recipe (the merge2 ov2_35b_a3b_* binds patch14/merge2 + the non-p16m33 processor -> vision-config/ckpt MISMATCH).
 # DATA_PATH / INIT_CKPT / SAVE / model paths: set per-card by the CARD PATH PROFILE (after HW detect).
 ITERS="${ITERS:-6094}"; LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-500}"
 # NPROC (GPUs/node) is set by the HARDWARE PROFILE block below (GB200=4, A100/H100=8); override via NPROC=.
@@ -62,9 +62,11 @@ NPROC="${NPROC:-$HW_NPROC}"        # GB200=4 GPU/node, A100/H100=8 GPU/node
 #     The recipe reads OV2_PRETRAIN_ROOT (llava processor+stage_0 ckpt root) and OV2_LLM_HF_30B (Qwen LLM). ---
 if [[ "${HWNAME:-}" == "gb200" || -d /datasets/qwen-models-ea5jyi ]]; then
   OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/datasets/qwen-models-ea5jyi/Qwen3-30B-A3B-Instruct-2507}"
-  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # GB200: now only the processor root (stage_0 SKIPPED); better set OV2_HF_PROC_30B directly — PENDING from you
+  OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"            # bundled processor (GB200)
+  OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"   # bundled processor (GB200, p16m33 recipe)
+  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # GB200: now only the processor root (stage_0 SKIPPED); OV2_HF_PROC_30B set directly above to the bundled auto_model
   DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"   # /datasets/llava/11May data
-  INIT_CKPT="${INIT_CKPT:-/datasets/stage2}"                           # stage2 resume ckpt (GB200, user-set)
+  INIT_CKPT="${INIT_CKPT:-/datasets/llava-ov2-30b-a3b-m9lvdn}"   # trained ckpt to resume (GB200; has iter_0001000 + auto_model)
   SAVE="${SAVE:-/home/ftan0055/ckpts_video_sft/ov2_30b_a3b_gb200}"     # output dir (GB200, user-set)
   OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # GB200: mid-train from stage2 -> skip the stage_0 stitch
 else
@@ -132,6 +134,9 @@ WORLD=$(( NPROC * NNODES ))
 # Validated: 2 nodes (WORLD 8 -> 16 microbatches) and 4 nodes (WORLD 16 -> 8). Odd counts (e.g. 3 nodes,
 # WORLD 12) hard-assert in mcore -> warn (use 2/4 nodes, or override train.global_batch_size).
 (( 128 % WORLD == 0 )) || echo "[ov2-30b] WARN: world=$WORLD does not divide default GBS=128 -> mcore microbatch assert will fire; use 2 or 4 nodes (WORLD 8/16) or override train.global_batch_size." >&2
+# EP=8 is fixed in the recipe -> mcore requires DP (=WORLD at TP1/PP1/CP1) be a multiple of 8 (and >=8).
+# A single GB200 node (WORLD=4) PASSES the GBS check above (128%4==0) but crashes late in mcore on DP%EP.
+(( WORLD >= 8 && WORLD % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs WORLD (=$WORLD; NPROC=$NPROC x NNODES=$NNODES) to be a multiple of 8 and >=8 -> use >=2 GB200 nodes (WORLD 8 or 16). A single node (WORLD=4) cannot run EP8." >&2; exit 1; }
 
 # --- in-container env (were docker -e flags) ---
 export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"
@@ -202,6 +207,26 @@ ONE-WAY; torch_dist INIT_CKPT will mismatch -> convert it to fsdp_dtensor or poi
 fi
 
 mkdir -p "$SAVE"; cd "$REPO"
+# --- Muon resume-topology guard (Pass-6): distributed Muon (LayerWise) shards momentum across the DP
+# axis and forces the ckpt replica_id DP-coord to 0 ("fixed DP usage only") with NO reshard guard, so
+# resuming a Muon ckpt at a DIFFERENT world size (e.g. A800 16-rank -> GB200 8-rank) SILENTLY loads
+# mismatched momentum (weights are fine; optimizer state corrupts) with no error. AdamW reshards fine
+# -> guard Muon only. WORLD==DP here (TP/PP/CP=1). Marker lives in $SAVE so it travels with the ckpt dir.
+_is_muon=0; [[ "$RECIPE" == *stage2* && "${OV2_STAGE2_ADAMW:-0}" != "1" ]] && _is_muon=1
+_wf="$SAVE/.ov2_train_world"
+_has_ckpt=0; { [[ -f "$SAVE/latest_checkpointed_iteration.txt" ]] || compgen -G "$SAVE/iter_*" >/dev/null 2>&1; } && _has_ckpt=1
+if [[ "$_is_muon" == "1" && "$_has_ckpt" == "1" && -f "$_wf" ]]; then
+  _saved_world="$(cat "$_wf" 2>/dev/null || echo "")"
+  if [[ -n "$_saved_world" && "$_saved_world" != "$WORLD" ]]; then
+    if [[ "${OV2_ALLOW_DP_RESHARD:-0}" == "1" ]]; then
+      echo "[ov2-30b] WARN: Muon ckpt in $SAVE saved at WORLD=$_saved_world, resuming at WORLD=$WORLD -> DP-sharded momentum MISMATCH; OV2_ALLOW_DP_RESHARD=1 set, continuing (optimizer state WILL be wrong)." >&2
+    else
+      echo "[ov2-30b] FATAL: distributed-Muon ckpt in $SAVE was saved at WORLD=$_saved_world but you are resuming at WORLD=$WORLD. Muon momentum is DP-sharded with NO reshard support -> resuming silently loads MISMATCHED optimizer state. Resume at WORLD=$_saved_world, OR set OV2_ALLOW_DP_RESHARD=1 to override (momentum garbage; expect a loss/grad-norm bump)." >&2
+      exit 1
+    fi
+  fi
+fi
+[[ "$NODE_RANK" -eq 0 ]] && { echo "$WORLD" > "$_wf" 2>/dev/null || true; }
 echo "[ov2-30b-gb200] in-container | hw=$HWNAME(cc=$_cc) repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD node_rank=$NODE_RANK nnodes=$NNODES"
 # shellcheck disable=SC2086  # $RDZV and $OVERRIDES must word-split into separate args
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
