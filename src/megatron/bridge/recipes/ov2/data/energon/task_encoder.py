@@ -11,7 +11,7 @@ last position) so that `labels[t]` supervises `input_ids[t+1]` — required beca
 The OV2 step passes `images=pixel_values` + `image_grid_thw` straight to LlavaOnevision2.forward.
 """
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -61,6 +61,21 @@ class OV2TaskBatch(Batch):
     pixel_values: Optional[torch.Tensor]
     image_grid_thw: Optional[torch.Tensor]
     cu_seqlens: Optional[torch.Tensor] = None
+
+
+_OV2_BATCH_DUNDERS = {f.name for f in fields(OV2TaskBatch)} & {"__key__", "__restore_key__"}
+
+
+def _ov2_batch_dunders(samples):
+    """energon >=6/7 makes Batch a kw-only dataclass that REQUIRES __key__/__restore_key__; energon
+    5.x (the A100 mbridge image) has neither and rejects them. Pass them only when THIS energon's
+    Batch actually declares them, so one task_encoder runs unchanged on both image generations."""
+    extra = {}
+    if "__key__" in _OV2_BATCH_DUNDERS:
+        extra["__key__"] = samples[0].__key__ if samples else "ov2batch"
+    if "__restore_key__" in _OV2_BATCH_DUNDERS:
+        extra["__restore_key__"] = ()  # placeholder; the savable loader reassigns the real key
+    return extra
 
 
 class OV2TaskEncoder(DefaultTaskEncoder):
@@ -325,6 +340,7 @@ class OV2TaskEncoder(DefaultTaskEncoder):
             pixel_values=torch.cat(pvs, dim=0) if pvs else None,
             image_grid_thw=torch.cat(grids, dim=0) if grids else None,
             cu_seqlens=(samples[0].cu_seqlens if (n == 1 and samples[0].cu_seqlens is not None) else None),
+            **_ov2_batch_dunders(samples),
         )
 
     def encode_batch(self, batch: OV2TaskBatch) -> dict:
