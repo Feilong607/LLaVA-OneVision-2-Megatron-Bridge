@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# =============================================================================
+# GB200 NCCL collective benchmark (all_reduce + all_to_all). In-container.
+#   single node (intra-node NVLink):   NPROC=4 bash .../gb200_nccl_test.sh
+#   multi-node  (NVL72 cross-node):    LIST_IP="<ip0> <ip1>" bash .../gb200_nccl_test.sh   (run on EACH node)
+# Set NCCL_DEBUG=INFO to dump the topology/transport NCCL chose (confirms NVLink/NVLS vs IB).
+# =============================================================================
+set -uo pipefail
+REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
+[[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/LLaVA-OneVision-2-Megatron-Bridge" >&2; exit 1; }
+NPROC="${NPROC:-4}"
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+PROBE="$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/gb200_nccl_probe.py"
+
+if [[ -n "${LIST_IP:-}" ]]; then read -ra list_ip <<< "$LIST_IP"; else list_ip=(); fi
+NN=${#list_ip[@]}
+if [[ "$NN" -le 1 ]]; then
+  # static single-node rendezvous (NOT --standalone): the dynamic c10d rendezvous
+  # times out at next_rendezvous join inside GB200 containers (RendezvousTimeoutError).
+  RDZV="--nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=${MASTER_PORT:-26048}"
+else
+  MASTER_ADDR="${list_ip[0]}"; MASTER_PORT="${MASTER_PORT:-26048}"
+  CUR="$(hostname -I | awk '{print $1}')"; NR=-1
+  for i in "${!list_ip[@]}"; do [[ "${list_ip[$i]}" == "$CUR" ]] && NR=$i && break; done
+  [[ "$NR" -eq -1 ]] && { echo "ERROR: $CUR not in LIST_IP (${list_ip[*]})" >&2; exit 1; }
+  RDZV="--nnodes=$NN --node_rank=$NR --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT"
+fi
+echo "[gb200-nccl] nnodes=${NN:-1} nproc_per_node=$NPROC NVLS=$NCCL_NVLS_ENABLE debug=$NCCL_DEBUG"
+python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" "$PROBE"
