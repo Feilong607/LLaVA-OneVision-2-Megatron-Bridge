@@ -165,8 +165,14 @@ class LlavaOnevision2Provider(GPTModelProvider):
             expert_model_parallel_size=getattr(self, "expert_model_parallel_size", 1) or 1,
             expert_tensor_parallel_size=getattr(self, "expert_tensor_parallel_size", None),
             sequence_parallel=bool(getattr(self, "sequence_parallel", False)),
+            moe_expert_capacity_factor=getattr(self, "moe_expert_capacity_factor", None),
+            moe_pad_expert_input_to_capacity=bool(getattr(self, "moe_pad_expert_input_to_capacity", False)),
             load_llm_weights=self.load_llm_weights,
             recompute=bool(getattr(self, "recompute_activations", False)),
+            # Megatron-FSDP needs gradient_accumulation_fusion OFF unless TE>=2.10 (mcore_fsdp_adapter
+            # asserts is_te_min_version("2.10") only when GAF is True). Env-gated so NON-FSDP runs are
+            # untouched: set OV2_DISABLE_GAF=1 to pass grad_accum_fusion=False into build_llava_ov2.
+            grad_accum_fusion=(False if __import__("os").environ.get("OV2_DISABLE_GAF") == "1" else None),
             # Per-backbone vision-tower geometry (4B defaults reproduce the verified p16m33 tower).
             patch_size=getattr(self, "vision_patch_size", 16),
             spatial_merge_size=getattr(self, "vision_spatial_merge_size", 3),

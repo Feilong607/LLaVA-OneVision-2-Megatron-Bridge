@@ -265,8 +265,19 @@ class EnergonMultiModalDataModule:
             state = torch.load(state_path, map_location="cpu", weights_only=False)
             energon_loader.restore_state_rank(state["dataloader_state_dict"])
             logger.info("[energon resume] restored dataloader state from %s", state_path)
-        except Exception as e:  # noqa: BLE001 - fail safe to fresh data, never crash resume
-            logger.warning("[energon resume] failed to restore %s: %s; data starts from scratch", state_path, e)
+        except Exception as e:  # noqa: BLE001
+            # Reaching here means the state file EXISTS (no-file / no-tracker fresh-start cases
+            # already returned above) => a GENUINE resume whose saved state is unreadable
+            # (corruption / DP-or-worker topology change / energon restore assert). Silently
+            # restarting from FRESH data re-reads seen samples and can desync ranks; and this
+            # module's warnings are swallowed here, so a warning is invisible. Fail LOUD by
+            # default; OV2_ALLOW_DATALOADER_FRESH=1 opts back into the old soft-fail.
+            if os.environ.get("OV2_ALLOW_DATALOADER_FRESH", "0") != "1":
+                logger.error("[energon resume] FAILED to restore existing dataloader state %s: %s "
+                             "(set OV2_ALLOW_DATALOADER_FRESH=1 to continue from fresh data).", state_path, e)
+                raise
+            logger.warning("[energon resume] OV2_ALLOW_DATALOADER_FRESH=1: restore of %s failed (%s); "
+                           "continuing from FRESH data (will re-read samples).", state_path, e)
 
     def val_dataloader(self):
         """

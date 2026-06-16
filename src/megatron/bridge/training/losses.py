@@ -65,7 +65,7 @@ def masked_next_token_loss(
     else:
         losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses * loss_mask)
+    loss = torch.sum(torch.where(loss_mask > 0, losses, torch.zeros_like(losses)) * loss_mask)
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()

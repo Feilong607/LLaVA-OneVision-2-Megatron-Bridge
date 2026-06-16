@@ -32,7 +32,7 @@ export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONP
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-SCRIPT="$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/convert/convert_ov2_checkpoint.py"
+SCRIPT="$REPO/examples/models/qwen/qwen3_vl_ov2/A800/convert/convert_ov2_checkpoint.py"
 
 if [[ -n "${LIST_IP:-}" ]]; then read -ra ip <<< "$LIST_IP"; else ip=(); fi
 NN=${#ip[@]}; [[ "$NN" -le 1 ]] && NN=1

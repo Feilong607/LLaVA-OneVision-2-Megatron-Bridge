@@ -35,6 +35,7 @@ from dataclasses import asdict
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 from megatron.core import tensor_parallel, parallel_state
 from megatron.core.transformer.module import MegatronModule
 
@@ -212,23 +213,80 @@ class LlavaOnevision2(MegatronModule):
         patch_positions=None,
         **kwargs,
     ) -> torch.Tensor:
+        if __import__("os").environ.get("OV2_ANOMALY") == "1" and not getattr(self, "_ov2_nanhooks", False):
+            self._ov2_nanhooks = True
+            _rr = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+            def _ck_nan(_t):
+                return torch.is_tensor(_t) and _t.numel() > 0 and (bool(torch.isnan(_t).any()) or bool(torch.isinf(_t).any()))
+            def _fwd_hook(_name):
+                def _h(_m, _i, _o):
+                    _t = _o[0] if isinstance(_o, (tuple, list)) and len(_o) and torch.is_tensor(_o[0]) else _o
+                    if _ck_nan(_t):
+                        print(f"[NANFWD r{_rr}] {_name} ({type(_m).__name__}) out NaN/Inf shape={tuple(_t.shape)}", flush=True)
+                return _h
+            def _bwd_hook(_name):
+                def _h(_m, _gi, _go):
+                    for _g in (_go if isinstance(_go, (tuple, list)) else (_go,)):
+                        if _ck_nan(_g):
+                            print(f"[NANBWD r{_rr}] {_name} ({type(_m).__name__}) grad_out NaN/Inf shape={tuple(_g.shape)}", flush=True)
+                            break
+                return _h
+            _cnt = 0
+            for _nm, _mod in self.named_modules():
+                if _nm and len(list(_mod.children())) == 0:
+                    _mod.register_forward_hook(_fwd_hook(_nm))
+                    _mod.register_full_backward_hook(_bwd_hook(_nm))
+                    _cnt += 1
+            print(f"[NANHOOK r{_rr}] registered {_cnt} fwd+bwd leaf hooks", flush=True)
         # 1) vision -> adapter
         image_embeddings = None
+        # Image-feature / image-token validity is checked COLLECTIVELY (see the all_reduce below) so a
+        # malformed microbatch aborts the whole job in lockstep instead of deadlocking. A per-rank raise
+        # inside this forward would hang every downstream rendezvous: first the MoE expert-parallel
+        # all-to-all in language_model(), then the gradient all-reduce -- because the offending rank
+        # never arrives. So we (a) never raise per-rank here, and (b) reduce over the WHOLE job, not just
+        # the EP group (an EP-only abort would still hang the surviving DP replicas at the grad all-reduce).
+        _feat_bad = 0
+        _n_feat = _n_tok = -1
+        _sp = bool(getattr(self.config, "sequence_parallel", False))
         if images is not None:
             ve = self.vision_model(images, grid_thw=image_grid_thw, patch_positions=patch_positions)
-            image_embeddings = self.adapter(ve)
-            n_tok = (input_ids == self.image_token_id).sum().item()
-            n_feat = image_embeddings.shape[0]
-            # Without sequence-parallel there is no ViT SP-padding, so features must match tokens
-            # exactly; a mismatch here means a processor/grid bug and must be loud, not silently trimmed.
-            if not getattr(self.config, "sequence_parallel", False):
-                assert n_feat == n_tok, (
-                    f"image features {n_feat} != image tokens {n_tok} (SP off; expected exact match)"
-                )
-            if n_feat > n_tok:  # trim ViT SP-padding overflow (only expected under sequence_parallel)
-                image_embeddings = image_embeddings[:n_tok]
-            elif n_feat < n_tok:
-                raise ValueError(f"image features {n_feat} < image tokens {n_tok}")
+            # AIAK parity (llava_onevision2_model.py:227-233): forward patch_positions into the adapter
+            # too, so a "-pos" adapter (use_patch_position_encoding=True) can add its learned absolute
+            # spatial position embedding. NO-OP for the current p16m33 model (flag defaults False ->
+            # adapter ignores the arg). patch_positions is already one [P,3] tensor from batch(); mirror
+            # AIAK list-or-tensor guard defensively.
+            _pp_cat = None
+            if patch_positions is not None:
+                _pp_cat = (torch.cat(patch_positions, dim=0)
+                           if isinstance(patch_positions, (list, tuple)) else patch_positions)
+            image_embeddings = self.adapter(ve, patch_positions=_pp_cat)
+            _n_tok = (input_ids == self.image_token_id).sum().item()
+            _n_feat = image_embeddings.shape[0]
+            # SP off: no ViT SP-padding -> features must match tokens EXACTLY.
+            # SP on : ViT SP-padding makes n_feat >= n_tok; overflow is trimmed, a shortfall is a bug.
+            if not _sp:
+                _feat_bad = 1 if _n_feat != _n_tok else 0
+            else:
+                _feat_bad = 1 if _n_feat < _n_tok else 0
+                if _n_feat > _n_tok:  # trim ViT SP-padding overflow (only expected under sequence_parallel)
+                    image_embeddings = image_embeddings[:_n_tok]
+        # Collective abort: EVERY rank participates -- including text-only ranks where images is None and
+        # _feat_bad stays 0 -- so the all_reduce itself can never desync. MAX => if ANY rank saw a
+        # mismatch, ALL ranks raise the same RuntimeError at this identical program point.
+        if dist.is_available() and dist.is_initialized():
+            _flag = torch.tensor([_feat_bad], dtype=torch.int32, device=input_ids.device)
+            dist.all_reduce(_flag, op=dist.ReduceOp.MAX)
+            _feat_bad = int(_flag.item())
+        if _feat_bad:
+            _local_mismatch = "yes" if (_n_feat >= 0 and _n_feat != _n_tok) else "no"
+            raise RuntimeError(
+                "OV2 image feature/token mismatch (collective abort across all ranks). "
+                f"This rank: n_feat={_n_feat} n_tok={_n_tok} sp={_sp} local_mismatch={_local_mismatch}. "
+                "At least one rank's image features did not match its <image> placeholders; the whole job "
+                "aborts in lockstep to avoid an expert-parallel all-to-all / gradient all-reduce deadlock. "
+                "Inspect the processor/grid (image_grid_thw vs inserted image tokens) on the failing rank."
+            )
 
         # 2) text embeddings + masked_scatter fuse
         language_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
@@ -257,10 +315,39 @@ class LlavaOnevision2(MegatronModule):
             tp = parallel_state.get_tensor_model_parallel_world_size()
             rem = combined.size(0) % tp
             if rem:
-                pad = combined.new_zeros((tp - rem,) + tuple(combined.shape[1:]))
+                pad_len = tp - rem
+                pad = combined.new_zeros((pad_len,) + tuple(combined.shape[1:]))
                 combined = torch.cat((combined, pad), dim=0)
+                # The SP pad lengthens the token tensor, so the THD packing metadata must absorb it too,
+                # else _apply_rotary_pos_emb_thd's torch.split(t, seqlens) underflows by pad_len
+                # (sum(seqlens) != t.size(0) -> "split_sizes ... sum exactly to N" crash). Append the pad
+                # as its own trailing segment: real sequences are untouched, the zero pad attends only to
+                # itself and its labels are ignored. deepcopy so the caller's packed_seq_params is unchanged.
+                if packed_seq_params is not None and getattr(packed_seq_params, "cu_seqlens_q", None) is not None:
+                    packed_seq_params = deepcopy(packed_seq_params)
+                    _cu_q = packed_seq_params.cu_seqlens_q
+                    packed_seq_params.cu_seqlens_q = torch.cat((_cu_q, _cu_q[-1:] + pad_len))
+                    _cu_kv = getattr(packed_seq_params, "cu_seqlens_kv", None)
+                    if _cu_kv is not None:
+                        packed_seq_params.cu_seqlens_kv = torch.cat((_cu_kv, _cu_kv[-1:] + pad_len))
+                    # ov2_step sets the *_padded twins on PARTIAL packs (cu_last<seq_len); they index the
+                    # now-longer buffer too -> extend by the same pad_len, else TE THD attention sees
+                    # cu_seqlens_*_padded ending at the OLD length (sum-vs-size mismatch / silent corruption).
+                    # Dormant when seq_len % tp == 0 (e.g. 10192) since this pad branch is skipped then;
+                    # fires only at a non-tp-divisible seq_len.
+                    for _attr in ("cu_seqlens_q_padded", "cu_seqlens_kv_padded"):
+                        _cup = getattr(packed_seq_params, _attr, None)
+                        if _cup is not None:
+                            setattr(packed_seq_params, _attr, torch.cat((_cup, _cup[-1:] + pad_len)))
             combined = tensor_parallel.scatter_to_sequence_parallel_region(combined)
 
+        if __import__("os").environ.get("OV2_NAN_DEBUG") == "1":
+            _r = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+            for _nm, _t in (("images", images), ("img_emb", image_embeddings), ("combined", combined)):
+                if torch.is_tensor(_t):
+                    _nan = bool(torch.isnan(_t).any()); _inf = bool(torch.isinf(_t).any())
+                    _mx = _t.detach().float().abs().max().item()
+                    print(f"[NANDBG r{_r}] {_nm} nan={_nan} inf={_inf} maxabs={_mx:.3e} shape={tuple(_t.shape)}", flush=True)
         # 4) language model
         return self.language_model(
             input_ids=None,
@@ -286,6 +373,8 @@ def build_llava_ov2(
     expert_model_parallel_size: int = 1,
     expert_tensor_parallel_size: Optional[int] = None,
     sequence_parallel: bool = False,
+    moe_expert_capacity_factor: Optional[float] = None,
+    moe_pad_expert_input_to_capacity: bool = False,
     load_llm_weights: bool = False,
     # Per-backbone vision-tower geometry. Defaults == the VERIFIED 4B p16m33 tower, so an
     # un-parameterized call (and the 4B recipe) build the exact same vision_model/adapter as before.
@@ -338,6 +427,13 @@ def build_llava_ov2(
     # Observed: OV2-30B-A3B stage-1 NaN'd at iter 2 on all ranks. fp32 routing is the fix.
     if getattr(prov, "num_moe_experts", None):
         prov.moe_router_dtype = "fp32"
+        # These fields must be set BEFORE prov.provide(): MCore token dispatchers cache
+        # drop_and_pad/capacity in their __init__. Setting cfg.model via the recipe is not
+        # enough for OV2 because this function rebuilds the inner LLM provider from HF.
+        if hasattr(prov, "moe_expert_capacity_factor"):
+            prov.moe_expert_capacity_factor = moe_expert_capacity_factor
+        if hasattr(prov, "moe_pad_expert_input_to_capacity"):
+            prov.moe_pad_expert_input_to_capacity = bool(moe_pad_expert_input_to_capacity)
     prov.share_embeddings_and_output_weights = False  # OV2 ckpt has a separate output_layer.weight
     # AIAK sets scatter_embedding_sequence_parallel=False: the VLM does its own SP scatter on the
     # fused (text+image) embeddings (see forward step 3), so the LLM embedding must NOT pre-scatter.
@@ -381,6 +477,34 @@ def build_llava_ov2(
     if hasattr(language_model.config, "moe_permute_fusion"):
         import os as _os
         language_model.config.moe_permute_fusion = _os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
+    if getattr(language_model.config, "num_moe_experts", None):
+        if (
+            moe_expert_capacity_factor is not None
+            and getattr(language_model.config, "moe_expert_capacity_factor", None) != moe_expert_capacity_factor
+        ):
+            raise RuntimeError(
+                "OV2 requested moe_expert_capacity_factor="
+                f"{moe_expert_capacity_factor}, but runtime LLM config has "
+                f"{getattr(language_model.config, 'moe_expert_capacity_factor', None)}. "
+                "Capacity limiting would be a no-op; refusing to continue."
+            )
+        if (
+            moe_expert_capacity_factor is not None
+            and bool(getattr(language_model.config, "moe_pad_expert_input_to_capacity", False))
+            != bool(moe_pad_expert_input_to_capacity)
+        ):
+            raise RuntimeError(
+                "OV2 requested moe_pad_expert_input_to_capacity="
+                f"{bool(moe_pad_expert_input_to_capacity)}, but runtime LLM config has "
+                f"{getattr(language_model.config, 'moe_pad_expert_input_to_capacity', None)}. "
+                "Pad-to-capacity would be a no-op; refusing to continue."
+            )
+        logger.info(
+            "[ov2 build] MoE capacity wired: factor=%s pad_to_capacity=%s dispatcher=%s",
+            getattr(language_model.config, "moe_expert_capacity_factor", None),
+            getattr(language_model.config, "moe_pad_expert_input_to_capacity", None),
+            getattr(language_model.config, "moe_token_dispatcher_type", None),
+        )
     if load_llm_weights:  # stream HF Qwen3-4B weights into the freshly-built LLM (cpu params)
         bridge.load_hf_weights([language_model])
         # Qwen3-4B-Instruct ties input/output embeddings (no lm_head.weight in HF), but the
@@ -411,9 +535,20 @@ def build_llava_ov2(
     # deepcopies llm_cfg, so explicitly DISABLE recompute on the vision encoder — its ported
     # _checkpointed_forward passes attn_mask_type, incompatible with this mcore's TransformerLayer
     # (the encoder is small: 24L / bounded patches, so it needn't recompute anyway).
-    for _a in ("recompute_granularity", "recompute_method", "recompute_num_layers", "recompute_modules"):
-        if hasattr(vis_cfg, _a):
-            setattr(vis_cfg, _a, None)
+    # OV2_VISION_RECOMPUTE=1: OVERRIDE — enable FULL recompute on the vision tower too. Needed at
+    # TP=1 where the ~86-frame video vision activation (unsharded) OOMs the forward; recompute frees
+    # it. Env-gated so the default path is unchanged. Worst case = the attn_mask_type incompat above
+    # crashes loudly (caught/handled), not silent-wrong.
+    if __import__("os").environ.get("OV2_VISION_RECOMPUTE") == "1":
+        vis_cfg.recompute_granularity = "full"
+        vis_cfg.recompute_method = "uniform"
+        vis_cfg.recompute_num_layers = 1
+        if hasattr(vis_cfg, "recompute_modules"):
+            vis_cfg.recompute_modules = None
+    else:
+        for _a in ("recompute_granularity", "recompute_method", "recompute_num_layers", "recompute_modules"):
+            if hasattr(vis_cfg, _a):
+                setattr(vis_cfg, _a, None)
     if grad_accum_fusion is not None:
         for c in (vis_cfg, adp_cfg):
             if hasattr(c, "gradient_accumulation_fusion"):
@@ -589,11 +724,17 @@ def load_ov2_mcore_checkpoint(model: LlavaOnevision2, ckpt_path: str, *, load_ad
 
     if not load_adapter:
         sd = {k: v for k, v in sd.items() if not k.startswith("adapter.")}
+    # load_vision=False: drop vision_model.* from the primary stitch so a separate p16m33 vision
+    # source (load_hf_encoder_into_tower) is authoritative (was a dead param; now honored).
+    if not load_vision:
+        sd = {k: v for k, v in sd.items() if not k.startswith("vision_model.")}
 
     missing, unexpected = model.load_state_dict(sd, strict=False)
     real_missing = [
         k for k in missing
-        if not k.endswith("._extra_state") and not (not load_adapter and k.startswith("adapter."))
+        if not k.endswith("._extra_state")
+        and not (not load_adapter and k.startswith("adapter."))
+        and not (not load_vision and k.startswith("vision_model."))
     ]
     real_unexpected = [k for k in unexpected if not k.endswith("._extra_state")]
     summary = {
@@ -606,6 +747,28 @@ def load_ov2_mcore_checkpoint(model: LlavaOnevision2, ckpt_path: str, *, load_ad
         "[ov2 load] loaded=%d missing=%d unexpected=%d adapter_loaded=%s",
         len(sd), len(real_missing), len(real_unexpected), load_adapter,
     )
+    # Fail-fast on a partial load. perform_init is OFF here, so any param NOT found in the checkpoint
+    # stays as torch.empty (uninitialized garbage) and training would silently learn from random
+    # weights -- e.g. if the MoE per-expert -> TE-grouped key remap above ever stops matching, every
+    # expert would be left random with only an INFO line. Mirror the EP-shard SystemExit above.
+    if real_missing:
+        import os
+        _preview = real_missing[:20]
+        _msg = (
+            "[ov2 load] {} model parameter(s) were NOT found in the checkpoint and remain "
+            "UNINITIALIZED (perform_init off -> torch.empty). The checkpoint format likely drifted "
+            "(e.g. the MoE expert-key remap no longer matches the built model). First {}: {}{}".format(
+                len(real_missing), len(_preview), _preview,
+                "" if len(real_missing) <= len(_preview) else " ...",
+            )
+        )
+        if os.environ.get("OV2_ALLOW_PARTIAL_LOAD", "0") == "1":
+            logger.error("%s -- OV2_ALLOW_PARTIAL_LOAD=1 set, continuing anyway.", _msg)
+        else:
+            raise SystemExit(
+                _msg + " If these params are intentionally initialized elsewhere, re-run with "
+                "OV2_ALLOW_PARTIAL_LOAD=1 to bypass this guard."
+            )
     return summary
 
 

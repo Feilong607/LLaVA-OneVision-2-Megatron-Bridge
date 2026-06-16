@@ -141,7 +141,11 @@ def initialize_megatron(
     # Compile dataset helpers after distributed initialization
     # Use local rank to ensure each node compiles independently (multi-node without shared filesystem)
     if torch.distributed.is_initialized():
-        if get_local_rank_preinit() == 0:
+        # OV2_SKIP_HELPERS=1: skip the C++ index-builder compile (energon datasets don't use
+        # helpers_cpp; only the megatron-indexed/BERT path does). The barrier below stays
+        # UNCONDITIONAL so all ranks still sync -> skipping only the compile keeps the
+        # collective balanced (no deadlock).
+        if get_local_rank_preinit() == 0 and os.environ.get("OV2_SKIP_HELPERS") != "1":
             start_time = time.time()
             print("> compiling dataset index builder ...")
             compile_helpers()

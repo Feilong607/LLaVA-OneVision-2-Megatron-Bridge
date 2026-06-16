@@ -1360,8 +1360,11 @@ def maybe_save_dataloader_state(
 
     torch.distributed.barrier(group=pg_collection.dp)
 
-    if pg_collection.dp.rank() == 0:
-        ensure_directory_exists(data_state_save_path)
+    # NFS cross-node race fix: EVERY rank ensures iter_dir exists from its own view.
+    # rank-0-only mkdir + barrier guarantees ordering but NOT cross-node NFS metadata
+    # visibility, so peer-node ranks hit "Parent directory iter_XXXXXXX does not exist"
+    # on torch.save. makedirs(exist_ok=True) is concurrency-safe.
+    ensure_directory_exists(data_state_save_path)
 
     torch.distributed.barrier(group=pg_collection.dp)
 

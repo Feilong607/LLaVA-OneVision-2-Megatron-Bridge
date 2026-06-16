@@ -13,12 +13,38 @@
 # =============================================================================
 set -uo pipefail   # NOT -e: run ALL checks, then tally.
 
-REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
+# Auto-detect the repo root from THIS script's location (.../examples/models/qwen/qwen3_vl_ov2/gb200/)
+# so it works on A100-2 (/ov2/...) AND GB200 (/home/<user>/LLaVA-OneVision-2-Megatron-Bridge) with no
+# hardcoding. Override REPO=... to force a different checkout.
+_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
+[[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/LLaVA-OneVision-2-Megatron-Bridge" >&2; exit 1; }
 RECIPE="${RECIPE:-ov2_35b_a3b_midtrain}"
+# HF models root (LLM arch + energon processor). Default A100-2 layout; override on GB200 to wherever
+# Qwen3-30B-A3B-Instruct-2507/ and llava_onevision2/llava_onevision2_30b_a3b/auto_model/ actually live.
+# --- CARD PATH PROFILE: A100 (/ov2) <-> GB200 (/datasets). Per-card path DEFAULTS; all env-overridable.
+#     The recipe reads OV2_PRETRAIN_ROOT (llava processor+stage_0 ckpt root) and OV2_LLM_HF_30B (Qwen LLM). ---
+if [[ "${HWNAME:-}" == "gb200" || -d /datasets/qwen-models-ea5jyi ]]; then
+  OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/datasets/qwen-models-ea5jyi/Qwen3-30B-A3B-Instruct-2507}"
+  OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"            # bundled processor (GB200)
+  OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"   # bundled processor (GB200, p16m33 recipe)
+  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # GB200: now only the processor root (stage_0 SKIPPED); OV2_HF_PROC_30B set directly above to the bundled auto_model
+  DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"   # /datasets/llava/11May data
+  INIT_CKPT="${INIT_CKPT:-/datasets/llava-ov2-30b-a3b-m9lvdn}"   # trained ckpt to resume (GB200; has iter_0001000 + auto_model)
+  SAVE="${SAVE:-/home/ftan0055/ckpts_video_sft/ov2_30b_a3b_gb200}"     # output dir (GB200, user-set)
+  OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # GB200: mid-train from stage2 -> skip the stage_0 stitch
+else
+  OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/ov2/pretrain_models/Qwen3-30B-A3B-Instruct-2507}"
+  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/ov2/pretrain_models}"
+  DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/mid_training_seed85m.yaml}"         # /ov2/dataset_sft data (backup yaml)
+  INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_stage2}"
+  SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_gb200}"
+  OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-0}"   # A100: keep the stage_0 stitch
+fi
+OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b/auto_model}"
+export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
+export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before skipping the stitch
 ACCEL="${ACCEL:-0}"
-INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_stage2}"
-DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"
-SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_gb200}"
 export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"
@@ -78,9 +104,9 @@ if [[ -f "$DATA_PATH" ]]; then
 fi
 
 sec "3. HF dirs (LLM arch + processor) — MUST be local (no internet at runtime)"
-exdir "/ov2/pretrain_models/Qwen3-30B-A3B-Instruct-2507"                              "LLM HF dir (AutoBridge arch/weights)"
-exfile "/ov2/pretrain_models/Qwen3-30B-A3B-Instruct-2507/config.json"                 "LLM HF config.json"
-exdir "/ov2/pretrain_models/llava_onevision2/llava_onevision2_30b_a3b/auto_model"     "HF processor dir (energon task encoder)"
+exdir "$OV2_LLM_HF_30B"                                                             "LLM HF dir (AutoBridge arch/weights)"
+exfile "$OV2_LLM_HF_30B/config.json"                                                "LLM HF config.json"
+exdir "$OV2_HF_PROC_30B"                                                            "HF processor dir (energon task encoder)"
 
 sec "4. disk space for SAVE (ckpts ~60GB each, model-only; more with optimizer)"
 sdir="$SAVE"; while [[ ! -d "$sdir" && "$sdir" != "/" ]]; do sdir="$(dirname "$sdir")"; done
@@ -157,6 +183,23 @@ if ACCEL == "2":
         ok("HybridEP fully importable (deep_ep + HybridEPBuffer + HAVE_HYBRIDEP) -> ACCEL=2 usable offline")
     except Exception as e:
         bad("ACCEL=2 (HybridEP) NOT importable offline: %s -> use ACCEL=0/1 (alltoall) on this container" % e)
+# Triton x Blackwell: Triton<3.3 has no mature sm_100 codegen. The fla '>=3.3' warning is benign for
+# qwen3_moe (no GDN at runtime), but TE/grouped-GEMM Triton kernels still JIT on Blackwell. The fix is
+# the right CONTAINER (cu13/Blackwell ships Triton>=3.3) -- do NOT pip-upgrade Triton (ABI-pinned to torch/TE).
+try:
+    import triton
+    _tv = tuple(int(x) for x in triton.__version__.split(".")[:2])
+    if cc[0] >= 10 and _tv < (3, 3):
+        bad("Triton %s on Blackwell (cc=%s): no mature sm_100 codegen -> you are likely on a cu12 container; "
+            "use the cu13/Blackwell image (Triton>=3.3). Do NOT pip-upgrade Triton (ABI-pinned to torch/TE)."
+            % (triton.__version__, cc))
+    elif cc[0] >= 10:
+        ok("Triton %s OK for Blackwell (torch cuda %s)" % (triton.__version__, torch.version.cuda))
+    else:
+        ok("Triton %s (cc=%s, torch cuda %s) -- fla>=3.3 warning is benign here (qwen3_moe has no GDN at runtime)"
+           % (triton.__version__, cc, torch.version.cuda))
+except Exception as e:
+    warn("triton/Blackwell check: %s" % e)
 print("RESULT_FAILS=%d" % len(fails))
 sys.exit(1 if fails else 0)
 PY
