@@ -43,6 +43,10 @@ RECIPE="${RECIPE:-ov2_30b_a3b_p16m33_midtrain}"  # p16m33 full-model midtrain; f
 MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-16}"                  # global batch size; override with OV2_MIDTRAIN_GBS=
 MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-780000}"  # LLaVA-Next 780k default
 ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
+# LR warmup = 0.002 * train_iters (AIAK stage-1 fraction; ~97 @ 48750 iters). Gentle ramp 0->2e-5 then
+# constant (min_lr==max_lr). Override OV2_WARMUP_ITERS= (e.g. =0 for AIAK pure-constant-LR).
+WARMUP_ITERS="${OV2_WARMUP_ITERS:-$(( ITERS * 2 / 1000 ))}"
+if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-500}"
 # NPROC (GPUs/node) is set by the HARDWARE PROFILE block below (GB200=4, A100/H100=8); override via NPROC=.
 
@@ -200,6 +204,7 @@ export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONP
 export OV2_SKIP_HELPERS="${OV2_SKIP_HELPERS:-1}"   # energon doesn't use helpers_cpp -> skip the C++ index-builder compile
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"  # avoid TE Triton MoE-permute wedge (30B-A3B fix)
+export OV2_MOE_AUX_LOSS_COEFF="${OV2_MOE_AUX_LOSS_COEFF:-0.01}"  # AIAK midtrain load-balance coeff (HF default 0.001); build_llava_ov2 forces it on the built LLM
 export OV2_PACK_FULL_CAUSAL="${OV2_PACK_FULL_CAUSAL:-0}"      # 0=THD block-diagonal (AIAK-faithful); 1=full-causal
 export OV2_SEQ_LEN="$SEQ_LEN"                                # recipe reads this at import -> model+dataset+task_encoder
 export OV2_MIDTRAIN_GBS="$MIDTRAIN_GBS" OV2_MIDTRAIN_N_SAMPLES="$MIDTRAIN_N_SAMPLES"
@@ -250,7 +255,14 @@ OVERRIDES="dataset.path=$DATA_PATH"
 OVERRIDES="$OVERRIDES checkpoint.save=$SAVE checkpoint.load=$SAVE dataset.dataloader_save=$SAVE"
 OVERRIDES="$OVERRIDES checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS validation.eval_iters=0 logger.log_interval=$LOG_EVERY train.micro_batch_size=1"   # packing REQUIRES mbs=1 (model asserts batch==1)
 OVERRIDES="$OVERRIDES model.tensor_model_parallel_size=$TP model.sequence_parallel=$SP $MOE_CAPACITY_ARGS"
-OVERRIDES="$OVERRIDES scheduler.lr_warmup_iters=0"   # AIAK: warmup 0 -> constant 2e-5 from step 1
+# MoE router in fp32 for 128-expert stability (matches A800). The CLI override is the RELIABLE path:
+# the provider also sets it but that field may not survive build_llava_ov2's HF LLM rebuild.
+OVERRIDES="$OVERRIDES model.moe_router_dtype=${OV2_ROUTER_DTYPE:-fp32}"
+OVERRIDES="$OVERRIDES scheduler.lr_warmup_iters=$WARMUP_ITERS"   # 0.002*train_iters warmup ramp; OV2_WARMUP_ITERS=0 to disable
+# LR aligned to AIAK 30B-A3B midtrain: peak 1e-5 -> cosine decay -> 1e-6 (the recipe default is 2e-5 FLAT,
+# min_lr==max_lr). lr_decay_style=cosine + lr_decay_iters=train_iters are ALREADY set by the recipe, so
+# making min_lr<lr re-enables the cosine ramp-down. Override OV2_LR= / OV2_MIN_LR= (=2e-5 =2e-5 to restore flat).
+OVERRIDES="$OVERRIDES optimizer.lr=${OV2_LR:-1e-5} optimizer.min_lr=${OV2_MIN_LR:-1e-6}"
 # GB200 (192GB HBM): keep the WHOLE optimizer on-GPU as plain fp32 AdamW -- NO CPU offload. This is the
 # core GB200 simplification vs the A800 launcher (which, to fit 80GB at TP=1, sets optimizer_cpu_offload=true
 # + use_precision_aware_optimizer=true). Forcing both OFF here is explicit/defensive: the recipe already
@@ -324,7 +336,7 @@ if [[ "$_is_muon" == "1" && "$_has_ckpt" == "1" && -f "$_wf" ]]; then
   fi
 fi
 [[ "$NODE_RANK" -eq 0 ]] && { echo "$WORLD" > "$_wf" 2>/dev/null || true; }
-echo "[ov2-30b-gb200] in-container | hw=$HWNAME(cc=$_cc) repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY node_rank=$NODE_RANK nnodes=$NNODES"
+echo "[ov2-30b-gb200] in-container | hw=$HWNAME(cc=$_cc) repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY node_rank=$NODE_RANK nnodes=$NNODES"
 # shellcheck disable=SC2086  # $RDZV and $OVERRIDES must word-split into separate args
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
   --recipe "$RECIPE" --dataset vlm-energon --step_func ov2_step \

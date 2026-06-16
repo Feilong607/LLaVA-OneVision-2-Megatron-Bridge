@@ -573,6 +573,16 @@ def _ov2_common(
     cfg.scheduler.start_weight_decay = 0.0
     cfg.scheduler.end_weight_decay = 0.0
 
+    # midtrain (full-model SFT, per AIAK qwen3_30b_a3b/mid_training.sh): beta2=0.95 + weight_decay=0.01.
+    # Scoped to MIDTRAIN ONLY -- stage-1/stage-2 keep beta2=0.99 / wd=0 (AIAK stage configs). wd is set on
+    # BOTH the optimizer AND scheduler start/end (constant 0.01), else OptimizerParamScheduler.step()
+    # clobbers optimizer.weight_decay back to the scheduler value every iter (see note above).
+    if stage == "midtrain":
+        cfg.optimizer.adam_beta2 = 0.95
+        cfg.optimizer.weight_decay = 0.01
+        cfg.scheduler.start_weight_decay = 0.01
+        cfg.scheduler.end_weight_decay = 0.01
+
     # ---- Dataset (Energon; path via CLI) + native dataloader-state save ----
     if stage == "stage1":
         ds_workers, ds_buffer = 4, 2000             # blip 16-rank diversity fix (small samples -> mem-safe)

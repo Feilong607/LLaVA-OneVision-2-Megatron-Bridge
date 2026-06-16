@@ -263,14 +263,14 @@ class LlavaOnevision2(MegatronModule):
             image_embeddings = self.adapter(ve, patch_positions=_pp_cat)
             _n_tok = (input_ids == self.image_token_id).sum().item()
             _n_feat = image_embeddings.shape[0]
-            # SP off: no ViT SP-padding -> features must match tokens EXACTLY.
-            # SP on : ViT SP-padding makes n_feat >= n_tok; overflow is trimmed, a shortfall is a bug.
-            if not _sp:
-                _feat_bad = 1 if _n_feat != _n_tok else 0
-            else:
-                _feat_bad = 1 if _n_feat < _n_tok else 0
-                if _n_feat > _n_tok:  # trim ViT SP-padding overflow (only expected under sequence_parallel)
-                    image_embeddings = image_embeddings[:_n_tok]
+            # The vision tower + adapter are ALWAYS built TP=1 / sequence_parallel=False (see
+            # _vision_config_from / _adapter_config_from) -> they NEVER SP-pad. _n_feat is the merged
+            # patch count = exactly the number of <image> placeholders the processor inserted, so it must
+            # equal _n_tok REGARDLESS of the LLM's sequence_parallel (_sp). The step-3 SP pad lengthens
+            # the FUSED `combined` tensor, not these features. So require an EXACT match unconditionally
+            # and NEVER trim: an overflow is a real processor/grid bug, and trimming would silently fuse
+            # the wrong features instead of catching it. (_sp is kept only for the diagnostic message.)
+            _feat_bad = 1 if _n_feat != _n_tok else 0
         # Collective abort: EVERY rank participates -- including text-only ranks where images is None and
         # _feat_bad stays 0 -- so the all_reduce itself can never desync. MAX => if ANY rank saw a
         # mismatch, ALL ranks raise the same RuntimeError at this identical program point.
@@ -477,6 +477,15 @@ def build_llava_ov2(
     if hasattr(language_model.config, "moe_permute_fusion"):
         import os as _os
         language_model.config.moe_permute_fusion = _os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
+    # moe_aux_loss_coeff: HF Qwen3-30B-A3B ships router_aux_loss_coef=0.001; AIAK midtrain uses 0.01.
+    # Like permute_fusion this must be forced on the BUILT config (cfg.model is rebuilt from HF, so a
+    # recipe/CLI model.* override never reaches it). The MoE router reads config.moe_aux_loss_coeff each
+    # step, so a post-provide override lands. Env-gated: unset -> inherit HF default (no change).
+    if hasattr(language_model.config, "moe_aux_loss_coeff"):
+        import os as _os
+        _aux = _os.environ.get("OV2_MOE_AUX_LOSS_COEFF", "")
+        if _aux != "":
+            language_model.config.moe_aux_loss_coeff = float(_aux)
     if getattr(language_model.config, "num_moe_experts", None):
         if (
             moe_expert_capacity_factor is not None
