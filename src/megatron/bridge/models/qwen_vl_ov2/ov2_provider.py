@@ -165,8 +165,6 @@ class LlavaOnevision2Provider(GPTModelProvider):
             expert_model_parallel_size=getattr(self, "expert_model_parallel_size", 1) or 1,
             expert_tensor_parallel_size=getattr(self, "expert_tensor_parallel_size", None),
             sequence_parallel=bool(getattr(self, "sequence_parallel", False)),
-            moe_expert_capacity_factor=getattr(self, "moe_expert_capacity_factor", None),
-            moe_pad_expert_input_to_capacity=bool(getattr(self, "moe_pad_expert_input_to_capacity", False)),
             load_llm_weights=self.load_llm_weights,
             recompute=bool(getattr(self, "recompute_activations", False)),
             # Per-backbone vision-tower geometry (4B defaults reproduce the verified p16m33 tower).
