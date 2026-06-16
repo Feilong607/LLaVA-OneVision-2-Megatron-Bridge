@@ -9,8 +9,8 @@ per-token loss [b, s] (mcore GPTModel.compute_language_model_loss, which does NO
 Labels are therefore expected PRE-SHIFTED by the data task encoder (roll -1), exactly the
 QwenVLTaskEncoder convention. This step does NOT shift labels and does NOT double-count.
 
-Assumes CP = 1 (LlavaOnevision2.forward asserts CP==1). Offline-packed OV2 samples use
-THD block-diagonal attention via cu_seqlens; unlike qwen3_vl_step there is no CP split here.
+Assumes TP/PP/CP = 1 (LlavaOnevision2.forward asserts CP==1) and no sequence packing — so unlike
+qwen3_vl_step there is no pack_or_pad / cp-split here.
 """
 import logging
 import os
@@ -39,10 +39,9 @@ def get_batch(data_iterator: Iterable):
     pixel_values = _cuda(batch.get("pixel_values"))
     image_grid_thw = _cuda(batch.get("image_grid_thw"))
     cu_seqlens = _cuda(batch.get("cu_seqlens"))
-    patch_positions = _cuda(batch.get("patch_positions"))   # video: [P,3] int64 (t,h,w); do NOT bf16-cast
     if pixel_values is not None and pixel_values.dtype == torch.float32:
         pixel_values = pixel_values.to(torch.bfloat16)  # match bf16 weights (vision tower)
-    return tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw, cu_seqlens, patch_positions
+    return tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw, cu_seqlens
 
 
 def forward_step(
@@ -59,7 +58,7 @@ def forward_step(
     """
     timers = state.timers
     timers("batch-generator", log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw, cu_seqlens, patch_positions = get_batch(data_iterator)
+    tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw, cu_seqlens = get_batch(data_iterator)
     timers("batch-generator").stop()
 
     # THD block-diagonal packed attention when the task encoder emitted segment boundaries
@@ -68,38 +67,11 @@ def forward_step(
     packed_seq_params = None
     if cu_seqlens is not None and os.environ.get("OV2_PACK_FULL_CAUSAL", "0") != "1":
         from megatron.core.packed_seq_params import PackedSeqParams
-        cu = cu_seqlens.to(torch.int32).flatten()
-        seq_len = int(tokens.shape[1])
-        cu_last = int(cu[-1].item())
-        if cu_last > seq_len:
-            raise RuntimeError(
-                f"OV2 packed cu_seqlens ends at {cu_last}, beyond token sequence length {seq_len}; "
-                f"cu_seqlens={cu.tolist()}"
-            )
-        cu_padded = None
-        if cu_last < seq_len:
-            # Energon / SP padding can make the actual hidden sequence longer than the packed
-            # sample payload. Represent the padded tail as a zero-length real segment plus
-            # a nonzero padded segment, matching MCore's padded/unpadded THD convention.
-            labels[:, cu_last:] = -100
-            loss_mask[:, cu_last:] = 0
-            cu_unpadded = torch.cat([cu, cu.new_tensor([cu_last])])
-            cu_padded = torch.cat([cu, cu.new_tensor([seq_len])])
-        else:
-            cu_unpadded = cu
-        cu_for_msl = cu_padded if cu_padded is not None else cu_unpadded
-        seglens_for_msl = cu_for_msl[1:] - cu_for_msl[:-1]
-        msl = int(seglens_for_msl.max().item()) if seglens_for_msl.numel() > 0 else int(tokens.shape[1])
-        _packed_kwargs = dict(
-            qkv_format="thd",
-            cu_seqlens_q=cu_unpadded,
-            cu_seqlens_kv=cu_unpadded,
-            max_seqlen_q=msl,
-            max_seqlen_kv=msl,
-        )
-        if cu_padded is not None:
-            _packed_kwargs.update(cu_seqlens_q_padded=cu_padded, cu_seqlens_kv_padded=cu_padded)
-        packed_seq_params = PackedSeqParams(**_packed_kwargs)
+        cu = cu_seqlens.to(torch.int32)
+        seglens = cu[1:] - cu[:-1]
+        msl = int(seglens.max().item()) if seglens.numel() > 0 else int(tokens.shape[1])
+        packed_seq_params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu,
+                                            max_seqlen_q=msl, max_seqlen_kv=msl)
 
     # FLOPS metadata. Packed attention is O(Sum Li^2) over per-sub-sample lengths (block-diagonal),
     # NOT O((Sum Li)^2) -> feed the REAL Sum Li / Sum Li^2 so MODEL_TFLOP/s and the MFU line are not
@@ -108,8 +80,7 @@ def forward_step(
         mbs = tokens.shape[0]
         seq_len = tokens.shape[1]
         if cu_seqlens is not None:
-            _cu_stats = cu_seqlens.flatten()
-            _sl = (_cu_stats[1:] - _cu_stats[:-1]).to(torch.float64)
+            _sl = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.float64)
             state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + int(_sl.sum().item())
             state._flops_seqlen_sq_sum = getattr(state, "_flops_seqlen_sq_sum", 0) + int((_sl * _sl).sum().item())
         else:
@@ -127,7 +98,6 @@ def forward_step(
         position_ids=None,        # LlavaOnevision2 / Qwen3 LLM compute positions internally
         attention_mask=attention_mask,
         labels=labels,            # PRE-SHIFTED by the task encoder; mcore does not shift
-        patch_positions=patch_positions,       # video: temporal (t,h,w) RoPE; None for image (self-derived)
         packed_seq_params=packed_seq_params,   # THD block-diagonal when offline-packed (else None)
     )
 

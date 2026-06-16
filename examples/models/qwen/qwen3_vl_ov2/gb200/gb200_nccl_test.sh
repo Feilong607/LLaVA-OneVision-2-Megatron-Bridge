@@ -6,8 +6,7 @@
 # Set NCCL_DEBUG=INFO to dump the topology/transport NCCL chose (confirms NVLink/NVLS vs IB).
 # =============================================================================
 set -uo pipefail
-REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
-[[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/LLaVA-OneVision-2-Megatron-Bridge" >&2; exit 1; }
+REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
 NPROC="${NPROC:-4}"
 export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
@@ -16,9 +15,7 @@ PROBE="$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/gb200_nccl_probe.py"
 if [[ -n "${LIST_IP:-}" ]]; then read -ra list_ip <<< "$LIST_IP"; else list_ip=(); fi
 NN=${#list_ip[@]}
 if [[ "$NN" -le 1 ]]; then
-  # static single-node rendezvous (NOT --standalone): the dynamic c10d rendezvous
-  # times out at next_rendezvous join inside GB200 containers (RendezvousTimeoutError).
-  RDZV="--nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=${MASTER_PORT:-26048}"
+  RDZV="--standalone"
 else
   MASTER_ADDR="${list_ip[0]}"; MASTER_PORT="${MASTER_PORT:-26048}"
   CUR="$(hostname -I | awk '{print $1}')"; NR=-1
