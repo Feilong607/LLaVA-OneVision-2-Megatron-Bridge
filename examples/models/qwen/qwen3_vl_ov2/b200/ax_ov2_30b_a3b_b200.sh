@@ -206,6 +206,13 @@ export OV2_MOE_AUX_LOSS_COEFF="${OV2_MOE_AUX_LOSS_COEFF:-0.01}"  # AIAK midtrain
 export OV2_PACK_FULL_CAUSAL="${OV2_PACK_FULL_CAUSAL:-0}"      # 0=THD block-diagonal (AIAK-faithful); 1=full-causal
 export OV2_SEQ_LEN="$SEQ_LEN"                                # recipe reads this at import -> model+dataset+task_encoder
 export OV2_MIDTRAIN_GBS="$MIDTRAIN_GBS" OV2_MIDTRAIN_N_SAMPLES="$MIDTRAIN_N_SAMPLES"
+# Timing breakdown (opt-in): OV2_TIMING_LOG_LEVEL=1|2 enables the Megatron per-rank (min,max) timing
+# block (appended to OVERRIDES below). OV2_TIMING_PRINT_INTERVAL=N prints that block every N iters
+# (default 50) so it does not spam every iter; the default-off path is byte-identical (train_utils.py
+# gates on this env, defaulting to the original per-log_interval call). forward/backward-compute timers
+# also need the setup.py inner-config-timers fix already in this repo -> if REPO is a synced /home copy,
+# sync src/megatron/bridge/training/{setup.py,utils/train_utils.py} there too.
+export OV2_TIMING_PRINT_INTERVAL="${OV2_TIMING_PRINT_INTERVAL:-50}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}" NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-$HW_NVLS}"  # NVLS: B200/H100 on (intra-node NVSwitch), Ampere off
 [[ -n "${NCCL_IB_HCA:-}" ]] && export NCCL_IB_HCA NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
@@ -282,6 +289,11 @@ OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-1
 # with PermissionError -> that rank crashes -> the others hit a collective timeout (the crash masquerades
 # as a 'collective timeout from rank 7'). Pin tensorboard to the WRITABLE $SAVE so it never touches $REPO.
 OVERRIDES="$OVERRIDES logger.tensorboard_dir=$SAVE/tensorboard"
+# Per-rank (min,max) timing breakdown: opt-in via OV2_TIMING_LOG_LEVEL=1|2. log_timers_to_tensorboard=false
+# is REQUIRED alongside it -- otherwise training_log()'s wandb/mlflow/comet timer-writes call
+# elapsed(reset=True) (even when those writers are None) and zero the per-iter timers BEFORE the console
+# timers.log() -> the block prints nothing. Default (env unset) appends nothing -> behavior unchanged.
+[[ -n "${OV2_TIMING_LOG_LEVEL:-}" ]] && OVERRIDES="$OVERRIDES logger.timing_log_level=$OV2_TIMING_LOG_LEVEL logger.log_timers_to_tensorboard=false"
 OVERRIDES="$OVERRIDES mixed_precision=$MIXED_PRECISION"
 [[ "$DISABLE_RECOMPUTE" == "1" ]] && OVERRIDES="$OVERRIDES model.recompute_activations=false model.recompute_granularity=null"
 # NB: the dispatcher is wired in ov2_provider.provide() via OV2_FLEX_BACKEND (above) -- setting

@@ -64,6 +64,22 @@ def _init_ov2_adapter(adapter) -> None:
                     p.normal_(0.0, 0.02)
             else:
                 p.zero_()
+    # OV2_ADAPTER_INIT_SCALE: multiply the fc2 output-projection init so the adapter output magnitude
+    # matches the LLM input-embedding scale. Default unset/1.0 -> NO-OP (4B/30B Qwen3-family unchanged;
+    # their embedding L2 ~= the adapter output ~26). Qwen3.5 embeddings are ~54x smaller (L2 ~0.48) so
+    # the un-rescaled visual prefix is a residual-stream outlier and the layer-0 RMSNorm backward
+    # starves the adapter gradient -> stage-1 loss plateaus. Set ~0.0184 (=0.477/25.9) for qwen3.5.
+    import os as _os
+    _env = _os.environ.get("OV2_ADAPTER_INIT_SCALE")
+    if _env is not None and _env.strip() != "":
+        _sc = float(_env)                                            # explicit env override wins
+    else:
+        _sc = float(getattr(cfg, "adapter_init_scale", 1.0) or 1.0)  # per-backbone default (qwen3.5=0.0184; 1.0=no-op)
+    if _sc != 1.0:
+        with torch.no_grad():
+            for n, p in adapter.named_parameters():
+                if "linear_fc2" in n and p.dim() >= 2:
+                    p.mul_(_sc)
 
 
 @dataclass
@@ -82,6 +98,8 @@ class LlavaOnevision2Provider(GPTModelProvider):
     load_ov2_vision: bool = True
     load_llm_weights: bool = False                # LLM weights come from the stitch ckpt, not HF
     image_token_id: int = 151655
+    adapter_init_scale: float = 1.0               # adapter fc2 init rescale to match LLM emb scale (qwen3.5=0.0184; 1.0=no-op)
+    mrope_section: Optional[list] = None          # set (qwen3.5=[11,11,10]) -> build LLM as multimodal RoPE; None -> 1D rope (4B/30B)
     recompute_activations: bool = False           # LLM activation recompute (full/uniform/1) — cuts
                                                   # peak memory (~71GB->~35GB for 30B-A3B) at ~30% speed
                                                   # cost; set via recipe/CLI to fit busy/coexisting GPUs
@@ -168,6 +186,9 @@ class LlavaOnevision2Provider(GPTModelProvider):
             moe_expert_capacity_factor=getattr(self, "moe_expert_capacity_factor", None),
             moe_pad_expert_input_to_capacity=bool(getattr(self, "moe_pad_expert_input_to_capacity", False)),
             load_llm_weights=self.load_llm_weights,
+            image_token_id=getattr(self, "image_token_id", 151655),
+            adapter_init_scale=getattr(self, "adapter_init_scale", 1.0),
+            mrope_section=getattr(self, "mrope_section", None),
             recompute=bool(getattr(self, "recompute_activations", False)),
             # Megatron-FSDP needs gradient_accumulation_fusion OFF unless TE>=2.10 (mcore_fsdp_adapter
             # asserts is_te_min_version("2.10") only when GAF is True). Env-gated so NON-FSDP runs are
@@ -186,6 +207,26 @@ class LlavaOnevision2Provider(GPTModelProvider):
                 freeze_vision_model=self.freeze_vision_model,
                 freeze_adapter=self.freeze_adapter,
             )
+
+        # --- Frozen-LLM stages (stage-1/2): zero the MTP + MoE-aux losses ---
+        # When the LLM is frozen (adapter-only / vit+adapter alignment) its MTP head and MoE router
+        # are frozen too, so NEITHER the MTP loss nor the load-balancing aux loss can be reduced --
+        # yet mcore still backprops both through the frozen trunk into the TRAINABLE adapter. That
+        # gradient is unrelated to caption alignment and corrupts it: stage-1 caption loss plateaus
+        # (qwen3.5 stuck ~3.7 vs ~3.07) and the mtp loss RISES as the adapter fights it. Zero both so
+        # the adapter optimizes PURELY on the caption loss. Both are read LIVE from the LLM config each
+        # step (mtp: multi_token_prediction.py:700 `config.mtp_loss_scaling_factor / mtp_num_layers`;
+        # aux: the MoE router), and model.config IS the LLM config, so this post-build override lands.
+        # Midtrain (LLM trainable -> both are legit learnable objectives) keeps them: gate on freeze.
+        # No-op on dense (4B/8B: no MoE/MTP). ISOLATION (2026-06-26): gate to the Qwen3.5 line ONLY
+        # (mrope_section set) so the EXISTING Qwen3-30B-A3B p16m33 workhorse stays byte-identical to its
+        # proven stage1/stage2 runs -- it KEEPS the live HF MoE aux coeff (0.001) it always trained with.
+        # The mtp/aux zero-out (a frozen-stage corruption fix) is applied ONLY to Qwen3.5-35B here.
+        if self.freeze_language_model and getattr(self, "mrope_section", None) is not None:
+            if getattr(model.config, "mtp_num_layers", None):
+                model.config.mtp_loss_scaling_factor = 0.0
+            if getattr(model.config, "num_moe_experts", None):
+                model.config.moe_aux_loss_coeff = 0.0
 
         # --- CRITICAL multi-node grad-normalization fix ---
         # LlavaOnevision2.__init__ does super().__init__(config=language_model.config), so the

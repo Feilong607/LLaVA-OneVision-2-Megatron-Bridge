@@ -150,6 +150,7 @@ from megatron.bridge.models.qwen_vl import (
     Qwen35VLMoEBridge,
     Qwen35VLMoEModelProvider,
 )
+from megatron.bridge.models.qwen_vl_ov2 import LlavaOnevision2MoEBridge  # noqa: F401 (OV2 bridge registration)
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl import (
     Qwen3VLBridge,
     Qwen3VLModel,

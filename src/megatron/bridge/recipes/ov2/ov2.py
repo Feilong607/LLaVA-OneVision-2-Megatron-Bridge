@@ -234,6 +234,7 @@ class OV2EnergonProvider(EnergonProvider):
             # images via PIL so pixel inputs are byte-level identical to AIAK. Without it the Energon
             # default decoder may differ. Flows through **kwargs -> get_train_dataset(image_decode=...).
             image_decode="pil",
+            parallel_shard_iters=int(os.environ.get("OV2_PARALLEL_SHARD_ITERS", "16")),
         )
         train_loader = dataset.train_dataloader()
         try:
@@ -356,7 +357,7 @@ def _ov2_common(
     if stage == "stage1":
         ckpt_path = paths["mcore_ckpt"]
         load_adapter = False
-        freeze_vision_model = True
+        freeze_vision_model = (__import__("os").environ.get("OV2_FREEZE_VISION") or "1") == "1"   # stage1 default: freeze vision (adapter-only); OV2_FREEZE_VISION=0 -> train vit+adapter (empty/unset both -> freeze)
         freeze_language_model = True
     else:
         # stage2: freeze LLM, train vision+adapter. midtrain: train the FULL model (unfreeze the LLM),
@@ -421,6 +422,9 @@ def _ov2_common(
         vision_model_name=paths["vision_model_name"],
     )
     cfg.model.seq_length = seq_len
+    cfg.model.image_token_id = paths.get("image_token_id", 151655)   # per-backbone <|image_pad|> (qwen3.5=248056); 4B/30B keep 151655
+    cfg.model.adapter_init_scale = paths.get("adapter_init_scale", 1.0)   # per-backbone adapter fc2 init rescale (qwen3.5=0.0184; others 1.0=no-op)
+    cfg.model.mrope_section = paths.get("mrope_section", None)   # per-backbone multimodal-RoPE section (qwen3.5=[11,11,10]); None -> 1D rope (4B/30B)
     cfg.model.pipeline_dtype = None
     # midtrain trains the full model (LLM activations dominate at seq 32000) -> enable activation
     # recompute (full/uniform/1), matching AIAK date0528. provide() threads recompute_activations
@@ -619,7 +623,19 @@ def _ov2_common(
     cfg.ddp.grad_reduce_in_fp32 = True
     cfg.ddp.average_in_collective = False
     cfg.mixed_precision = "bf16_mixed"
-    cfg.comm_overlap = None
+    # EP all-to-all comm-overlap (OPT-IN; default OFF -> byte-identical). OV2_EP_OVERLAP=1 hides the
+    # inter-node MoE dispatch/combine a2a behind expert-FFN compute (~1.3x on exposed a2a). REQUIRES
+    # CUDA_DEVICE_MAX_CONNECTIONS>=32 + PyTorch>=2.6; RE-VALIDATE 2-node grad-norm before trusting (the
+    # MIMO grad-finalize path that forced cuda_graph_impl=none below is fragile on 2 nodes).
+    if os.environ.get("OV2_EP_OVERLAP", "0") == "1":
+        from megatron.bridge.training.comm_overlap import CommOverlapConfig
+        cfg.comm_overlap = CommOverlapConfig(
+            tp_comm_overlap=False,  # TP=1 here -> no TP comm to overlap (required arg, no default)
+            overlap_moe_expert_parallel_comm=True,
+            delay_wgrad_compute=(os.environ.get("OV2_EP_DELAY_WGRAD", "0") == "1"),
+        )
+    else:
+        cfg.comm_overlap = None
     # CUDA graphs OFF (match AIAK, which trains without them). With the OV2 MIMO model + CUDA
     # graphs, the captured step bypasses the standard Python grad-finalize and mis-scales the
     # adapter gradient across NODES (2-node grad norm ~10x single-node / AIAK ~1.3). Disabling

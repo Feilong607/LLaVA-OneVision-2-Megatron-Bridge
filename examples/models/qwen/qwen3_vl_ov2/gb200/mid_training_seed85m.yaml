@@ -4,62 +4,62 @@ splits:
   train:
     datasets:
       - weight: 4685855
-        path: /home/ftan0055/seed85m_video20m_47m5p_packed/node_00/webdataset
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_00/webdataset
         subflavors: {augmentation: false}
       - weight: 4685855
-        path: /home/ftan0055/seed85m_video20m_47m5p_packed/node_01/webdataset
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_01/webdataset
         subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_02/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_03/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_04/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_05/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_06/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_07/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_08/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_09/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_10/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_11/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_12/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_13/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_14/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_15/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_16/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_17/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685855
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_18/webdataset
-      #   subflavors: {augmentation: false}
-      # - weight: 4685845
-      #   path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_19/webdataset
-      #   subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_02/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_03/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_04/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_05/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_06/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_07/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_08/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_09/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_10/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_11/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_12/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_13/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_14/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_15/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_16/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_17/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685855
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_18/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4685845
+        path: /datasets/llava/11May/seed85m_video20m_47m5p_packed/node_19/webdataset
+        subflavors: {augmentation: false}

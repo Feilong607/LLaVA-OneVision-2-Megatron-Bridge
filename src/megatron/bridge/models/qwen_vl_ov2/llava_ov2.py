@@ -166,12 +166,15 @@ class LlavaOnevision2(MegatronModule):
     Assumes PP=1 (pre_process and post_process both on this rank).
     """
 
-    def __init__(self, language_model, vision_model, adapter, *, image_token_id: int = IMAGE_TOKEN_ID):
+    def __init__(self, language_model, vision_model, adapter, *, image_token_id: int = IMAGE_TOKEN_ID,
+                 video_token_id: int = 248057, vision_start_token_id: int = 248053):
         super().__init__(config=language_model.config)
         self.language_model = language_model
         self.vision_model = vision_model
         self.adapter = adapter
         self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
         # This forward assumes context_parallel_size==1 (no get_inputs_on_this_cp_rank split).
         assert getattr(language_model.config, "context_parallel_size", 1) == 1, (
             "LlavaOnevision2.forward assumes context_parallel_size==1; add a CP split before enabling CP."
@@ -209,6 +212,7 @@ class LlavaOnevision2(MegatronModule):
         position_ids: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
         labels: torch.Tensor = None,
+        loss_mask: torch.Tensor = None,
         packed_seq_params=None,
         patch_positions=None,
         **kwargs,
@@ -349,12 +353,61 @@ class LlavaOnevision2(MegatronModule):
                     _mx = _t.detach().float().abs().max().item()
                     print(f"[NANDBG r{_r}] {_nm} nan={_nan} inf={_inf} maxabs={_mx:.3e} shape={tuple(_t.shape)}", flush=True)
         # 4) language model
+        # decoder_input (fused image+text embeddings) drives the main path; gpt_model._preprocess
+        # ignores input_ids/position_ids when decoder_input is given. BUT an MTP head (Qwen3.5) rolls +
+        # re-embeds input_ids AND position_ids, so they must be REAL tensors -> pass them through when MTP
+        # is active. Gated on mtp_process so non-MTP backbones (4B/30B) stay byte-identical (None as before).
+        _mtp = bool(getattr(self.language_model, "mtp_process", False))
+        _ids = input_ids if _mtp else None
+        # M-RoPE: an mrope LLM (Qwen3.5) needs 3D (t,h,w) positions; image tokens get a 2D grid via
+        # get_rope_index (= Bridge-native qwen35_vl). Non-mrope LLMs (4B/30B "rope") ignore
+        # position_ids -> keep prior behavior (1D arange only for MTP, else None).
+        _is_mrope = getattr(self.language_model.config, "position_embedding_type", "rope") == "mrope"
+        _pos = position_ids
+        if _is_mrope and input_ids is not None:
+            from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import get_rope_index
+            _merge = getattr(self.adapter, "spatial_merge_size", 3)
+            if packed_seq_params is None:
+                # BSHD (stage-1/2, non-packed). get_rope_index handles no-image (image_grid_thw=None) too.
+                _pos, _ = get_rope_index(
+                    _merge, self.image_token_id, self.video_token_id, self.vision_start_token_id,
+                    input_ids, image_grid_thw=image_grid_thw, video_grid_thw=None, attention_mask=None,
+                )  # [3, b, s]
+            else:
+                # Packed/THD (midtrain): OV2 packs N sub-samples into ONE row, but get_rope_index loops
+                # over batch ROWS (not segments) -- its packed mask-builder crashes on a 1-row pack and
+                # positions would NOT reset per sub-sample. Build per-segment ZERO-BASED positions over
+                # cu_seqlens_q so each block-diagonal segment restarts at 0 (matches THD attn + Qwen3.5
+                # zero-based pretraining). image_grid_thw rows are consumed in segment order.
+                _cu = packed_seq_params.cu_seqlens_q.tolist()
+                _S = input_ids.shape[1]
+                _pos = torch.zeros(3, input_ids.shape[0], _S, dtype=torch.long, device=input_ids.device)
+                _gi = 0
+                for _a, _b in zip(_cu[:-1], _cu[1:]):
+                    if _b <= _a:
+                        continue
+                    _seg = input_ids[:, _a:_b]
+                    _nimg = int((_seg[0] == self.vision_start_token_id).sum().item())
+                    _sg = image_grid_thw[_gi:_gi + _nimg] if (image_grid_thw is not None and _nimg > 0) else None
+                    _gi += _nimg
+                    _sp, _ = get_rope_index(
+                        _merge, self.image_token_id, self.video_token_id, self.vision_start_token_id,
+                        _seg, image_grid_thw=_sg, video_grid_thw=None, attention_mask=None,
+                    )  # [3, 1, seg_len], zero-based within the segment
+                    _pos[:, :, _a:_b] = _sp.to(_pos.dtype)
+        elif _mtp and _pos is None and input_ids is not None:
+            _pos = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).unsqueeze(0).expand_as(input_ids)
+        _pos_arg = _pos if (_is_mrope or _mtp) else None
+        # loss_mask threaded into the LLM so the MTP head masks its aux loss to the SAME supervised
+        # tokens as the main loss (else process_mtp_loss defaults to all-ones -> trains MTP on
+        # prompt/image-pad/pad; matters once MTP is live at midtrain). No-op in stage-1/2 (MTP zeroed).
         return self.language_model(
-            input_ids=None,
-            position_ids=None,
+            input_ids=_ids,
+            position_ids=_pos_arg,
             attention_mask=attention_mask,
             decoder_input=combined,
             labels=labels,
+            loss_mask=loss_mask,
             packed_seq_params=packed_seq_params,
         )
 
@@ -383,6 +436,11 @@ def build_llava_ov2(
     vision_hidden_size: int = OV2_VISION_HIDDEN,
     vision_num_layers: int = OV2_VISION_LAYERS,
     vision_model_name: Optional[str] = None,
+    image_token_id: int = IMAGE_TOKEN_ID,
+    video_token_id: int = 248057,          # Qwen3.5 <|video_pad|> (used only on the mrope path)
+    vision_start_token_id: int = 248053,   # Qwen3.5 <|vision_start|> (get_rope_index scans this for image spans)
+    adapter_init_scale: float = 1.0,
+    mrope_section: Optional[list] = None,   # set (e.g. [11,11,10]) to build the LLM as multimodal RoPE (Qwen3.5); None -> 1D rope (4B/30B)
 ) -> LlavaOnevision2:
     """Build the OV2 model (untied Qwen3-family LLM + OV2 vision tower + adapter).
 
@@ -412,6 +470,20 @@ def build_llava_ov2(
     # weights only via a pre_wrap_hook fired by provide_distributed_model()/get_model() --
     # NOT by prov.provide() -- so HF LLM weights are streamed in explicitly after provide().
     prov = bridge.to_megatron_provider(load_weights=False)
+    # attention-softmax-in-fp32: bf16 attention softmax (head_dim 256 + rope_theta 1e7) is numerically
+    # fragile; the sibling qwen3_vl/qwen35_vl providers BOTH set this True, but the OV2 build inherited
+    # gpt_provider's False default (a self-contradiction). Force True for numerical stability (matches
+    # LoongForge --attention-softmax-in-fp32). Set BEFORE provide() so the built attention uses it.
+    if hasattr(prov, "attention_softmax_in_fp32"):
+        prov.attention_softmax_in_fp32 = True
+    # M-RoPE: the qwen35 TEXT bridge forces position_embedding_type="rope" (1D). Override to "mrope"
+    # BEFORE prov.provide() (the rotary module is selected at GPTModel.__init__: gpt_model.py:199 builds
+    # MultimodalRotaryEmbedding when type=="mrope") so the frozen Qwen3.5 weights get the 2D-grid RoPE
+    # they were pretrained with. Gated on mrope_section (qwen35=[11,11,10]; 4B/30B None -> stay rope).
+    # The forward feeds [3,b,s] positions via get_rope_index; mcore's mrope branch consumes them.
+    if mrope_section is not None:
+        prov.position_embedding_type = "mrope"
+        prov.mrope_section = list(mrope_section)
     prov.tensor_model_parallel_size = tensor_model_parallel_size
     prov.pipeline_model_parallel_size = pipeline_model_parallel_size
     # Expert/sequence parallel for MoE backbones (no-op fields for dense). Only override
@@ -456,7 +528,13 @@ def build_llava_ov2(
         if os.environ.get("OV2_RECOMPUTE_FULL", "0") == "1":
             prov.recompute_granularity = "full"; prov.recompute_method = "uniform"; prov.recompute_num_layers = 1
         else:
-            prov.recompute_granularity = "selective"; prov.recompute_modules = ["core_attn"]
+            # selective: core_attn always (memory-heavy/compute-light). OV2_RECOMPUTE_MOE=1 ALSO
+            # recomputes the MoE layer (the biggest activation consumer) -> far cheaper than full/uniform
+            # yet a big memory saver. Default unset -> core_attn-only (existing stage-2/midtrain unchanged).
+            _rmods = ["core_attn"]
+            if os.environ.get("OV2_RECOMPUTE_MOE", "0") == "1":
+                _rmods.append("moe")
+            prov.recompute_granularity = "selective"; prov.recompute_modules = _rmods
             prov.recompute_method = None; prov.recompute_num_layers = None
     # moe_permute_fusion: force OFF on the BUILT LLM config — set on `prov` BEFORE prov.provide()
     # (the reliable spot, exactly like recompute above). The post-build model.config force-set in
@@ -467,7 +545,57 @@ def build_llava_ov2(
         import os
         prov.moe_permute_fusion = os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
     _fill_init(prov, perform_init=perform_init)
+    # M-RoPE: build the LLM as mrope if the HF config declares mrope_section (Qwen3.5:
+    # rope_parameters.mrope_section=[11,11,10]). The text bridge defaults to plain 1D "rope";
+    # for a FROZEN mrope LLM that destroys image spatial structure -> stage-1 alignment plateaus.
+    # Visual tokens get 2D-grid (t,h,w) positions per-step via get_rope_index in forward. No-op for
+    # non-mrope LLMs (4B/30B stay "rope" -> position_ids ignored).
+    _hf_cfg = getattr(getattr(bridge, "hf_pretrained", None), "config", None)
+    def _mrope_section_of(_c):
+        for _cc in (_c, getattr(_c, "text_config", None)):
+            for _k in ("rope_parameters", "rope_scaling"):
+                _rp = getattr(_cc, _k, None)
+                if _rp is None:
+                    continue
+                _sec = _rp.get("mrope_section") if isinstance(_rp, dict) else getattr(_rp, "mrope_section", None)
+                if _sec:
+                    return list(_sec)
+        return None
+    _mrope_sec = _mrope_section_of(_hf_cfg)
+    if _mrope_sec is None and "qwen3_5" in str(getattr(_hf_cfg, "model_type", "")).lower():
+        _mrope_sec = [11, 11, 10]   # Qwen3.5 default (config did not expose mrope_section)
+    if _mrope_sec and hasattr(prov, "position_embedding_type"):
+        prov.position_embedding_type = "mrope"
+        prov.mrope_section = _mrope_sec
+        logger.info("[ov2 build] mrope LLM: position_embedding_type=mrope mrope_section=%s", _mrope_sec)
     language_model = prov.provide(pre_process=pre_process, post_process=post_process)
+    # Interleaved M-RoPE: Qwen3.5 config has mrope_interleaved=True, but stock mcore builds the CHUNKED
+    # MultimodalRotaryEmbedding (cat([m[i%3]...])). For text tokens t==h==w so chunked==interleaved, but
+    # IMAGE tokens (t!=h!=w) get the wrong rotary layout. Swap in the repo's native interleaved module
+    # (apply_interleaved_mrope). Its forward signature (position_ids, mrope_section, ...) matches the
+    # stock GPTModel call (gpt_model.py:413) and it returns the same [s,b,1,2*dim] emb. Copy the stock
+    # module's inv_freq so the frequencies are byte-identical -- ONLY the chunked->interleaved layout
+    # differs. No-op for non-mrope LLMs (4B/30B keep 1D rope).
+    if getattr(language_model.config, "position_embedding_type", "rope") == "mrope" and hasattr(language_model, "rotary_pos_emb"):
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import Qwen3VLMultimodalRotaryEmbedding
+        import megatron.core.parallel_state as _mpu
+        _old_rpe = language_model.rotary_pos_emb
+        _lc = language_model.config
+        _new_rpe = Qwen3VLMultimodalRotaryEmbedding(
+            kv_channels=_lc.kv_channels,
+            rotary_percent=getattr(_lc, "rotary_percent", 1.0),
+            rotary_interleaved=bool(getattr(_lc, "rotary_interleaved", False)),
+            seq_len_interpolation_factor=getattr(_lc, "seq_len_interpolation_factor", None),
+            rotary_base=getattr(_lc, "rotary_base", 10000),
+            cp_group=_mpu.get_context_parallel_group(),
+        )
+        if hasattr(_old_rpe, "inv_freq"):
+            with torch.no_grad():
+                _new_rpe.inv_freq = _old_rpe.inv_freq.clone()
+        _new_rpe.seq_len_interpolation_factor = getattr(_old_rpe, "seq_len_interpolation_factor", None)
+        language_model.rotary_pos_emb = _new_rpe
+        logger.info("[ov2 build] rotary_pos_emb -> Qwen3VLMultimodalRotaryEmbedding (INTERLEAVED mrope); inv_freq[:3]=%s",
+                    _new_rpe.inv_freq[:3].tolist())
     # moe_permute_fusion override (MUST be post-provide): the qwen3_(5_)moe bridge's provider_bridge()
     # re-sets moe_permute_fusion=True DURING prov.provide(), clobbering any pre-provide set. Override on
     # the BUILT config here — language_model.config is the runtime TransformerConfig the MoE token
@@ -477,6 +605,21 @@ def build_llava_ov2(
     if hasattr(language_model.config, "moe_permute_fusion"):
         import os as _os
         language_model.config.moe_permute_fusion = _os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
+    # --- additional post-build MoE perf force-sets (HF rebuild clobbers provider/CLI model.*; all env-gated default-OFF) ---
+    import os as _os
+    # OV2_MOE_ROUTER_FUSION=1: fuse router topk+softmax+aux (TE>=2.7). OV2 inherits mcore default False;
+    # cuts launch overhead on the routing path (48 MoE layers x microbatches). No change unless =1.
+    if hasattr(language_model.config, "moe_router_fusion"):
+        language_model.config.moe_router_fusion = _os.environ.get("OV2_MOE_ROUTER_FUSION", "0") == "1"
+    # OV2_MOE_SHARED_EXPERT_OVERLAP=1: overlap the always-on shared-expert MLP with the routed-expert EP
+    # all-to-all. ALLTOALL-ONLY (mcore #3000: NOT compatible with flex/hybridep) -> use only at ACCEL=0.
+    # Mutually exclusive with EP comm-overlap. Default-OFF.
+    if hasattr(language_model.config, "moe_shared_expert_overlap"):
+        language_model.config.moe_shared_expert_overlap = _os.environ.get("OV2_MOE_SHARED_EXPERT_OVERLAP", "0") == "1"
+    # OV2_MOE_ROUTER_PAD_FP8=1: pad routing-map M-dim to 16/32 so FP8/MXFP8 grouped-GEMMs hit aligned
+    # tiles (recovers fp8 efficiency). No-op under bf16; only meaningful with ACCEL=1/MXFP8.
+    if hasattr(language_model.config, "moe_router_padding_for_fp8"):
+        language_model.config.moe_router_padding_for_fp8 = _os.environ.get("OV2_MOE_ROUTER_PAD_FP8", "0") == "1"
     # moe_aux_loss_coeff: HF Qwen3-30B-A3B ships router_aux_loss_coef=0.001; AIAK midtrain uses 0.01.
     # Like permute_fusion this must be forced on the BUILT config (cfg.model is rebuilt from HF, so a
     # recipe/CLI model.* override never reaches it). The MoE router reads config.moe_aux_loss_coeff each
@@ -528,6 +671,13 @@ def build_llava_ov2(
                 with torch.no_grad():
                     _out.weight.copy_(_emb.weight)
     llm_cfg = language_model.config
+    # OV2_MTP_LOSS_SCALE: override the MTP aux-loss weight on the BUILT runtime config (process_mtp_loss
+    # reads mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers). Set =0 to disable the
+    # MTP gradient entirely (e.g. stage-1 adapter alignment: a frozen MTP head's 0.1 grad is unhelpful).
+    _mtp_s = __import__("os").environ.get("OV2_MTP_LOSS_SCALE")
+    if _mtp_s is not None and _mtp_s.strip() != "" and hasattr(llm_cfg, "mtp_loss_scaling_factor"):
+        llm_cfg.mtp_loss_scaling_factor = float(_mtp_s)
+        logger.info("[ov2 build] OV2_MTP_LOSS_SCALE=%s -> mtp_loss_scaling_factor=%s", _mtp_s, llm_cfg.mtp_loss_scaling_factor)
 
     vis_cfg = _fill_init(
         _vision_config_from(
@@ -540,6 +690,7 @@ def build_llava_ov2(
         perform_init=perform_init,
     )
     adp_cfg = _fill_init(_adapter_config_from(llm_cfg), perform_init=perform_init)
+    adp_cfg.adapter_init_scale = adapter_init_scale   # read by _init_ov2_adapter (per-backbone fc2 rescale)
     # Recompute applies to the LLM ONLY (seq 32000 × 36 layers dominates memory). vis_cfg
     # deepcopies llm_cfg, so explicitly DISABLE recompute on the vision encoder — its ported
     # _checkpointed_forward passes attn_mask_type, incompatible with this mcore's TransformerLayer
@@ -571,7 +722,8 @@ def build_llava_ov2(
         output_size=llm_cfg.hidden_size,         # auto-sizes to ANY LLM width (4B=2560, 8B=4096, 35B-A3B=2048)
         spatial_merge_size=spatial_merge_size,
     )
-    return LlavaOnevision2(language_model, vision_model, adapter)
+    return LlavaOnevision2(language_model, vision_model, adapter, image_token_id=image_token_id,
+                           video_token_id=video_token_id, vision_start_token_id=vision_start_token_id)
 
 
 # Back-compat alias: the 4B-specific name kept so older callers / running scripts still import it.

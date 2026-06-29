@@ -40,8 +40,8 @@ RECIPE="${RECIPE:-ov2_30b_a3b_p16m33_midtrain}"  # p16m33 full-model midtrain; f
 # DATA_PATH / INIT_CKPT / SAVE / model paths: set per-card by the CARD PATH PROFILE (after HW detect).
 # Match the A800 midtrain launcher's tunable constants. The recipe reads the exported OV2_*
 # values below, so train_iters / LR schedule / task_encoder seq_length stay in sync.
-MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-16}"                  # global batch size; override with OV2_MIDTRAIN_GBS=
-MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-780000}"  # LLaVA-Next 780k default
+MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-384}"                  # global batch size; override with OV2_MIDTRAIN_GBS=
+MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"  # LLaVA-Next 780k default
 ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
 # LR warmup = 0.002 * train_iters (AIAK stage-1 fraction; ~97 @ 48750 iters). Gentle ramp 0->2e-5 then
 # constant (min_lr==max_lr). Override OV2_WARMUP_ITERS= (e.g. =0 for AIAK pure-constant-LR).
@@ -131,14 +131,15 @@ else                                    # Phase-1: bf16 baseline -- the DEFAULT 
   # (recompute only trades compute for memory; loss curve unchanged). A100/A800/H100 (80-94GB) keep it ON
   # or they OOM. Either way DISABLE_RECOMPUTE=/OV2_RECOMPUTE_FULL= override it.
   if [[ "$HWNAME" == "gb200" ]]; then
-    DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-1}"   # GB200: recompute ON (AIAK full/uniform/1; bf16+recompute-off risked 192GB OOM -> back to AIAK parity). DISABLE_RECOMPUTE=1 to turn off.
+    DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"   # GB200: SELECTIVE recompute (core_attn + MoE layer) -- recomputes only the big MoE activations, far cheaper than full/uniform yet fits 192GB. OV2_RECOMPUTE_FULL=1 for AIAK full parity; DISABLE_RECOMPUTE=1 to turn off.
   else
     DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-1}"   # A100/A800/H100: recompute ON (AIAK full/uniform/1) to fit 80-94GB
   fi
   FLEX_BACKEND="${FLEX_BACKEND:-}"
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_BF16}"
 fi
-export OV2_RECOMPUTE_FULL MFU_PEAK_TFLOPS
+OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-0}"   # selective MoE-layer recompute (added to core_attn) when =1; only active when recompute ON and OV2_RECOMPUTE_FULL=0
+export OV2_RECOMPUTE_FULL OV2_RECOMPUTE_MOE MFU_PEAK_TFLOPS
 # OV2_FLEX_BACKEND is what ov2_provider.provide() reads to wire the runtime dispatcher (the cfg.model
 # field is dead). Empty -> verified alltoall; "hybridep" -> HybridEP (also disables shared-expert-overlap).
 export OV2_FLEX_BACKEND="$FLEX_BACKEND"
@@ -208,12 +209,13 @@ export OV2_MOE_AUX_LOSS_COEFF="${OV2_MOE_AUX_LOSS_COEFF:-0.01}"  # AIAK midtrain
 export OV2_PACK_FULL_CAUSAL="${OV2_PACK_FULL_CAUSAL:-0}"      # 0=THD block-diagonal (AIAK-faithful); 1=full-causal
 export OV2_SEQ_LEN="$SEQ_LEN"                                # recipe reads this at import -> model+dataset+task_encoder
 export OV2_MIDTRAIN_GBS="$MIDTRAIN_GBS" OV2_MIDTRAIN_N_SAMPLES="$MIDTRAIN_N_SAMPLES"
+export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"  # energon per-worker concurrent open shards (default 16 chokes WekaFS); 1 keeps 4xWx1 streams/node
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}" NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-$HW_NVLS}"  # NVLS: GB200/H100 on, Ampere off
 [[ -n "${NCCL_IB_HCA:-}" ]] && export NCCL_IB_HCA NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 # --- GB200 cross-node NCCL tuning (MNNVL + NVLink). All env-overridable; added per the GB200 env block. ---
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker}"        # bootstrap iface: exclude loopback + docker bridge
-export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"                              # WARN = quiet (hides the harmless GIN/SHARP plugin-probe INFO). For multi-node bring-up debugging: NCCL_DEBUG=INFO bash ...
+export NCCL_DEBUG="${OV2_NCCL_DEBUG:-WARN}"                              # WARN = quiet (hides the harmless GIN/SHARP plugin-probe INFO). Quiet by default (ignores ambient NCCL_DEBUG). For bring-up debugging: OV2_NCCL_DEBUG=INFO bash ...
 export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-1}"                   # NVL72 Multi-Node NVLink (cross-node GPU NVLink)
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"                       # P2P over NVLink
 export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-SYS}"
@@ -253,7 +255,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 OVERRIDES="dataset.path=$DATA_PATH"
 [[ "$INIT_CKPT" != "null" && -n "$INIT_CKPT" ]] && OVERRIDES="$OVERRIDES checkpoint.pretrained_checkpoint=$INIT_CKPT"
 OVERRIDES="$OVERRIDES checkpoint.save=$SAVE checkpoint.load=$SAVE dataset.dataloader_save=$SAVE"
-OVERRIDES="$OVERRIDES checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS validation.eval_iters=0 logger.log_interval=$LOG_EVERY train.micro_batch_size=1"   # packing REQUIRES mbs=1 (model asserts batch==1)
+OVERRIDES="$OVERRIDES checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS validation.eval_iters=0 logger.log_interval=$LOG_EVERY logger.timing_log_level=${OV2_TIMING_LOG_LEVEL:-2} train.micro_batch_size=1"   # packing REQUIRES mbs=1 (model asserts batch==1)
 OVERRIDES="$OVERRIDES model.tensor_model_parallel_size=$TP model.sequence_parallel=$SP $MOE_CAPACITY_ARGS"
 # MoE router in fp32 for 128-expert stability (matches A800). The CLI override is the RELIABLE path:
 # the provider also sets it but that field may not survive build_llava_ov2's HF LLM rebuild.
@@ -336,7 +338,7 @@ if [[ "$_is_muon" == "1" && "$_has_ckpt" == "1" && -f "$_wf" ]]; then
   fi
 fi
 [[ "$NODE_RANK" -eq 0 ]] && { echo "$WORLD" > "$_wf" 2>/dev/null || true; }
-echo "[ov2-30b-gb200] in-container | hw=$HWNAME(cc=$_cc) repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY node_rank=$NODE_RANK nnodes=$NNODES"
+echo "[ov2-30b-gb200] in-container | hw=$HWNAME(cc=$_cc) repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY node_rank=$NODE_RANK nnodes=$NNODES"
 # shellcheck disable=SC2086  # $RDZV and $OVERRIDES must word-split into separate args
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
   --recipe "$RECIPE" --dataset vlm-energon --step_func ov2_step \

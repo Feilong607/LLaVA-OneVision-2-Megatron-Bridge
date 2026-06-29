@@ -32,7 +32,11 @@ if TYPE_CHECKING:
 
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
-from modelopt.torch.quantization.utils import is_quantized
+try:
+    from modelopt.torch.quantization.utils import is_quantized
+except Exception:  # modelopt is optional; if absent, treat nothing as quantized
+    def is_quantized(*_a, **_k):
+        return False
 from safetensors.torch import save_file
 from transformers.configuration_utils import PretrainedConfig
 from typing_extensions import Unpack

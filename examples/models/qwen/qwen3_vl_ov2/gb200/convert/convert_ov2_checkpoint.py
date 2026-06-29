@@ -182,7 +182,7 @@ def main():
     def _save_loadable(model):
         """Write a Bridge-loadable torch_dist ckpt (iter_/ + model wrapper + run_config + tokenizer)."""
         from megatron.bridge.training.model_load_save import save_megatron_model
-        save_megatron_model([model], args.out, ckpt_format="torch_dist", hf_tokenizer_path=p["llm_hf"])
+        save_megatron_model([model], args.out, ckpt_format="torch_dist", hf_tokenizer_path=os.environ.get("OV2_CONVERT_TOKENIZER", p["llm_hf"]))
         log("saved Bridge torch_dist (loadable) -> {} (use as pretrained_checkpoint/load)".format(args.out))
 
     if args.mode == "from_base":

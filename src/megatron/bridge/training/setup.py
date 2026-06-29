@@ -249,6 +249,19 @@ def setup(
 
     cfg.model.timers = timers
     cfg.optimizer.timers = timers
+    # Multimodal/OV2: the pipeline schedule starts forward/backward-compute via
+    # get_model_config(model).timers. For LlavaOnevision2 that runtime config is the INNER
+    # language_model.config, NOT cfg.model set just above -> without this those timers never
+    # start and the per-iter (min,max) timing block omits forward-backward/forward-compute.
+    # No-op for models whose runtime config IS cfg.model (timers already set).
+    from megatron.core.utils import get_model_config as _get_model_config
+    for _m in model:
+        try:
+            _mc = _get_model_config(_m)
+        except Exception:
+            _mc = None
+        if _mc is not None and getattr(_mc, "timers", None) is None:
+            _mc.timers = timers
     optimizer, scheduler = setup_optimizer(
         optimizer_config=cfg.optimizer,
         scheduler_config=cfg.scheduler,

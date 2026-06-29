@@ -1194,6 +1194,12 @@ def training_log(
         if global_state.train_state.skipped_train_samples > 0:
             log_string += " skipped samples: {:12d} |".format(global_state.train_state.skipped_train_samples)
         log_string += " elapsed time per iteration (ms): {:.1f} |".format(elapsed_time_per_iteration * 1000.0)
+        if seq_length is not None and elapsed_time_per_iteration > 0:
+            # tokens/s/GPU = (global tokens this iter) / wall-time / GPUs = (gbs * seq_len) / iter_s / world.
+            # Counts ALL packed sequence positions (seq_length), not just unmasked/supervised tokens.
+            log_string += " tokens/s/GPU: {:.1f} |".format(
+                (batch_size * seq_length) / elapsed_time_per_iteration / get_world_size_safe()
+            )
 
         if num_flops is not None and logger_config.log_throughput:
             log_string += f" throughput per GPU (TFLOP/s/GPU): {per_gpu_tf:.1f} |"
@@ -1258,7 +1264,13 @@ def training_log(
                 # Make sure the memory after the second iteration is reported
                 # to include optimizer state memory.
                 report_memory_flag = False
-        timers.log(timers_to_log, normalizer=logger_config.log_interval)
+        # Timing block cadence: by default print with the loss line (log_interval). When
+        # OV2_TIMING_PRINT_INTERVAL=N (>0) is set, print the (min,max) block only every N iters
+        # (timers accumulate across the window; normalize by N for a per-iter average) so the
+        # loss line can stay every-iter without the timing block spamming every iter.
+        _tpi = int(__import__('os').environ.get('OV2_TIMING_PRINT_INTERVAL', '0') or '0')
+        if _tpi <= 0 or (iteration % _tpi == 0):
+            timers.log(timers_to_log, normalizer=(_tpi if _tpi > 0 else logger_config.log_interval))
 
     return report_memory_flag
 

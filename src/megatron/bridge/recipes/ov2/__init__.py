@@ -45,3 +45,15 @@ __all__ = [
     "ov2_1_stage1_adapter_only_config",
     "ov2_1_stage2_vit_adapter_muon_config",
 ]
+
+# --- Qwen3.5-35B-A3B (qwen3_5_moe) OV2 recipes (separate module; additive) ---
+from .ov2_qwen35 import (
+    ov2_qwen35_35b_a3b_stage1,
+    ov2_qwen35_35b_a3b_stage2,
+    ov2_qwen35_35b_a3b_midtrain,
+)
+__all__ += [
+    "ov2_qwen35_35b_a3b_stage1",
+    "ov2_qwen35_35b_a3b_stage2",
+    "ov2_qwen35_35b_a3b_midtrain",
+]

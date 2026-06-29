@@ -145,6 +145,7 @@ def forward_step(
         position_ids=None,        # LlavaOnevision2 / Qwen3 LLM compute positions internally
         attention_mask=attention_mask,
         labels=labels,            # PRE-SHIFTED by the task encoder; mcore does not shift
+        loss_mask=loss_mask,      # threaded so the MTP head masks aux loss like the main loss (midtrain)
         patch_positions=patch_positions,       # video: temporal (t,h,w) RoPE; None for image (self-derived)
         packed_seq_params=packed_seq_params,   # THD block-diagonal when offline-packed (else None)
     )

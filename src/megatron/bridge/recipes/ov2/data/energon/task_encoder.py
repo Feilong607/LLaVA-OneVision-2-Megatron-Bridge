@@ -112,6 +112,20 @@ class OV2TaskEncoder(DefaultTaskEncoder):
         self.proc = AutoProcessor.from_pretrained(hf_processor_path, trust_remote_code=False, local_files_only=True)
         tok = getattr(self.proc, "tokenizer", self.proc)
         self.pad_id = int(getattr(tok, "pad_token_id", None) or getattr(tok, "eos_token_id", 0) or 0)
+        # Per-backbone special-token ids from THIS tokenizer (Qwen2.5-VL -> 151655/151652/151653;
+        # Qwen3.5 -> 248056/248053/248054). Override the hardcoded class defaults as INSTANCE attrs;
+        # fall back to the class default if a token is absent. Keeps 4B/30B byte-identical.
+        def _tid(_t, _d):
+            try:
+                _i = tok.convert_tokens_to_ids(_t)
+                return int(_i) if isinstance(_i, int) and _i >= 0 and _i != getattr(tok, "unk_token_id", -1) else _d
+            except Exception:
+                return _d
+        self.IMG_PAD_ID = _tid("<|image_pad|>", type(self).IMG_PAD_ID)
+        self.VIS_START_ID = _tid("<|vision_start|>", type(self).VIS_START_ID)
+        self.VIS_END_ID = _tid("<|vision_end|>", type(self).VIS_END_ID)
+        logger.info("[ov2 task_encoder] token ids: image_pad=%d vis_start=%d vis_end=%d",
+                    self.IMG_PAD_ID, self.VIS_START_ID, self.VIS_END_ID)
         self.seq_length = self.seq_len = int(seq_length)
         self.default_system = default_system
         # Explicit per-backbone merge override. The <|image_pad|> expansion count MUST match the
