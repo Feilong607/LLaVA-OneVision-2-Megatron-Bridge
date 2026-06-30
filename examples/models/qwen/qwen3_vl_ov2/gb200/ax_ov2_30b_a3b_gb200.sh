@@ -24,7 +24,8 @@
 #   BLOCKED: CUDA graphs (OV2 forces cuda_graph_impl=none; THD-packed variable seqlens break capture).
 #   OPT-IN:  EP comm-overlap (OV2_EP_OVERLAP=1, ~1.3x on exposed a2a but re-validate the grad path);
 #            Megatron-FSDP (OV2_FSDP=1, only helps at >=4 nodes/DP>1 -- see block below).
-#   FIXED:   AdamW for the MoE backbone (Muon+EP deadlocks); TP=1 (OV2 SP/vision only TP1-tested).
+#   OPT-IN:  Muon on the MoE backbone via OV2_MIDTRAIN_MUON=1 (default AdamW). UNVALIDATED on unfrozen EP8
+#            experts (prior A800 iter-2 NaN); see the MUON STABILITY block. TP=1 (OV2 SP/vision only TP1-tested).
 # NOTE: REPO points at .../Megatron-Bridge (NOT -refactor) -- where the MFU + dataloader-resume +
 #       provider fp8/dispatcher fixes live. If you switch REPO, sync those edits there too.
 # =============================================================================
@@ -105,9 +106,15 @@ OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-$OV2_PRETRAIN_ROOT/llava_onevi
 export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
 export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before skipping the stitch
 
-# --- TRAINING MODE (see ACCEL legend above). 30B-A3B is MoE -> optimizer AdamW (distributed Muon
-# deadlocks EP backward). Recipe keeps AIAK lr 2e-5 const / clip 1.0 / wd 0 / betas .9,.99 / eps 1e-5
-# / gbs 128 / mbs 1 / seq 32000. ---
+# --- TRAINING MODE (see ACCEL legend above). 30B-A3B is MoE. The recipe AUTO-ROUTES MoE midtrain to AdamW
+# (is_moe); OV2_MIDTRAIN_MUON=1 below FORCES distributed Muon instead (user-enabled 2026-06-30). Recipe
+# keeps AIAK lr / clip 1.0 / betas / eps; midtrain wd 0.01 / beta2 0.95 / gbs / mbs 1 / seq. ---
+# OPTIMIZER on the MoE backbone: AdamW (validated) vs distributed Muon (OV2_MIDTRAIN_MUON=1). Muon on the
+# UNFROZEN EP8 experts is UNVALIDATED -- a prior A800 run NaN'd at iter-2 (orthogonalization update on the
+# freshly-unfrozen experts). GB200 removes the two A800 blockers (192GB -> no CPU-offload -> no offload-vs-
+# Muon ValueError; TP=1 fits -> no vision OOM), so the iter-2 NaN is the only open question to test here.
+# Default ON per user request; set OV2_MIDTRAIN_MUON=0 to revert to the validated AdamW path.
+export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
 ACCEL="${ACCEL:-0}"
 # MXFP8 needs fp8 tensor cores (Hopper sm_90 / Blackwell sm_100). On Ampere (A100/A800) there are none
 # -> auto-fall back to the bf16 baseline so the SAME command is safe to run on A-cards.
@@ -196,7 +203,7 @@ WORLD=$(( NPROC * NNODES ))
 (( WORLD % TP == 0 )) || { echo "[ov2-30b] FATAL: WORLD=$WORLD must be divisible by TP=$TP." >&2; exit 1; }
 DP=$(( WORLD / TP ))
 # midtrain GBS -> microbatch calc needs GBS % (mbs * DP) == 0. PP/CP are 1 here.
-(( MIDTRAIN_GBS % DP == 0 )) || echo "[ov2-30b] WARN: DP=$DP (WORLD=$WORLD / TP=$TP) does not divide GBS=$MIDTRAIN_GBS -> mcore microbatch assert will fire; adjust TP/NNODES or OV2_MIDTRAIN_GBS." >&2
+(( MIDTRAIN_GBS % DP == 0 )) || { echo "[ov2-30b] FATAL: GBS=$MIDTRAIN_GBS not divisible by DP=$DP (WORLD=$WORLD / TP=$TP; mbs fixed at 1, PP=CP=1) -> mcore num_microbatches assert would fire with a generic message. GBS % DP = $((MIDTRAIN_GBS % DP)). Adjust OV2_MIDTRAIN_GBS / TP / NNODES so GBS % DP == 0." >&2; exit 1; }
 # EP=8 is fixed in the recipe -> mcore requires data parallel size to be a multiple of EP and >= EP.
 (( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs DP=$DP (WORLD=$WORLD / TP=$TP) to be a multiple of 8 and >=8. For 2 GB200 nodes (WORLD=8) keep TP=1; TP=2 needs >=4 GB200 nodes." >&2; exit 1; }
 
@@ -272,6 +279,29 @@ OVERRIDES="$OVERRIDES optimizer.lr=${OV2_LR:-1e-5} optimizer.min_lr=${OV2_MIN_LR
 # walks the offload path -- so the offload-zero bug class (CPU master never seeded from ckpt -> first step
 # zeros weights -> iter-3 forward NaN; NVIDIA/Megatron-LM #1842/#1872/#1986) structurally cannot occur here.
 OVERRIDES="$OVERRIDES optimizer.optimizer_cpu_offload=false optimizer.use_precision_aware_optimizer=false"
+# --- MUON STABILITY (applies only when OV2_MIDTRAIN_MUON=1) -----------------------------------------------
+# Recipe midtrain-Muon defaults: scale_mode=spectral / extra_scale_factor=0.15 / wd=0.01 -- the config that
+# NaN'd at iter-2 on A800. The ONLY Bridge config proven to run Muon on TRAINABLE EP8 experts is
+# deepseek_v4's: muon_scale_mode=unit_rms_norm + muon_extra_scale_factor=0.2 + weight_decay=0.1.
+#   MUON_STABLE=0 (default): keep recipe values  -> A/B control that reproduces the known NaN.
+#   MUON_STABLE=1          : DeepSeek-V4-proven trio -> best chance to NOT NaN.
+# Each knob is also individually overridable (OV2_MUON_SCALE_MODE / OV2_MUON_EXTRA_SCALE / OV2_MUON_WD).
+# wd is set on BOTH optimizer AND scheduler start/end (OptimizerParamScheduler clobbers optimizer.weight_decay
+# every iter otherwise -- see recipe ov2.py:573-588).
+if [[ "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
+  [[ "${OV2_FSDP:-0}" == "1" ]] && { echo "[ov2-30b-gb200] FATAL: OV2_FSDP=1 is incompatible with Muon (Muon forces use_distributed_optimizer=False; FSDP shards optim state). Unset one." >&2; exit 1; }
+  if [[ "${MUON_STABLE:-0}" == "1" ]]; then
+    OV2_MUON_SCALE_MODE="${OV2_MUON_SCALE_MODE:-unit_rms_norm}"
+    OV2_MUON_EXTRA_SCALE="${OV2_MUON_EXTRA_SCALE:-0.2}"
+    OV2_MUON_WD="${OV2_MUON_WD:-0.1}"
+  fi
+  [[ -n "${OV2_MUON_SCALE_MODE:-}" ]] && OVERRIDES="$OVERRIDES optimizer.muon_scale_mode=$OV2_MUON_SCALE_MODE"
+  [[ -n "${OV2_MUON_EXTRA_SCALE:-}" ]] && OVERRIDES="$OVERRIDES optimizer.muon_extra_scale_factor=$OV2_MUON_EXTRA_SCALE"
+  [[ -n "${OV2_MUON_WD:-}" ]] && OVERRIDES="$OVERRIDES optimizer.weight_decay=$OV2_MUON_WD scheduler.start_weight_decay=$OV2_MUON_WD scheduler.end_weight_decay=$OV2_MUON_WD"
+  echo "[ov2-30b-gb200] MUON ENABLED: scale_mode=${OV2_MUON_SCALE_MODE:-spectral(recipe)} extra_scale=${OV2_MUON_EXTRA_SCALE:-0.15(recipe)} wd=${OV2_MUON_WD:-0.01(recipe)} stable=${MUON_STABLE:-0} -- watch iter-1->3 grad-norm/NaN." >&2
+  echo "[ov2-30b-gb200] MUON resume CAUTION: checkpoint.load=$SAVE -- Muon cannot cross-optimizer-resume from an AdamW ckpt (KeyError on momentum). Use a FRESH SAVE (e.g. SAVE=${SAVE}_muon) or a Muon-saved ckpt." >&2
+fi
+# ---------------------------------------------------------------------------------------------------------
 # dataloader workers/rank. Recipe default for midtrain is 2 (llava_next samples ~10x larger -> a big
 # buffer/many workers pressure HOST RAM). 16 is safe here: the 85M-sample data has plenty of shards (so
 # no shard-starvation) and Grace has ~1TB RAM; lower via OV2_NUM_WORKERS= if host memory gets tight.
@@ -324,6 +354,7 @@ mkdir -p "$SAVE"; cd "$REPO"
 # mismatched momentum (weights are fine; optimizer state corrupts) with no error. AdamW reshards fine
 # -> guard Muon only. DP=WORLD/TP here (PP/CP=1). Marker lives in $SAVE so it travels with the ckpt dir.
 _is_muon=0; [[ "$RECIPE" == *stage2* && "${OV2_STAGE2_ADAMW:-0}" != "1" ]] && _is_muon=1
+[[ "$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1" ]] && _is_muon=1   # midtrain Muon momentum is ALSO DP-sharded -> same reshard guard
 _wf="$SAVE/.ov2_train_world"
 _has_ckpt=0; { [[ -f "$SAVE/latest_checkpointed_iteration.txt" ]] || compgen -G "$SAVE/iter_*" >/dev/null 2>&1; } && _has_ckpt=1
 if [[ "$_is_muon" == "1" && "$_has_ckpt" == "1" && -f "$_wf" ]]; then

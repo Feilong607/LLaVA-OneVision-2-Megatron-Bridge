@@ -348,6 +348,16 @@ def _ov2_common(
         min_lr = 1e-6 if stage == "stage1" else max_lr  # stage-2 + midtrain: constant LR (min==max), per AIAK date0528
 
     cfg = _sft_common_vlm()
+    # Keep weights/logs OFF the Bridge repo. _sft_common_vlm() defaults checkpoint.save/load + tb_logs to
+    # $CWD/nemo_experiments, and the launchers cd into $REPO -> a bare (un-overridden) run would write the
+    # 30B ckpt UNDER the repo (pollutes git-sync, risks read-only-repo write failures). Re-root to
+    # OV2_SAVE_ROOT (default ~/ov2_experiments) so weights default to off-repo storage; the launcher's
+    # checkpoint.save= / checkpoint.load= CLI overrides still win when set.
+    _ov2_save_root = os.environ.get("OV2_SAVE_ROOT") or os.path.join(os.path.expanduser("~"), "ov2_experiments")
+    _ov2_run_dir = os.path.join(_ov2_save_root, f"ov2_{backbone}_{stage}")
+    cfg.checkpoint.save = os.path.join(_ov2_run_dir, "checkpoints")
+    cfg.checkpoint.load = cfg.checkpoint.save
+    cfg.logger.tensorboard_dir = os.path.join(_ov2_run_dir, "tb_logs")
     train_iters = math.ceil(n_samples / global_batch_size)
 
     # ---- Model provider (built from the backbone's AutoBridge provider) ----

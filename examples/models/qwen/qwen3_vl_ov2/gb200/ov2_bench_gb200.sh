@@ -32,7 +32,7 @@
 #   (or: nvidia-smi -q | grep -i fabric).  Do NOT edit files — every lever is an env override.
 # =============================================================================
 set -uo pipefail
-PRESET="${1:?usage: ov2_bench_gb200.sh baseline|hybridep|hybridep8|permute|norecompute|capacity|fp8|best}"
+PRESET="${1:?usage: ov2_bench_gb200.sh baseline|hybridep|hybridep8|permute|norecompute|recompute_moe_off|ep_overlap|router_fusion|shared_overlap|capacity|fp8|fp8_pad|best|best_alltoall}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER="${LAUNCHER:-$HERE/ax_ov2_30b_a3b_gb200.sh}"
 [[ -f "$LAUNCHER" ]] || { echo "FATAL: launcher not found at $LAUNCHER (set LAUNCHER=)"; exit 1; }
@@ -57,6 +57,10 @@ case "$PRESET" in
   capacity)    PENV=(MOE_CAPACITY_FACTOR=1.0 MOE_PAD_TO_CAPACITY=true) ;;                        # bound the a2a payload (drops tokens — speed knob, watch loss)
   fp8)         PENV=(ACCEL=1) ;;                                                                 # MXFP8 + alltoall (peak 4500); SEPARATE from hybridep (ACCEL=1+hybridep is a hard error)
   best)        PENV=(ACCEL=2 NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4 OV2_MOE_PERMUTE_FUSION=1) ;;  # hybridep(d4) + fused-permute + recompute-off (do NOT add ACCEL=1)
+  router_fusion)   PENV=(OV2_MOE_ROUTER_FUSION=1) ;;                                               # fuse router topk+softmax+aux (OV2 default False; cuts MoE launch overhead; needs TE>=2.7)
+  shared_overlap)  PENV=(OV2_MOE_SHARED_EXPERT_OVERLAP=1) ;;                                        # ALLTOALL-ONLY: overlap shared-expert MLP w/ EP a2a (mcore #3000; auto-off if OV2_EP_OVERLAP=1)
+  fp8_pad)         PENV=(ACCEL=1 OV2_MOE_ROUTER_PAD_FP8=1 OV2_MOE_ROUTER_FUSION=1) ;;               # MXFP8 + FP8 routing-map M-align (recovers fp8 grouped-GEMM eff) + router-fusion
+  best_alltoall)   PENV=(OV2_MOE_PERMUTE_FUSION=1 OV2_MOE_ROUTER_FUSION=1 OV2_MOE_SHARED_EXPERT_OVERLAP=1) ;;  # alltoall-lane stack; compare vs best (hybridep lane)
   *) echo "unknown preset '$PRESET'"; exit 1 ;;
 esac
 
@@ -70,19 +74,31 @@ import os, re, sys, statistics
 log, preset, csv = sys.argv[1], sys.argv[2], sys.argv[3]
 lines = open(log, errors="ignore").read().splitlines()
 fwd=[]; bwd=[]; it=[]; tok=[]; mfu=[]
+NUM = r"([0-9.eE+-]+)"   # sci-notation safe (per the loss-parse rule)
+_has_iter_line = False
 for l in lines:
-    m = re.search(r"forward=([0-9.]+)ms.*?backward=([0-9.]+)ms.*?iter=([0-9.]+)ms.*?tokens/s/GPU=([0-9.]+)", l)
-    if m:
-        fwd.append(float(m[1])); bwd.append(float(m[2])); it.append(float(m[3])); tok.append(float(m[4]))
-    mm = re.search(r"MFU[:= ]+([0-9.]+)", l)
-    if mm: mfu.append(float(mm[1]))
+    # REAL Bridge per-iter line (train_utils.py): "elapsed time per iteration (ms): X" -- NOT forward=/iter=.
+    m = re.search(r"elapsed time per iteration \(ms\): *"+NUM, l)
+    if m: it.append(float(m.group(1))); _has_iter_line = True
+    # tokens/s/GPU + MFU only appear when a FLOP peak is configured (e.g. GB200 launcher); colon OR equals.
+    m = re.search(r"tokens/s/GPU:? *=? *"+NUM, l)
+    if m: tok.append(float(m.group(1)))
+    m = re.search(r"MFU:? *=? *"+NUM, l)
+    if m: mfu.append(float(m.group(1)))
+    # optional fwd/bwd from the OV2_TIMING_LOG_LEVEL>=2 block "forward-compute ....: (min, max)" (take max).
+    m = re.search(r"forward-compute[ .]*: *\("+NUM+r", *"+NUM+r"\)", l)
+    if m: fwd.append(float(m.group(2)))
+    m = re.search(r"backward-compute[ .]*: *\("+NUM+r", *"+NUM+r"\)", l)
+    if m: bwd.append(float(m.group(2)))
 def med(x, skip=10):
     x = x[skip:] if len(x) > skip else x
     return statistics.median(x) if x else float("nan")
 n = len(it)
 peak = next((l.split("peak=")[1].split()[0] for l in lines if "peak=" in l), "?")
 if n == 0:
-    print(f"[bench] no metric lines parsed (normal on node_rank>0; check node 0's log). banner peak={peak}")
+    if _has_iter_line:
+        print(f"[bench] FATAL: iteration lines present but 0 'elapsed time per iteration (ms)' parsed -> parser/format drift. peak={peak}", file=sys.stderr); sys.exit(1)
+    print(f"[bench] no iteration lines (normal on node_rank>0; metrics print on node 0). banner peak={peak}")
     sys.exit(0)
 row = f"{preset},{med(fwd):.0f},{med(bwd):.0f},{med(it):.0f},{med(tok):.0f},{med(mfu):.2f},{peak},{n}"
 new = not os.path.exists(csv)

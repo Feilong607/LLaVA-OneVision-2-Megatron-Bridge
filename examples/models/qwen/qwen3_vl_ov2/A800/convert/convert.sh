@@ -61,6 +61,15 @@ else
 fi
 NPROC="${NPROC:-$DEF_NPROC}"
 HF_OUT="${HF_OUT:-$WORK/hf_export}"
+# Guard: keep WORK/HF_OUT OFF the repo. convert.sh does `cd "$REPO"`, so a RELATIVE WORK/HF_OUT (or one
+# pointed under $REPO) would write the 30-58G HF export INTO the Bridge repo (pollutes git-sync, fills the
+# repo FS -- this happened: stray hf_export*/4B dirs). Absolutize relative paths against $PWD (pre-cd),
+# then reject anything under $REPO.
+for _v in WORK HF_OUT; do
+  _p="${!_v}"; case "$_p" in /*) ;; *) _p="$PWD/$_p";; esac; printf -v "$_v" '%s' "$_p"
+done
+case "$HF_OUT/" in "$REPO/"*) echo "FATAL: HF_OUT=$HF_OUT is UNDER the repo ($REPO). Weights must NOT live in the Bridge repo -- set HF_OUT to an off-repo path (e.g. \$WORK/hf_export)." >&2; exit 1;; esac
+case "$WORK/"   in "$REPO/"*) echo "FATAL: WORK=$WORK is UNDER the repo ($REPO). Set WORK to an off-repo scratch dir." >&2; exit 1;; esac
 
 # env contract: offline HF; PYTHONPATH incl aiak_shim + _verify_stubs (shims optional modelopt/diffusers);
 # MoE permute fusion OFF (OV2 wedge gotcha).

@@ -315,11 +315,13 @@ class LlavaOnevision2(MegatronModule):
             combined = language_embeddings.masked_scatter(mask, image_embeddings)
 
         # 3) sequence-parallel scatter (pad to TP multiple) if enabled
+        _sp_pad = 0  # tokens added by the SP-pad below; used to extend mrope/mtp position_ids to match
         if getattr(self.config, "sequence_parallel", False):
             tp = parallel_state.get_tensor_model_parallel_world_size()
             rem = combined.size(0) % tp
             if rem:
                 pad_len = tp - rem
+                _sp_pad = pad_len
                 pad = combined.new_zeros((pad_len,) + tuple(combined.shape[1:]))
                 combined = torch.cat((combined, pad), dim=0)
                 # The SP pad lengthens the token tensor, so the THD packing metadata must absorb it too,
@@ -397,6 +399,13 @@ class LlavaOnevision2(MegatronModule):
                     _pos[:, :, _a:_b] = _sp.to(_pos.dtype)
         elif _mtp and _pos is None and input_ids is not None:
             _pos = torch.arange(input_ids.shape[1], device=input_ids.device, dtype=torch.long).unsqueeze(0).expand_as(input_ids)
+        # SP-pad parity: _pos is built at the UNPADDED length, but SP padded `combined` to a TP-multiple.
+        # The 1D-rope path compensates (rotary_pos_embedding.py: rotary_seq_len *= tp); mrope/mtp
+        # position_ids must match the all-gathered (padded) length too, else the rotary freqs (orig_S)
+        # mismatch the query (S_padded) -> BSHD broadcast crash / THD per-segment mis-align at TP>1.
+        # Pad tokens are ignored (loss-masked), so zero positions for the tail suffice.
+        if _sp_pad > 0 and _pos is not None and _pos.shape[-1] == input_ids.shape[1]:
+            _pos = torch.cat((_pos, _pos.new_zeros(_pos.shape[:-1] + (_sp_pad,))), dim=-1)
         _pos_arg = _pos if (_is_mrope or _mtp) else None
         # loss_mask threaded into the LLM so the MTP head masks its aux loss to the SAME supervised
         # tokens as the main loss (else process_mtp_loss defaults to all-ones -> trains MTP on
@@ -506,6 +515,21 @@ def build_llava_ov2(
             prov.moe_expert_capacity_factor = moe_expert_capacity_factor
         if hasattr(prov, "moe_pad_expert_input_to_capacity"):
             prov.moe_pad_expert_input_to_capacity = bool(moe_pad_expert_input_to_capacity)
+        # moe_shared_expert_overlap is CACHED at MoE-layer __init__ (moe_layer.py: self.shared_expert_overlap
+        # = self.config...), and moe_router_padding_for_fp8 is config __post_init__-derived -> BOTH must be
+        # set on `prov` BEFORE prov.provide() here; a post-build set on language_model.config is a SILENT
+        # NO-OP. (moe_router_fusion is read from config at FORWARD -> it stays a post-build set below.)
+        import os as _os_pp
+        if hasattr(prov, "moe_shared_expert_overlap"):
+            _shared = _os_pp.environ.get("OV2_MOE_SHARED_EXPERT_OVERLAP", "0") == "1"
+            if _shared and _os_pp.environ.get("OV2_EP_OVERLAP", "0") == "1":
+                # mcore #3000: shared-expert-overlap is alltoall-only and mutually exclusive with the EP
+                # all-to-all comm-overlap (OV2_EP_OVERLAP). Enabling both crashes; EP-overlap wins.
+                _shared = False
+                logger.warning("OV2_MOE_SHARED_EXPERT_OVERLAP disabled because OV2_EP_OVERLAP=1 (mutually exclusive; mcore #3000)")
+            prov.moe_shared_expert_overlap = _shared
+        if hasattr(prov, "moe_router_padding_for_fp8"):
+            prov.moe_router_padding_for_fp8 = _os_pp.environ.get("OV2_MOE_ROUTER_PAD_FP8", "0") == "1"
     prov.share_embeddings_and_output_weights = False  # OV2 ckpt has a separate output_layer.weight
     # AIAK sets scatter_embedding_sequence_parallel=False: the VLM does its own SP scatter on the
     # fused (text+image) embeddings (see forward step 3), so the LLM embedding must NOT pre-scatter.
@@ -611,15 +635,10 @@ def build_llava_ov2(
     # cuts launch overhead on the routing path (48 MoE layers x microbatches). No change unless =1.
     if hasattr(language_model.config, "moe_router_fusion"):
         language_model.config.moe_router_fusion = _os.environ.get("OV2_MOE_ROUTER_FUSION", "0") == "1"
-    # OV2_MOE_SHARED_EXPERT_OVERLAP=1: overlap the always-on shared-expert MLP with the routed-expert EP
-    # all-to-all. ALLTOALL-ONLY (mcore #3000: NOT compatible with flex/hybridep) -> use only at ACCEL=0.
-    # Mutually exclusive with EP comm-overlap. Default-OFF.
-    if hasattr(language_model.config, "moe_shared_expert_overlap"):
-        language_model.config.moe_shared_expert_overlap = _os.environ.get("OV2_MOE_SHARED_EXPERT_OVERLAP", "0") == "1"
-    # OV2_MOE_ROUTER_PAD_FP8=1: pad routing-map M-dim to 16/32 so FP8/MXFP8 grouped-GEMMs hit aligned
-    # tiles (recovers fp8 efficiency). No-op under bf16; only meaningful with ACCEL=1/MXFP8.
-    if hasattr(language_model.config, "moe_router_padding_for_fp8"):
-        language_model.config.moe_router_padding_for_fp8 = _os.environ.get("OV2_MOE_ROUTER_PAD_FP8", "0") == "1"
+    # NOTE: OV2_MOE_SHARED_EXPERT_OVERLAP (moe_shared_expert_overlap) and OV2_MOE_ROUTER_PAD_FP8
+    # (moe_router_padding_for_fp8) are now set on `prov` BEFORE prov.provide() (see the num_moe_experts
+    # block above) -- they are init-cached / __post_init__-derived, so a post-build set here would be a
+    # SILENT NO-OP. Only forward-read fields (moe_router_fusion above, moe_aux_loss_coeff below) belong here.
     # moe_aux_loss_coeff: HF Qwen3-30B-A3B ships router_aux_loss_coef=0.001; AIAK midtrain uses 0.01.
     # Like permute_fusion this must be forced on the BUILT config (cfg.model is rebuilt from HF, so a
     # recipe/CLI model.* override never reaches it). The MoE router reads config.moe_aux_loss_coeff each
