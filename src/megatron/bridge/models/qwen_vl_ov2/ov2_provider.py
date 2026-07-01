@@ -301,6 +301,21 @@ class LlavaOnevision2Provider(GPTModelProvider):
                             model.config.moe_token_dispatcher_type,
                             getattr(model.config, "moe_flex_dispatcher_backend", None),
                             getattr(model.config, "moe_shared_expert_overlap", None))
+                # HybridEP TUNING knobs (perf-only, no numerics) on the RUNTIME config (same dead-field reason
+                # as the backend above; cfg.model never reaches the rebuilt LLM). Both default to leaving the
+                # mcore default unchanged. OV2_HYBRIDEP_NUM_SMS: comm-kernel SM count -- mcore default None ->
+                # DeepEP internal default; NVIDIA perf harness matches ep_size, sibling recipes pin 16,
+                # DeepSeek-V3 GB200 ref uses 32, gpt_oss 128 -> SWEEP it (16/24/32). OV2_HYBRIDEP_PERMUTE_FUSION=1:
+                # fuse permute/unpermute INTO the HybridEP dispatch/combine kernels -- the REAL HybridEP permute
+                # fusion (OV2_MOE_PERMUTE_FUSION / moe_permute_fusion is a NO-OP on the flex/hybridep lane).
+                _num_sms = os.environ.get("OV2_HYBRIDEP_NUM_SMS")
+                if _num_sms:
+                    model.config.moe_hybridep_num_sms = int(_num_sms)
+                if os.environ.get("OV2_HYBRIDEP_PERMUTE_FUSION", "0") == "1":
+                    model.config.moe_permute_fusion_into_hybridep = True
+                logger.info("[ov2 provider] hybridep tuning: num_sms=%s permute_into_hybridep=%s",
+                            getattr(model.config, "moe_hybridep_num_sms", None),
+                            getattr(model.config, "moe_permute_fusion_into_hybridep", None))
         return model
 
     # ------------------------------------------------------------------ #

@@ -209,6 +209,12 @@ DP=$(( WORLD / TP ))
 
 # --- in-container env (were docker -e flags) ---
 export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"
+# HybridEP (ACCEL=2) needs deep_ep, whose deep_ep_cpp.so requires nvshmem_selected_device_transport@@NVSHMEM
+# -- present ONLY in the pip nvidia-nvshmem (.../dist-packages/nvidia/nvshmem/lib), NOT CUDA's bundled
+# libnvshmem_host.so.3. Without this, ACCEL=2 dies at iter-1 with an undefined-symbol ImportError (verified
+# 2026-06-30 via nm). Prepend the pip nvshmem ONLY when it exists (no-op on A-cards / non-deep_ep images).
+_nvshmem_lib="${OV2_NVSHMEM_LIB:-/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib}"
+[[ -e "$_nvshmem_lib/libnvshmem_host.so.3" ]] && export LD_LIBRARY_PATH="$_nvshmem_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OV2_SKIP_HELPERS="${OV2_SKIP_HELPERS:-1}"   # energon doesn't use helpers_cpp -> skip the C++ index-builder compile
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"  # avoid TE Triton MoE-permute wedge (30B-A3B fix)

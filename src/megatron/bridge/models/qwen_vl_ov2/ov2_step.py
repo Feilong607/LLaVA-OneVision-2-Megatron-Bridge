@@ -69,6 +69,7 @@ def forward_step(
     # hits an off-by-one (logits N+1 vs labels N). The pad tail is masked just below by the existing
     # `cu_last < seq_len` branch (labels=-100, loss_mask=0) + the cu_*_padded twins, so the loss is
     # identical to the unpadded sequence. Dormant when TP=1 or packs are already a TP multiple.
+    _unpadded_seq_len = tokens.shape[1] if tokens is not None else 0   # capture BEFORE SP-pad so the FLOP non-packed branch uses the TRUE len
     if tokens is not None:
         from megatron.core import parallel_state
         _tp = parallel_state.get_tensor_model_parallel_world_size()
@@ -131,8 +132,9 @@ def forward_step(
             state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + int(_sl.sum().item())
             state._flops_seqlen_sq_sum = getattr(state, "_flops_seqlen_sq_sum", 0) + int((_sl * _sl).sum().item())
         else:
-            state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + mbs * seq_len
-            state._flops_seqlen_sq_sum = getattr(state, "_flops_seqlen_sq_sum", 0) + mbs * seq_len**2
+            # use the PRE-SP-pad length (SP-pad inflated tokens.shape[1]); matches the packed branch's unpadded cu_seqlens
+            state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + mbs * _unpadded_seq_len
+            state._flops_seqlen_sq_sum = getattr(state, "_flops_seqlen_sq_sum", 0) + mbs * _unpadded_seq_len**2
     if image_grid_thw is not None and image_grid_thw.numel() > 0:
         state._flops_vision_patches = getattr(state, "_flops_vision_patches", 0) + int(
             image_grid_thw.prod(dim=-1).sum().item()
