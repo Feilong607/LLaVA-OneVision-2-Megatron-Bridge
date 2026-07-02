@@ -30,7 +30,9 @@
 #       provider fp8/dispatcher fixes live. If you switch REPO, sync those edits there too.
 # =============================================================================
 set -euo pipefail
-REPO=/home/ftan0055/LLaVA-OneVision-2-Megatron-Bridge
+# REPO: env override wins; else AUTO-DETECTED below from this script's location (line 37). Do NOT
+# hardcode a path here -- it defeats the auto-detect and breaks on any checkout dir (e.g. feilong_code).
+REPO="${REPO:-}"
 
 # Auto-detect repo root from this script's location (works on A100-2 /ov2 AND GB200 ~/LLaVA-...).
 _SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -208,7 +210,7 @@ DP=$(( WORLD / TP ))
 (( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs DP=$DP (WORLD=$WORLD / TP=$TP) to be a multiple of 8 and >=8. For 2 GB200 nodes (WORLD=8) keep TP=1; TP=2 needs >=4 GB200 nodes." >&2; exit 1; }
 
 # --- in-container env (were docker -e flags) ---
-export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"  # _verify_stubs FIRST: sitecustomize (modelopt/diffusers stubs + botocore<->boto3 rename compat) must load at startup, before transformers->boto3
 # HybridEP (ACCEL=2) needs deep_ep, whose deep_ep_cpp.so requires nvshmem_selected_device_transport@@NVSHMEM
 # -- present ONLY in the pip nvidia-nvshmem (.../dist-packages/nvidia/nvshmem/lib), NOT CUDA's bundled
 # libnvshmem_host.so.3. Without this, ACCEL=2 dies at iter-1 with an undefined-symbol ImportError (verified

@@ -32,7 +32,9 @@
 #   (or: nvidia-smi -q | grep -i fabric).  Do NOT edit files — every lever is an env override.
 # =============================================================================
 set -uo pipefail
-PRESET="${1:?usage: ov2_bench_gb200.sh baseline|hybridep|hybridep8|permute|norecompute|recompute_moe_off|ep_overlap|router_fusion|shared_overlap|capacity|fp8|fp8_pad|best|best_alltoall}"
+# preset: CLI arg wins; else env OV2_BENCH_PRESET; else default "best" (so a bare `bash ov2_bench_gb200.sh` runs best).
+# full list: baseline|hybridep|hybridep8|permute|norecompute|recompute_moe_off|ep_overlap|router_fusion|shared_overlap|capacity|fp8|fp8_pad|best|best_alltoall
+PRESET="${1:-${OV2_BENCH_PRESET:-best}}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAUNCHER="${LAUNCHER:-$HERE/ax_ov2_30b_a3b_gb200.sh}"
 [[ -f "$LAUNCHER" ]] || { echo "FATAL: launcher not found at $LAUNCHER (set LAUNCHER=)"; exit 1; }
@@ -56,7 +58,7 @@ case "$PRESET" in
   ep_overlap)  PENV=(OV2_EP_OVERLAP=1 CUDA_DEVICE_MAX_CONNECTIONS=32 DISABLE_RECOMPUTE=1) ;;                           # FIX 5 (env-gated recipe wiring, default OFF): overlap the inter-node EP all-to-all behind expert-FFN compute on the alltoall baseline (~1.3x on exposed a2a). ⚠ MUST diff loss + grad-norm vs baseline — the 2-node MIMO grad-finalize path is fragile (same reason cuda_graph is off)
   capacity)    PENV=(MOE_CAPACITY_FACTOR=1.0 MOE_PAD_TO_CAPACITY=true) ;;                        # bound the a2a payload (drops tokens — speed knob, watch loss)
   fp8)         PENV=(ACCEL=1) ;;                                                                 # MXFP8 + alltoall (peak 4500); SEPARATE from hybridep (ACCEL=1+hybridep is a hard error)
-  best)        PENV=(ACCEL=2 NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 OV2_HYBRIDEP_PERMUTE_FUSION=1) ;;  # hybridep d8 (=ep_size, NVIDIA-correct on 1 NVL72 rack: perf_plugins.py:365) + HybridEP-native permute fusion (the real one; OV2_MOE_PERMUTE_FUSION is a no-op on flex) + recompute-off. Sweep SMs: OV2_HYBRIDEP_NUM_SMS=16|32 bash ... best. NEVER ACCEL=1.  # hybridep(d4) + fused-permute + recompute-off (do NOT add ACCEL=1)
+  best)        PENV=(ACCEL=2 NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 OV2_HYBRIDEP_PERMUTE_FUSION=1) ;;  # hybridep d8 (=ep_size, NVIDIA-correct on 1 NVL72 rack: perf_plugins.py:365) + HybridEP-native permute fusion (the real one; OV2_MOE_PERMUTE_FUSION is a no-op on flex) + recompute-off. Sweep SMs: OV2_HYBRIDEP_NUM_SMS=16|32 bash ... best. NEVER ACCEL=1.
   router_fusion)   PENV=(OV2_MOE_ROUTER_FUSION=1) ;;                                               # fuse router topk+softmax+aux (OV2 default False; cuts MoE launch overhead; needs TE>=2.7)
   shared_overlap)  PENV=(OV2_MOE_SHARED_EXPERT_OVERLAP=1) ;;                                        # ALLTOALL-ONLY: overlap shared-expert MLP w/ EP a2a (mcore #3000; auto-off if OV2_EP_OVERLAP=1)
   fp8_pad)         PENV=(ACCEL=1 OV2_MOE_ROUTER_PAD_FP8=1 OV2_MOE_ROUTER_FUSION=1) ;;               # MXFP8 + FP8 routing-map M-align (recovers fp8 grouped-GEMM eff) + router-fusion
@@ -79,7 +81,8 @@ _has_iter_line = False
 for l in lines:
     # REAL Bridge per-iter line (train_utils.py): "elapsed time per iteration (ms): X" -- NOT forward=/iter=.
     m = re.search(r"elapsed time per iteration \(ms\): *"+NUM, l)
-    if m: it.append(float(m.group(1))); _has_iter_line = True
+    if m: it.append(float(m.group(1)))
+    elif "elapsed time per iteration" in l: _has_iter_line = True   # line PRESENT but number UNPARSED -> real format drift
     # tokens/s/GPU + MFU only appear when a FLOP peak is configured (e.g. GB200 launcher); colon OR equals.
     m = re.search(r"tokens/s/GPU:? *=? *"+NUM, l)
     if m: tok.append(float(m.group(1)))
@@ -98,7 +101,14 @@ peak = next((l.split("peak=")[1].split()[0] for l in lines if "peak=" in l), "?"
 if n == 0:
     if _has_iter_line:
         print(f"[bench] FATAL: iteration lines present but 0 'elapsed time per iteration (ms)' parsed -> parser/format drift. peak={peak}", file=sys.stderr); sys.exit(1)
-    print(f"[bench] no iteration lines (normal on node_rank>0; metrics print on node 0). banner peak={peak}")
+    # 0 iterations -> tell WHY the CSV is missing (crash vs worker) so it is actionable.
+    err = [l for l in lines if re.search(r"Traceback|error:|out of memory|RuntimeError|AssertionError|ImportError|undefined symbol|FATAL|Killed|core dumped|NCCL.*(error|timeout)", l, re.I)]
+    if err:
+        print(f"[bench] NO CSV: 0 iterations -> this run CRASHED before iter-1 (preset={preset}, peak={peak}). Key error lines:", file=sys.stderr)
+        for l in (err[:4] + err[-3:] if len(err) > 7 else err):
+            print("   " + l.strip()[:200], file=sys.stderr)
+        sys.exit(1)
+    print(f"[bench] no iteration lines + no error in THIS log -> normal on a WORKER (node_rank>0): metrics + CSV are written ONLY on the rank-0/MASTER pod. Check the master. (preset={preset}, peak={peak})")
     sys.exit(0)
 row = f"{preset},{med(fwd):.0f},{med(bwd):.0f},{med(it):.0f},{med(tok):.0f},{med(mfu):.2f},{peak},{n}"
 new = not os.path.exists(csv)
@@ -115,5 +125,9 @@ if strag:
         print("   ", l.strip()[:175])
 PY
 echo
-echo "[bench] comparison so far ($BENCH_CSV):"
-column -t -s, "$BENCH_CSV" 2>/dev/null || cat "$BENCH_CSV"
+if [[ -f "$BENCH_CSV" ]]; then
+  echo "[bench] comparison so far ($BENCH_CSV):"
+  column -t -s, "$BENCH_CSV" 2>/dev/null || cat "$BENCH_CSV"
+else
+  echo "[bench] no CSV at $BENCH_CSV -- this pod wrote no metrics. See the [bench] message above: CRASH -> fix that error; WORKER pod -> the CSV is on the rank-0/master pod."
+fi
