@@ -592,6 +592,27 @@ def build_llava_ov2(
         prov.position_embedding_type = "mrope"
         prov.mrope_section = _mrope_sec
         logger.info("[ov2 build] mrope LLM: position_embedding_type=mrope mrope_section=%s", _mrope_sec)
+    # HybridEP/DeepEP flex dispatcher: moe_token_dispatcher_type is a BUILD-TIME choice (MoELayer.__init__
+    # instantiates the dispatcher class from it), so it MUST be set on `prov` BEFORE prov.provide() --
+    # exactly like attention_softmax_in_fp32 / mrope above. The old post-build set in ov2_provider (on
+    # model.config AFTER the layers were built) only changed the config FIELD, not the already-instantiated
+    # alltoall dispatcher objects -> HybridEP silently ran as plain alltoall (zero speedup). Env-gated:
+    # OV2_FLEX_BACKEND unset -> untouched (verified alltoall path).
+    import os as _os
+    _flex_backend = _os.environ.get("OV2_FLEX_BACKEND") or None
+    if _flex_backend and getattr(prov, "num_moe_experts", None):
+        from megatron.bridge.training.flex_dispatcher_backend import apply_flex_dispatcher_backend
+        apply_flex_dispatcher_backend(prov, _flex_backend)
+        _hnsms = _os.environ.get("OV2_HYBRIDEP_NUM_SMS")
+        if _hnsms:
+            prov.moe_hybridep_num_sms = int(_hnsms)
+        if _os.environ.get("OV2_HYBRIDEP_PERMUTE_FUSION", "0") == "1":
+            prov.moe_permute_fusion_into_hybridep = True
+        logger.info("[ov2 build] flex dispatcher wired on PROVIDER (pre-build): type=%s backend=%s num_sms=%s permute_into=%s",
+                    getattr(prov, "moe_token_dispatcher_type", None),
+                    getattr(prov, "moe_flex_dispatcher_backend", None),
+                    getattr(prov, "moe_hybridep_num_sms", None),
+                    getattr(prov, "moe_permute_fusion_into_hybridep", None))
     language_model = prov.provide(pre_process=pre_process, post_process=post_process)
     # Interleaved M-RoPE: Qwen3.5 config has mrope_interleaved=True, but stock mcore builds the CHUNKED
     # MultimodalRotaryEmbedding (cat([m[i%3]...])). For text tokens t==h==w so chunked==interleaved, but

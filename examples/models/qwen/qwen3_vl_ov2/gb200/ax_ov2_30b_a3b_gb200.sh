@@ -134,6 +134,15 @@ elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best on NVL
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_BF16}"
+  # --- HybridEP runtime REQUIREMENTS on GB200 (both needed or the first nvshmem kernel dies with
+  # "CUDA error: unspecified launch failure" / "HYBRID-EP ALLGATHER TIMEOUT"). Baked here so ACCEL=2
+  # is self-sufficient (was manual env -> easy to forget -> crash). Both env-gated (override wins). ---
+  #  (1) GB200 nvshmem symmetric-heap uses CUDA VMM which is broken on this platform -> disable it.
+  export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"
+  #  (2) HybridEP JIT needs MAX_NUM_OF_TOKENS_PER_RANK % 64 == 0 AND identical across all EP ranks; OV2
+  #      THD packing gives ragged per-rank counts -> pad every rank to this fixed target (>= max seq/rank,
+  #      rounded to 64). MUST be >= the actual per-rank token max (seq_len). Default fits seq<=10240.
+  export HYBRID_EP_MAX_TOKENS_PER_RANK="${HYBRID_EP_MAX_TOKENS_PER_RANK:-10240}"
 else                                    # Phase-1: bf16 baseline -- the DEFAULT mode (also the A-card default)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' is NOT a recipe -> ValueError)
   # recompute OFF by DEFAULT on GB200 (192GB) -> faster AND numerically IDENTICAL to AIAK full/uniform/1

@@ -99,6 +99,47 @@ ensure_dispatch_cfg(){
     echo "$dst"; fi
 }
 
+do_fixup(){  # apply HF-skeleton fixes to an existing export dir (idempotent; standalone: convert.sh fixup <dir>)
+  local D="${1:?usage: convert.sh fixup <hf_export_dir>}"
+  [[ -f "$D/config.json" ]] || { echo "FATAL: $D has no config.json" >&2; exit 1; }
+  echo "==> [$PLAT] fixup: $D"
+  # (a) golden modeling: _init_weights re-inits VisionRotaryEmbedding inv_freq buffers (persistent=False ->
+  #     garbage after meta-tensor from_pretrained), is_first_iteration pixel-drop (transformers 5.x removed
+  #     cache_position for remote code), spatial_merge_size from config (skeleton hardcoded 2; p16m33 = 3).
+  cp -f "$HERE/hf_skeleton_fixes/modeling_llava_onevision2_moe.py" "$D/modeling_llava_onevision2_moe.py"
+  # (b) chat template: lmms-eval chat impl needs apply_chat_template; skeleton auto_model may lack the file
+  [[ -f "$D/chat_template.jinja" ]] || cp "$HERE/hf_skeleton_fixes/chat_template.jinja" "$D/"
+  # (c) config: pos_enc false (ckpt has no pos_emb weights); preprocessor jsons: sync patch/merge/temporal
+  #     from vision_config (skeleton ships generic p14/m2 values -> reshape crash / silent wrong layout)
+  python3 - "$D" <<'FIXJSON'
+import json, os, sys
+d = sys.argv[1]
+cp_ = os.path.join(d, "config.json")
+c = json.load(open(cp_)); hit = False
+for key in ("vision_config", "visual"):
+    v = c.get(key)
+    if isinstance(v, dict) and v.get("use_patch_position_encoding"):
+        v["use_patch_position_encoding"] = False; hit = True
+if hit:
+    json.dump(c, open(cp_, "w"), indent=2)
+    print("==> fixup: use_patch_position_encoding true->false (ckpt has no pos_emb weights)")
+vc = c.get("vision_config") or {}
+patch, merge = vc.get("patch_size"), vc.get("spatial_merge_size")
+tps = vc.get("temporal_patch_size") or 1
+if patch and merge:
+    for name in ("preprocessor_config.json", "video_preprocessor_config.json"):
+        p2 = os.path.join(d, name)
+        if not os.path.exists(p2):
+            continue
+        j = json.load(open(p2))
+        before = (j.get("patch_size"), j.get("merge_size"), j.get("temporal_patch_size"))
+        if before != (patch, merge, tps):
+            j["patch_size"], j["merge_size"], j["temporal_patch_size"] = patch, merge, tps
+            json.dump(j, open(p2, "w"), indent=2)
+            print("==> fixup: %s (patch,merge,temporal) %s -> %s" % (name, before, (patch, merge, tps)))
+FIXJSON
+}
+
 do_export(){
   (( WORLD == 8 )) || { echo "ERROR: 30B is EP8 -> world must be 8 (got $WORLD: NPROC=$NPROC nodes=${NN:-1}); on GB200 use NPROC=4 LIST_IP=<2 nodes>" >&2; exit 1; }
   local CFG_RDY; CFG_RDY="$(ensure_dispatch_cfg "$CFG_DEF" "$WORK/cfg_dispatch")"
@@ -108,6 +149,14 @@ do_export(){
   for f in "$CFG_RDY"/*.py "$CFG_RDY"/tokenizer* "$CFG_RDY"/*token* "$CFG_RDY"/*preprocessor* "$CFG_RDY"/generation_config.json "$CFG_RDY"/vocab.json "$CFG_RDY"/merges.txt "$CFG_RDY"/chat_template.jinja "$CFG_RDY"/added_tokens.json; do
     [ -f "$f" ] && cp -n "$f" "$HF_OUT/" 2>/dev/null || true
   done
+  # The p16m33 auto_model skeleton config WRONGLY ships use_patch_position_encoding:true, but the trained
+  # mcore ckpt has ZERO adapter.pos_emb_* keys (never trained with -pos; no AIAK script ever passed it;
+  # config-class default is False). true makes HF create + APPLY randomly-initialized pos_emb_h/w at
+  # inference (the vision tower passes patch_positions into the merger unconditionally) -> silent image-
+  # feature corruption + MISSING-keys load report. Force false so the exported config matches the weights.
+  if [[ "${NR:-0}" == "0" ]]; then
+    do_fixup "$HF_OUT"
+  fi
 }
 do_roundtrip(){
   (( WORLD == 8 )) || { echo "ERROR: 30B roundtrip is EP8 -> world must be 8 (got $WORLD)" >&2; exit 1; }
@@ -117,6 +166,7 @@ do_roundtrip(){
 
 case "$MODE" in
   export)    do_export ;;
+  fixup)     do_fixup "${1:?usage: convert.sh fixup <hf_export_dir>}" ;;
   roundtrip) do_roundtrip ;;
   30b)       do_export; do_roundtrip ;;
   4b)

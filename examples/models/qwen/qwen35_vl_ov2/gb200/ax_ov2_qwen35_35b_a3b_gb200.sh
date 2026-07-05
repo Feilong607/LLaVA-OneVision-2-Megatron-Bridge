@@ -264,6 +264,7 @@ mkdir -p "$SAVE"; cd "$REPO"
 # so resuming a Muon ckpt at a DIFFERENT world size silently loads mismatched momentum. AdamW reshards
 # fine -> guard Muon only (stage2 default). Marker lives in $SAVE so it travels with the ckpt dir. ---
 _is_muon=0; [[ "$RECIPE" == *stage2* && "${OV2_STAGE2_ADAMW:-0}" != "1" ]] && _is_muon=1
+[[ "$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1" ]] && _is_muon=1   # midtrain Muon momentum is ALSO DP-sharded -> same reshard guard
 _wf="$SAVE/.ov2_train_world"
 _has_ckpt=0; { [[ -f "$SAVE/latest_checkpointed_iteration.txt" ]] || compgen -G "$SAVE/iter_*" >/dev/null 2>&1; } && _has_ckpt=1
 if [[ "$_is_muon" == "1" && "$_has_ckpt" == "1" && -f "$_wf" ]]; then
