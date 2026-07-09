@@ -117,7 +117,7 @@ export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before s
 # Muon ValueError; TP=1 fits -> no vision OOM), so the iter-2 NaN is the only open question to test here.
 # Default ON per user request; set OV2_MIDTRAIN_MUON=0 to revert to the validated AdamW path.
 export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
-ACCEL="${ACCEL:-0}"
+ACCEL="${ACCEL:-2}"
 # MXFP8 needs fp8 tensor cores (Hopper sm_90 / Blackwell sm_100). On Ampere (A100/A800) there are none
 # -> auto-fall back to the bf16 baseline so the SAME command is safe to run on A-cards.
 if [[ "$ACCEL" == "1" && "$HW_FP8" != "1" ]]; then
