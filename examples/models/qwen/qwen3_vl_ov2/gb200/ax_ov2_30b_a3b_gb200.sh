@@ -140,9 +140,17 @@ elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best on NVL
   #  (1) GB200 nvshmem symmetric-heap uses CUDA VMM which is broken on this platform -> disable it.
   export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"
   #  (2) HybridEP JIT needs MAX_NUM_OF_TOKENS_PER_RANK % 64 == 0 AND identical across all EP ranks; OV2
-  #      THD packing gives ragged per-rank counts -> pad every rank to this fixed target (>= max seq/rank,
-  #      rounded to 64). MUST be >= the actual per-rank token max (seq_len). Default fits seq<=10240.
-  export HYBRID_EP_MAX_TOKENS_PER_RANK="${HYBRID_EP_MAX_TOKENS_PER_RANK:-10240}"
+  #      THD packing gives ragged per-rank counts (each <= seq_len) -> pad every rank to ONE target.
+  #      DERIVED from SEQ_LEN (round up to 64) so the cap TRACKS the seq you actually run instead of a
+  #      fixed base -- round64(10192)=10240, so the historical default is preserved byte-identically, but
+  #      OV2_SEQ_LEN=16384 now auto-caps at 16384 (no manual bump, no silent per-rank divergence).
+  #      An explicit HYBRID_EP_MAX_TOKENS_PER_RANK= still wins (must be >= round64(SEQ_LEN); guarded below).
+  _hep_cap=$(( (SEQ_LEN + 63) / 64 * 64 ))
+  export HYBRID_EP_MAX_TOKENS_PER_RANK="${HYBRID_EP_MAX_TOKENS_PER_RANK:-$_hep_cap}"
+  #  (2b) GUARD: a cap below round64(SEQ_LEN) lets fused_a2a.py pad each EP rank to its OWN round64
+  #       target (different per rank) -> "HYBRID-EP ALLGATHER TIMEOUT" hang. Fail loud instead of hang.
+  (( HYBRID_EP_MAX_TOKENS_PER_RANK >= _hep_cap )) || {
+    echo "[ov2-30b] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK < round64(SEQ_LEN=$SEQ_LEN)=$_hep_cap -> EP ranks would pad to different targets -> HybridEP allgather-timeout hang. Set it >= $_hep_cap, or lower OV2_SEQ_LEN." >&2; exit 1; }
 else                                    # Phase-1: bf16 baseline -- the DEFAULT mode (also the A-card default)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' is NOT a recipe -> ValueError)
   # recompute OFF by DEFAULT on GB200 (192GB) -> faster AND numerically IDENTICAL to AIAK full/uniform/1

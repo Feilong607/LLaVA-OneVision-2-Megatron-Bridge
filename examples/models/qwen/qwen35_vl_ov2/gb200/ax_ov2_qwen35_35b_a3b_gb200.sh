@@ -214,6 +214,16 @@ if [[ "$ACCEL" == "2" ]]; then
   export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}"
   (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
     echo "ERROR: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8." >&2; exit 1; }
+  # HybridEP flex a2a env (baked so ACCEL=2 is self-sufficient; all env-gated, override wins).
+  # (1) GB200 nvshmem symmetric-heap uses CUDA VMM which is broken on this platform -> disable it.
+  export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"
+  # (2) HybridEP JIT needs MAX_NUM_OF_TOKENS_PER_RANK %64==0 AND identical across EP ranks; THD packing
+  #     gives ragged per-rank counts (each <= seq_len) -> pad every rank to ONE target DERIVED from
+  #     SEQ_LEN (round up to 64) so the cap TRACKS the seq you run instead of a fixed base. Override wins.
+  _hep_cap=$(( (SEQ_LEN + 63) / 64 * 64 ))
+  export HYBRID_EP_MAX_TOKENS_PER_RANK="${HYBRID_EP_MAX_TOKENS_PER_RANK:-$_hep_cap}"
+  (( HYBRID_EP_MAX_TOKENS_PER_RANK >= _hep_cap )) || {
+    echo "[ov2] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK < round64(SEQ_LEN=$SEQ_LEN)=$_hep_cap -> EP ranks pad to different targets -> HybridEP allgather hang. Set >= $_hep_cap or lower OV2_SEQ_LEN." >&2; exit 1; }
 fi
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 
