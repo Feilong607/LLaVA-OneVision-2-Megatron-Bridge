@@ -42,9 +42,15 @@ case "$MODE" in
     exec env A="$1" B="$2" bash "$HERE/verify.sh" ;;
 esac
 
-# --- platform auto-detect (mirrors the training launcher HW gate) ---
-_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.' || echo 0)"
-if [[ "${_cc:-0}" -ge 100 ]]; then
+# --- platform: PLAT=gb200|a800 (or HW=) override WINS; else auto-detect from compute_cap. Parse with awk
+#     (first row, DIGITS ONLY: "10.0"->"100"). The old `... | head -1 | tr -d . || echo 0` broke under
+#     `set -o pipefail`: head's SIGPIPE made the pipe non-zero -> `|| echo 0` appended -> _cc="100 0" ->
+#     `[[ "100 0" -ge 100 ]]` syntax error -> silently fell to the a800 (A100) paths on a GB200 box. ---
+PLAT="${PLAT:-${HW:-}}"
+_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | awk 'NR==1{gsub(/[^0-9]/,"");print}')"
+[[ "$_cc" =~ ^[0-9]+$ ]] || _cc=0
+[[ -n "$PLAT" ]] || { [[ "$_cc" -ge 100 ]] && PLAT=gb200 || PLAT=a800; }
+if [[ "$PLAT" == "gb200" ]]; then
   PLAT=gb200; DEF_NPROC=4
   CFG_DEF="${CFG:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"
   CKPTA_DEF="${CKPTA:-/datasets/llava-ov2-30b-a3b-m9lvdn}"
@@ -77,8 +83,18 @@ export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REP
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TE_EXTRA_STATE_MISSING_CHECK="${TE_EXTRA_STATE_MISSING_CHECK:-1}" OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"
 
-# torchrun rendezvous: standalone (1 node) or multi-node EP8 (GB200 2x4). node_rank auto from LIST_IP.
-if [[ -n "${LIST_IP:-}" ]]; then
+# torchrun rendezvous, 3 priorities (mirrors the training launcher -> LIST_IP is now OPTIONAL):
+#   (1) operator-injected env (PyTorchJob/Run:AI auto-inject PET_* + MASTER_ADDR/WORLD_SIZE) -> TRUE auto, NO LIST_IP
+#   (2) manual LIST_IP="<ip0> <ip1> ..." (run SAME cmd on each node)
+#   (3) single-node standalone
+if [[ -n "${PET_NNODES:-}" || ( -n "${MASTER_ADDR:-}" && -n "${WORLD_SIZE:-}" ) ]]; then
+  NN="${PET_NNODES:-$(( WORLD_SIZE / NPROC ))}"
+  NR="${PET_NODE_RANK:-$(( ${RANK:-0} / NPROC ))}"
+  MA="${MASTER_ADDR:-${PET_MASTER_ADDR:-}}"; MP="${MASTER_PORT:-${PET_MASTER_PORT:-26060}}"
+  [[ "$NN" -gt 1 && -z "${MA:-}" ]] && { echo "ERROR: multi-node but neither MASTER_ADDR nor PET_MASTER_ADDR injected by the operator" >&2; exit 1; }
+  RDZV="--nnodes=$NN --node_rank=$NR --master_addr=$MA --master_port=$MP"; WORLD=$((NN*NPROC))
+  echo "==> rdzv: operator-auto (nnodes=$NN node_rank=$NR master=$MA:$MP world=$WORLD)"
+elif [[ -n "${LIST_IP:-}" ]]; then
   read -ra ip <<< "$LIST_IP"; NN=${#ip[@]}
   MA="${ip[0]}"; MP="${MASTER_PORT:-26060}"; CUR="$(hostname -I | awk '{print $1}')"; NR=-1
   for i in "${!ip[@]}"; do [[ "${ip[$i]}" == "$CUR" ]] && NR=$i && break; done
@@ -141,7 +157,7 @@ FIXJSON
 }
 
 do_export(){
-  (( WORLD == 8 )) || { echo "ERROR: 30B is EP8 -> world must be 8 (got $WORLD: NPROC=$NPROC nodes=${NN:-1}); on GB200 use NPROC=4 LIST_IP=<2 nodes>" >&2; exit 1; }
+  (( WORLD == ${OV2_EP:-8} )) || { echo "ERROR: 30B export needs world == EP (OV2_EP=${OV2_EP:-8}) but world=$WORLD (NPROC=$NPROC nodes=${NN:-1}). Verified path = EP8 on 8 GPUs (2 nodes). Single 4-GPU node: OV2_EP=4 (EP4 load-reshards the EP8 ckpt -> UNVALIDATED, check roundtrip allclose)." >&2; exit 1; }
   local CFG_RDY; CFG_RDY="$(ensure_dispatch_cfg "$CFG_DEF" "$WORK/cfg_dispatch")"
   echo "==> [$PLAT] export: mcore $CKPTA_DEF -> HF $HF_OUT   (cfg=$CFG_RDY)"
   CFG="$CFG_RDY" CKPTA="$CKPTA_DEF" HF="$HF_OUT" dist "$HERE/ov2_30b_export_ep8.py"
@@ -159,7 +175,7 @@ do_export(){
   fi
 }
 do_roundtrip(){
-  (( WORLD == 8 )) || { echo "ERROR: 30B roundtrip is EP8 -> world must be 8 (got $WORLD)" >&2; exit 1; }
+  (( WORLD == ${OV2_EP:-8} )) || { echo "ERROR: 30B roundtrip needs world == EP (OV2_EP=${OV2_EP:-8}) but world=$WORLD." >&2; exit 1; }
   echo "==> [$PLAT] roundtrip: $HF_OUT -> Megatron(EP$WORLD) -> HF + allclose"
   dist examples/conversion/hf_megatron_roundtrip_multi_gpu.py --hf-model-id "$HF_OUT" --tp 1 --pp 1 --ep "$WORLD" --trust-remote-code --not-strict
 }

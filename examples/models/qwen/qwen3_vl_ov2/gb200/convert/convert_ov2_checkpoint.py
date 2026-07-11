@@ -147,6 +147,9 @@ def main():
     ap.add_argument("--ep", type=int, default=8)
     ap.add_argument("--etp", type=int, default=0, help="expert TP (0 -> default/None)")
     ap.add_argument("--no-adapter", action="store_true", help="from_base: leave adapter at init")
+    ap.add_argument("--vision_hf", default=None,
+                    help="from_base: graft a HF OneVisionEncoder dir into the vision tower "
+                         "(p16m33). LLM still from --src; vision tower from this HF encoder.")
     args = ap.parse_args()
 
     _init(args)
@@ -190,7 +193,23 @@ def main():
         log("{} TP{}/PP{}/EP{}/ETP{} | stitch base: {}".format(
             args.backbone, args.tp, args.pp, args.ep, args.etp or "-", args.src))
         model = _build()
-        load_ov2_mcore_checkpoint(model, args.src, load_adapter=not args.no_adapter, load_vision=True)
+        load_ov2_mcore_checkpoint(model, args.src, load_adapter=not args.no_adapter,
+                                  load_vision=(args.vision_hf is None))
+        if args.vision_hf:
+            from megatron.bridge.models.qwen_vl_ov2.llava_ov2 import load_hf_encoder_into_tower
+            r = load_hf_encoder_into_tower(model.vision_model, args.vision_hf)
+            log("vision_hf graft from {}: loaded={} missing={} unexpected={}".format(
+                args.vision_hf, r["loaded"], len(r["missing"]), len(r["unexpected"])))
+            if r["missing"]:
+                log("  WARN vision graft MISSING (first 12): {}".format(r["missing"][:12]))
+            if r["unexpected"]:
+                log("  WARN vision graft UNEXPECTED (first 12): {}".format(r["unexpected"][:12]))
+        if args.no_adapter or args.vision_hf:
+            # build used perform_init=False -> adapter is uninitialized; init it fresh (same as the
+            # provider stitch hook does for stage-1) so the saved ckpt has a finite, trainable adapter.
+            from megatron.bridge.models.qwen_vl_ov2.ov2_provider import _init_ov2_adapter
+            _init_ov2_adapter(model.adapter)
+            log("adapter freshly initialized (fc1 std, fc2 scaled)")
         _save_loadable(model)
 
     elif args.mode == "reshard":
