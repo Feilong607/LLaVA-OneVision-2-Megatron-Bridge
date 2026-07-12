@@ -129,6 +129,13 @@ if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (fp8 HW onl
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-}"                       # MUST stay empty: alltoall (HybridEP+fp8 unsupported)
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_FP8}"        # fp8 tensor-core peak (MFU vs fp8)
+  # MXFP8 aligns the token/M dim to 32 (1x32 block scaling) in BOTH GEMM families or the GEMM SILENTLY
+  # runs bf16: (1) dense/attention -> ov2_step pads the packed seq automatically (this repo); (2) the
+  # 128-expert grouped-GEMM -> per-expert token counts need moe_router_padding_for_fp8. Default it ON
+  # for ACCEL=1 so the BIGGEST GEMMs (expert FFN) actually run MXFP8 -- without it the experts fell back
+  # to bf16 and MXFP8 gave ~no speedup (see ov2_bench_gb200.sh 'fp8' vs 'fp8_pad'). Override
+  # OV2_MOE_ROUTER_PAD_FP8=0 to A/B the un-padded (expert-bf16) path.
+  export OV2_MOE_ROUTER_PAD_FP8="${OV2_MOE_ROUTER_PAD_FP8:-1}"
 elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best on NVL72; allowed elsewhere)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' is NOT a recipe -> ValueError)
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
@@ -281,7 +288,14 @@ if [[ "$ACCEL" == "2" ]]; then
   (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
     echo "ERROR: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8." >&2; exit 1; }
 fi
-export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+# EP comm-overlap (OV2_EP_OVERLAP=1) REQUIRES CUDA_DEVICE_MAX_CONNECTIONS>=32 (recipe requirement); the
+# default is 1, so enabling OV2_EP_OVERLAP alone would silently under-perform. Couple them so the overlap
+# lever actually engages (still env-overridable). Default path (overlap off) keeps the historical 1.
+if [[ "${OV2_EP_OVERLAP:-0}" == "1" ]]; then
+  export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
+else
+  export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+fi
 
 # --- run_recipe.py CLI overrides ---
 OVERRIDES="dataset.path=$DATA_PATH"
