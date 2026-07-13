@@ -1,0 +1,22 @@
+diff --git a/megatron/core/pipeline_parallel/combined_1f1b.py b/megatron/core/pipeline_parallel/combined_1f1b.py
+index 1f45f2d..dc03d4d 100644
+--- a/megatron/core/pipeline_parallel/combined_1f1b.py
++++ b/megatron/core/pipeline_parallel/combined_1f1b.py
+@@ -372,9 +372,15 @@ def combined_forward_backward_step(
+             )
+             from megatron.core.models.gpt.gpt_model import GPTModel
+ 
+-            assert isinstance(unwrapped_model, GPTModel), (
++            # OV2 EP-overlap patch: also accept MIMO VLM wrappers (e.g. LlavaOnevision2) that
++            # expose build_schedule_plan and DELEGATE to their inner GPTModel -- the plan they
++            # return is still a genuine GPTModel plan (enforced by the AbstractSchedulePlan
++            # isinstance check just below), so the combined-1F1B scheduling semantics are unchanged.
++            assert isinstance(unwrapped_model, GPTModel) or callable(
++                getattr(unwrapped_model, "build_schedule_plan", None)
++            ), (
+                 "The final unwrapped model must be a GPTModel instance "
+-                "since only GPTModel is supported for EP A2A overlapping."
++                "or expose build_schedule_plan (OV2 EP-overlap patch)."
+             )
+             f_schedule_plan, loss_func = forward_step_func(
+                 data_iterator, unwrapped_model, return_schedule_plan=True

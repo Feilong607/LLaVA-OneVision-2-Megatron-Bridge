@@ -335,6 +335,36 @@ class LlavaOnevision2Provider(GPTModelProvider):
                 logger.info("[ov2 provider] hybridep tuning: num_sms=%s permute_into_hybridep=%s",
                             getattr(model.config, "moe_hybridep_num_sms", None),
                             getattr(model.config, "moe_permute_fusion_into_hybridep", None))
+        # --- EP a2a comm-overlap (OV2_EP_OVERLAP=1): same dead-field issue as fp8/flex above.
+        # runtime_config_update -> CommOverlapConfig.setup(cfg.model, ...) wrote
+        # overlap_moe_expert_parallel_comm / delay_wgrad_compute onto THIS provider, but the schedule
+        # gate reads get_model_config(model) == the rebuilt LLM config (schedules.py:
+        # `if config.overlap_moe_expert_parallel_comm` -> combined-1F1B), and ov2_step used to ignore
+        # return_schedule_plan -> OV2_EP_OVERLAP=1 was a SILENT NO-OP (logged ON, ran the plain path).
+        # Copy the flags onto the RUNTIME config here (all mcore consumers read them at runtime:
+        # the schedules gate, TransformerLayer/MoELayer backward_dw, the per-layer plan's
+        # delay_wgrad_compute). Default (flags unset/False) -> no-op, byte-identical.
+        if getattr(self, "overlap_moe_expert_parallel_comm", None):
+            # Fail loud on the one prerequisite the comm_overlap.setup() asserts could NOT see:
+            # build_llava_ov2 sets recompute on the INNER config from recompute_activations +
+            # OV2_RECOMPUTE_FULL, so the runtime config can be full-recompute even when the provider
+            # passed setup()'s recompute_granularity check. Full recompute breaks combined-1F1B.
+            if getattr(model.config, "recompute_granularity", None) == "full":
+                raise SystemExit(
+                    "[ov2 provider] OV2_EP_OVERLAP=1 is incompatible with FULL activation recompute "
+                    "on the runtime LLM config (combined-1F1B cannot re-schedule a full-recompute "
+                    "layer). Run with DISABLE_RECOMPUTE=1 (or selective recompute), or unset "
+                    "OV2_EP_OVERLAP.")
+            model.config.overlap_moe_expert_parallel_comm = True
+            if getattr(self, "delay_wgrad_compute", None) and hasattr(model.config, "delay_wgrad_compute"):
+                model.config.delay_wgrad_compute = True
+            logger.info(
+                "[ov2 provider] EP comm-overlap wired onto runtime LLM config: overlap=%s delay_wgrad=%s "
+                "(combined-1F1B engages; needs CUDA_DEVICE_MAX_CONNECTIONS>=32 + the "
+                "megatron_lm_ov2_ep_overlap.patch; re-validate 2-node grad-norm)",
+                model.config.overlap_moe_expert_parallel_comm,
+                getattr(model.config, "delay_wgrad_compute", None),
+            )
         return model
 
     # ------------------------------------------------------------------ #

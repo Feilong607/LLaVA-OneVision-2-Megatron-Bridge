@@ -640,9 +640,14 @@ def _ov2_common(
     cfg.ddp.average_in_collective = False
     cfg.mixed_precision = "bf16_mixed"
     # EP all-to-all comm-overlap (OPT-IN; default OFF -> byte-identical). OV2_EP_OVERLAP=1 hides the
-    # inter-node MoE dispatch/combine a2a behind expert-FFN compute (~1.3x on exposed a2a). REQUIRES
-    # CUDA_DEVICE_MAX_CONNECTIONS>=32 + PyTorch>=2.6; RE-VALIDATE 2-node grad-norm before trusting (the
-    # MIMO grad-finalize path that forced cuda_graph_impl=none below is fragile on 2 nodes).
+    # inter-node MoE dispatch/combine a2a behind expert-FFN compute (~1.3x on exposed a2a, H100/IB;
+    # less on GB200 MNNVL). REQUIRES CUDA_DEVICE_MAX_CONNECTIONS>=32 + PyTorch>=2.6; RE-VALIDATE 2-node
+    # grad-norm before trusting (the MIMO grad-finalize path that forced cuda_graph_impl=none below is
+    # fragile on 2 nodes). NB this CommOverlapConfig lands on cfg.model (the PROVIDER); for it to
+    # actually engage, ov2_provider.provide() copies the flags to the RUNTIME LLM config (dead-field
+    # fix), ov2_step implements the return_schedule_plan protocol, and
+    # 3rdparty/megatron_lm_ov2_ep_overlap.patch relaxes mcore combined_1f1b's isinstance-GPTModel
+    # assert -- all three are required, else the overlap silently no-ops or asserts at step 1.
     if os.environ.get("OV2_EP_OVERLAP", "0") == "1":
         from megatron.bridge.training.comm_overlap import CommOverlapConfig
         cfg.comm_overlap = CommOverlapConfig(

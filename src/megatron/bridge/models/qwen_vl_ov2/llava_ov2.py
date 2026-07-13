@@ -204,19 +204,24 @@ class LlavaOnevision2(MegatronModule):
             for p in m.parameters():
                 p.requires_grad = False
 
-    def forward(
+    def _preprocess_lm_inputs(
         self,
         images: torch.Tensor,
         image_grid_thw: torch.Tensor,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor = None,
-        attention_mask: torch.Tensor = None,
-        labels: torch.Tensor = None,
-        loss_mask: torch.Tensor = None,
         packed_seq_params=None,
         patch_positions=None,
-        **kwargs,
-    ) -> torch.Tensor:
+    ):
+        """Shared multimodal prefix for ``forward()`` and ``build_schedule_plan()``.
+
+        Runs vision tower -> adapter -> masked_scatter fuse -> SP scatter -> position-id
+        derivation (mrope/MTP), i.e. everything up to the inner-LLM call. Returns
+        ``(input_ids_arg, position_ids_arg, combined_embeddings, packed_seq_params)``
+        (packed_seq_params may be a deepcopy extended by the SP pad). Exact code move from
+        the old ``forward()`` body -- behavior is byte-identical; both the eager forward and
+        the EP-overlap (combined-1F1B) schedule-plan path share this single implementation.
+        """
         if __import__("os").environ.get("OV2_ANOMALY") == "1" and not getattr(self, "_ov2_nanhooks", False):
             self._ov2_nanhooks = True
             _rr = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
@@ -407,10 +412,77 @@ class LlavaOnevision2(MegatronModule):
         if _sp_pad > 0 and _pos is not None and _pos.shape[-1] == input_ids.shape[1]:
             _pos = torch.cat((_pos, _pos.new_zeros(_pos.shape[:-1] + (_sp_pad,))), dim=-1)
         _pos_arg = _pos if (_is_mrope or _mtp) else None
+        return _ids, _pos_arg, combined, packed_seq_params
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
+        labels: torch.Tensor = None,
+        loss_mask: torch.Tensor = None,
+        packed_seq_params=None,
+        patch_positions=None,
+        **kwargs,
+    ) -> torch.Tensor:
+        _ids, _pos_arg, combined, packed_seq_params = self._preprocess_lm_inputs(
+            images,
+            image_grid_thw,
+            input_ids,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            patch_positions=patch_positions,
+        )
         # loss_mask threaded into the LLM so the MTP head masks its aux loss to the SAME supervised
         # tokens as the main loss (else process_mtp_loss defaults to all-ones -> trains MTP on
         # prompt/image-pad/pad; matters once MTP is live at midtrain). No-op in stage-1/2 (MTP zeroed).
         return self.language_model(
+            input_ids=_ids,
+            position_ids=_pos_arg,
+            attention_mask=attention_mask,
+            decoder_input=combined,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+    def build_schedule_plan(
+        self,
+        images: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
+        labels: torch.Tensor = None,
+        loss_mask: torch.Tensor = None,
+        packed_seq_params=None,
+        patch_positions=None,
+        **kwargs,
+    ):
+        """EP a2a comm-overlap entry point (mcore combined-1F1B; OV2_EP_OVERLAP=1).
+
+        mcore's ``combined_1f1b`` unwraps to the module exposing ``build_schedule_plan`` and calls
+        the step func with ``return_schedule_plan=True`` (ov2_step then calls this). We run the
+        multimodal prefix EAGERLY -- the exact same ``_preprocess_lm_inputs`` code path as
+        ``forward()`` -- and delegate to the inner GPTModel's ``build_schedule_plan`` with the fused
+        embeddings as ``decoder_input``. The returned plan is a genuine mcore
+        ``TransformerModelChunkSchedulePlan`` built by the inner LLM, so the combined-1F1B
+        scheduling semantics are unchanged; the eager vision/adapter prefix joins the autograd graph
+        through ``decoder_input``, so its grads flow in the plan's preprocess backward. Requires the
+        OV2 mcore patch that relaxes combined_1f1b's isinstance-GPTModel assert (see
+        3rdparty/megatron_lm_ov2_ep_overlap.patch).
+        """
+        _ids, _pos_arg, combined, packed_seq_params = self._preprocess_lm_inputs(
+            images,
+            image_grid_thw,
+            input_ids,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            patch_positions=patch_positions,
+        )
+        return self.language_model.build_schedule_plan(
             input_ids=_ids,
             position_ids=_pos_arg,
             attention_mask=attention_mask,
