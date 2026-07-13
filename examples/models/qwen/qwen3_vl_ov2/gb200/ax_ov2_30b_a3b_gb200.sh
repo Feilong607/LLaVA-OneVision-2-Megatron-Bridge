@@ -161,6 +161,13 @@ _nvshmem_lib="${OV2_NVSHMEM_LIB:-/usr/local/lib/python3.12/dist-packages/nvidia/
 [[ -e "$_nvshmem_lib/libnvshmem_host.so.3" ]] && export LD_LIBRARY_PATH="$_nvshmem_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OV2_SKIP_HELPERS="${OV2_SKIP_HELPERS:-1}"   # energon doesn't use helpers_cpp -> skip the C++ index-builder compile
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"   # HF tokenizer Rust threads x forked energon workers -> warn/deadlock (StepFun parity)
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"                   # tee'd logs keep their tail on crash (offline GB200 debugging)
+# TE LayerNorm SM margin: reserve SMs so LayerNorm kernels don't starve CONCURRENT comm kernels --
+# matters whenever comm overlaps compute (OV2_EP_OVERLAP=1, grad-reduce overlap). StepFun pairs 20
+# with CUDA_DEVICE_MAX_CONNECTIONS=32. Env-overridable; =0 restores the old all-SM behavior.
+export NVTE_FWD_LAYERNORM_SM_MARGIN="${NVTE_FWD_LAYERNORM_SM_MARGIN:-20}"
+export NVTE_BWD_LAYERNORM_SM_MARGIN="${NVTE_BWD_LAYERNORM_SM_MARGIN:-20}"
 export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"  # avoid TE Triton MoE-permute wedge (30B-A3B fix)
 export OV2_MOE_AUX_LOSS_COEFF="${OV2_MOE_AUX_LOSS_COEFF:-0.01}"  # AIAK midtrain load-balance coeff
 export OV2_PACK_FULL_CAUSAL="${OV2_PACK_FULL_CAUSAL:-0}"      # 0=THD block-diagonal (AIAK-faithful); 1=full-causal
