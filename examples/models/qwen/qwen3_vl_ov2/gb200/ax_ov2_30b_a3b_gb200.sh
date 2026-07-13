@@ -358,27 +358,8 @@ ONE-WAY; torch_dist INIT_CKPT will mismatch -> convert it to fsdp_dtensor or poi
 fi
 
 mkdir -p "$SAVE"; cd "$REPO"
-# --- Muon resume-topology guard (Pass-6): distributed Muon (LayerWise) shards momentum across the DP
-# axis and forces the ckpt replica_id DP-coord to 0 ("fixed DP usage only") with NO reshard guard, so
-# resuming a Muon ckpt at a DIFFERENT world size (e.g. A800 16-rank -> GB200 8-rank) SILENTLY loads
-# mismatched momentum (weights are fine; optimizer state corrupts) with no error. AdamW reshards fine
-# -> guard Muon only. DP=WORLD/TP here (PP/CP=1). Marker lives in $SAVE so it travels with the ckpt dir.
-_is_muon=0; [[ "$RECIPE" == *stage2* && "${OV2_STAGE2_ADAMW:-0}" != "1" ]] && _is_muon=1
-[[ "$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1" ]] && _is_muon=1   # midtrain Muon momentum is ALSO DP-sharded -> same reshard guard
-_wf="$SAVE/.ov2_train_world"
-_has_ckpt=0; { [[ -f "$SAVE/latest_checkpointed_iteration.txt" ]] || compgen -G "$SAVE/iter_*" >/dev/null 2>&1; } && _has_ckpt=1
-if [[ "$_is_muon" == "1" && "$_has_ckpt" == "1" && -f "$_wf" ]]; then
-  _saved_world="$(cat "$_wf" 2>/dev/null || echo "")"
-  if [[ -n "$_saved_world" && "$_saved_world" != "$WORLD" ]]; then
-    if [[ "${OV2_ALLOW_DP_RESHARD:-0}" == "1" ]]; then
-      echo "[ov2-30b] WARN: Muon ckpt in $SAVE saved at WORLD=$_saved_world, resuming at WORLD=$WORLD -> DP-sharded momentum MISMATCH; OV2_ALLOW_DP_RESHARD=1 set, continuing (optimizer state WILL be wrong)." >&2
-    else
-      echo "[ov2-30b] FATAL: distributed-Muon ckpt in $SAVE was saved at WORLD=$_saved_world but you are resuming at WORLD=$WORLD. Muon momentum is DP-sharded with NO reshard support -> resuming silently loads MISMATCHED optimizer state. Resume at WORLD=$_saved_world, OR set OV2_ALLOW_DP_RESHARD=1 to override (momentum garbage; expect a loss/grad-norm bump)." >&2
-      exit 1
-    fi
-  fi
-fi
-[[ "$NODE_RANK" -eq 0 ]] && { echo "$WORLD" > "$_wf" 2>/dev/null || true; }
+# NOTE: the old Muon resume-topology guard was removed -- distributed Muon now supports DP-reshard, so
+# resuming a Muon ckpt at a different WORLD size no longer corrupts the sharded momentum (guard obsolete).
 echo "[ov2-30b-gb200] in-container | hw=$HWNAME(cc=$_cc) repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY ep_overlap=${OV2_EP_OVERLAP:-0} ep_delay_wgrad=${OV2_EP_DELAY_WGRAD:-0} hybridep_num_sms=${OV2_HYBRIDEP_NUM_SMS:-default} hybridep_permute=${OV2_HYBRIDEP_PERMUTE_FUSION:-0} router_fusion=${OV2_MOE_ROUTER_FUSION:-0} router_pad_fp8=${OV2_MOE_ROUTER_PAD_FP8:-0} shared_overlap=${OV2_MOE_SHARED_EXPERT_OVERLAP:-0} freeze_vision=${OV2_FREEZE_VISION:-recipe-default} node_rank=$NODE_RANK nnodes=$NNODES"
 # shellcheck disable=SC2086  # $RDZV and $OVERRIDES must word-split into separate args
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
