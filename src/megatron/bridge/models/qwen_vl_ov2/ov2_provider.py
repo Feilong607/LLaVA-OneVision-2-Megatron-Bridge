@@ -302,13 +302,19 @@ class LlavaOnevision2Provider(GPTModelProvider):
             # arch & MoE). Env-gated: OV2_FLEX_BACKEND unset -> no-op (keeps verified alltoall).
             _flex = os.environ.get("OV2_FLEX_BACKEND") or None
             if _flex:
-                # MXFP8 + HybridEP fp8-dispatch is unsupported (mcore asserts in fused_a2a); fail loud
-                # here instead of crashing deep in the first MoE layer. They are SEPARATE Phase-2 modes.
+                # MXFP8 + HybridEP is SUPPORTED (ACCEL=3): mcore hardcodes fp8_dispatch=False in
+                # fused_a2a (the dispatch/combine stays bf16 -- only an explicit fp8 dispatch would
+                # assert) and the HybridEP dispatch/combine APIs pad internally for fp8 GEMM alignment.
+                # NVIDIA's measured-optimal GB200 preset for this exact backbone pairs them
+                # (QWEN3_VL_30B_A3B_PRETRAIN_CONFIG_GB200_FP8_MX: hybridep + mxfp8). The old SystemExit
+                # here over-read the fused_a2a assert as a blanket exclusion. Warn (unvalidated on OV2)
+                # instead of blocking.
                 if getattr(model.config, "fp8", None) and _flex == "hybridep":
-                    raise SystemExit(
-                        "[ov2 provider] MXFP8 + HybridEP fp8-dispatch is unsupported. Pick ONE: MXFP8 "
-                        "with alltoall (unset OV2_FLEX_BACKEND), OR HybridEP with bf16 (unset fp8 / use "
-                        "MIXED_PRECISION=bf16). See ax_ov2_30b_a3b_gb200.sh ACCEL=1 vs ACCEL=2.")
+                    logger.warning(
+                        "[ov2 provider] MXFP8 + HybridEP (ACCEL=3): dispatch/combine runs bf16 "
+                        "(mcore fp8_dispatch=False), GEMMs run MXFP8. Matches NVIDIA's GB200 FP8_MX "
+                        "preset for Qwen3-VL-30B-A3B, but UNVALIDATED on OV2 -- A/B the loss curve "
+                        "vs ACCEL=1/2 before trusting.")
                 from megatron.bridge.training.flex_dispatcher_backend import apply_flex_dispatcher_backend
                 apply_flex_dispatcher_backend(model.config, _flex)
                 if getattr(model.config, "moe_token_dispatcher_type", None) != "flex":
