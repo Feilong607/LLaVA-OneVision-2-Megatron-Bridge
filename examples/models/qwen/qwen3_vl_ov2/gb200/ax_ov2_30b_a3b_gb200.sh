@@ -4,9 +4,9 @@
 # Run this INSIDE the training container (you are ALREADY in docker on GB200): it only
 # assembles env + run_recipe overrides and execs torchrun -- NO `docker run` wrapper.
 #
-# HARDWARE: auto-detected (A100/A800 sm_80 | H100 sm_90 | GB200 sm_100); override HW=a100|h100|gb200.
-#   Nothing is hardwired to GB200 -- NPROC (4 vs 8), MFU peak, NVLS, and fp8 availability switch per HW,
-#   so the SAME script runs on A-cards too. On Ampere (no fp8) ACCEL=1/MXFP8 auto-falls back to bf16.
+# HARDWARE: GB200 (sm_100) ONLY. This launcher is GB200-specific -- NPROC=4, MFU peak, NVLS, fp8 HW,
+#   and the /datasets paths are hardwired to GB200 (the old A100/H100 auto-detect branches were removed).
+#   All values stay env-overridable.
 #
 # ACCEL MODES (set ACCEL=0|1|2):
 #   0  PHASE-1 baseline  : pure bf16 + alltoall + recompute full/uniform/1 (AIAK date0528 parity, on GB200 too). DEFAULT mode.
@@ -53,22 +53,9 @@ if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
 # NPROC (GPUs/node) is set by the HARDWARE PROFILE block below (GB200=4, A100/H100=8); override via NPROC=.
 
-# --- HARDWARE PROFILE: A100/A800 (sm_80) <-> Hopper/H100 (sm_90) <-> GB200 (sm_100). Auto-detected
-# from compute capability; override with HW=a100|a800|h100|gb200. Sets per-HW DEFAULTS only -- nothing
-# is hardwired to GB200, and every value stays env-overridable. This is what lets the SAME script run
-# (and be tested) on A-cards as well as GB200. ---
-HW="${HW:-auto}"
-case "$HW" in
-  gb200) _cc=100;; h100|hopper) _cc=90;; a100|a800|ampere) _cc=80;;
-  auto) _cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' .')";;
-  *) _cc="";;
-esac
-_cc="${_cc:-80}"
-[[ "$_cc" =~ ^[0-9]+$ ]] || _cc=80    # nvidia-smi may return 'N/A' (MIG/unhealthy); fall back to ampere, don't crash set -u arithmetic
-if   [[ "$_cc" -ge 100 ]]; then HWNAME=gb200;  HW_NPROC=4; PEAK_BF16=2250; PEAK_FP8=4500; HW_NVLS=1; HW_FP8=1
-elif [[ "$_cc" -ge 90  ]]; then HWNAME=hopper; HW_NPROC=8; PEAK_BF16=989;  PEAK_FP8=1979; HW_NVLS=1; HW_FP8=1
-else                            HWNAME=ampere; HW_NPROC=8; PEAK_BF16=312;  PEAK_FP8=312;  HW_NVLS=0; HW_FP8=0
-fi
+# --- HARDWARE: GB200 (sm_100) ONLY. This launcher is GB200-specific; the per-HW values below are
+# hardwired (was auto-detected across A100/H100/GB200). Every value stays env-overridable. ---
+HWNAME=gb200; _cc=100; HW_NPROC=4; PEAK_BF16=2250; PEAK_FP8=4500; HW_NVLS=1; HW_FP8=1
 NPROC="${NPROC:-$HW_NPROC}"        # GB200=4 GPU/node, A100/H100=8 GPU/node
 TP="${TP:-1}"                      # GB200 2-node world=8 needs TP=1 so DP=8 can satisfy EP=8. Use TP=2 only with enough nodes.
 if [[ "$TP" -gt 1 ]]; then SP=true; else SP=false; fi
@@ -83,25 +70,16 @@ if [[ -n "$MOE_CAPACITY_FACTOR" && "$MOE_CAPACITY_FACTOR" != "none" && "$MOE_CAP
   MOE_CAPACITY_ARGS="model.moe_expert_capacity_factor=$MOE_CAPACITY_FACTOR model.moe_pad_expert_input_to_capacity=$MOE_PAD_TO_CAPACITY"
 fi
 
-# --- CARD PATH PROFILE: A100 (/ov2) <-> GB200 (/datasets). Per-card path DEFAULTS; all env-overridable.
-#     The recipe reads OV2_PRETRAIN_ROOT (llava processor+stage_0 ckpt root) and OV2_LLM_HF_30B (Qwen LLM). ---
-if [[ "${HWNAME:-}" == "gb200" || -d /datasets/qwen-models-ea5jyi ]]; then
-  OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/datasets/qwen-models-ea5jyi/Qwen3-30B-A3B-Instruct-2507}"
-  OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"            # bundled processor (GB200)
-  OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"   # bundled processor (GB200, p16m33 recipe)
-  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # GB200: now only the processor root (stage_0 SKIPPED); OV2_HF_PROC_30B set directly above to the bundled auto_model
-  DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"   # /datasets/llava/11May data
-  INIT_CKPT="${INIT_CKPT:-/datasets/llava-ov2-30b-a3b-m9lvdn}"   # trained ckpt to resume (GB200; has iter_0001000 + auto_model)
-  SAVE="${SAVE:-/home/ftan0055/ckpts_video_sft/ov2_30b_a3b_gb200}"     # output dir (GB200, user-set)
-  OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # GB200: mid-train from stage2 -> skip the stage_0 stitch
-else
-  OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/ov2/pretrain_models/Qwen3-30B-A3B-Instruct-2507}"
-  OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/ov2/pretrain_models}"
-  DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/mid_training_seed85m.yaml}"         # /ov2/dataset_sft data (backup yaml)
-  INIT_CKPT="${INIT_CKPT:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_stage2}"
-  SAVE="${SAVE:-/ov2/feilong/gb200/ckpts_video_sft/ov2_30b_a3b_gb200}"
-  OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-0}"   # A100: keep the stage_0 stitch
-fi
+# --- CARD PATHS (GB200). Per-path DEFAULTS; all env-overridable.
+#     The recipe reads OV2_PRETRAIN_ROOT (llava processor root) and OV2_LLM_HF_30B (Qwen LLM). ---
+OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/datasets/qwen-models-ea5jyi/Qwen3-30B-A3B-Instruct-2507}"
+OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"            # bundled processor
+OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"   # bundled processor (p16m33 recipe)
+OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # processor root (stage_0 SKIPPED; OV2_HF_PROC_30B set to the bundled auto_model above)
+DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"   # /datasets/llava/11May data
+INIT_CKPT="${INIT_CKPT:-/datasets/llava-ov2-30b-a3b-m9lvdn}"   # trained ckpt to resume (has iter_0001000 + auto_model)
+SAVE="${SAVE:-/home/ftan0055/ckpts_video_sft/ov2_30b_a3b_gb200}"     # output dir (override with SAVE=)
+OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # mid-train from stage2 -> skip the stage_0 stitch
 OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b/auto_model}"
 # p16m33 processor (patch16/merge3) - platform-aware via OV2_PRETRAIN_ROOT; override directly if GB200 puts it elsewhere.
 OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b_p16_m33/auto_model}"
@@ -118,13 +96,7 @@ export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before s
 # Default ON per user request; set OV2_MIDTRAIN_MUON=0 to revert to the validated AdamW path.
 export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
 ACCEL="${ACCEL:-2}"
-# MXFP8 needs fp8 tensor cores (Hopper sm_90 / Blackwell sm_100). On Ampere (A100/A800) there are none
-# -> auto-fall back to the bf16 baseline so the SAME command is safe to run on A-cards.
-if [[ "$ACCEL" == "1" && "$HW_FP8" != "1" ]]; then
-  echo "[ov2-30b] WARN: ACCEL=1 (MXFP8) needs fp8 HW; HW=$HWNAME (cc=$_cc) has none -> bf16 baseline (ACCEL=0)." >&2
-  ACCEL=0
-fi
-if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (fp8 HW only)
+if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 HW)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-}"                       # MUST stay empty: alltoall (HybridEP+fp8 unsupported)
@@ -165,11 +137,7 @@ else                                    # Phase-1: bf16 baseline -- the DEFAULT 
   # recompute OFF by DEFAULT on GB200 (192GB) -> faster AND numerically IDENTICAL to AIAK full/uniform/1
   # (recompute only trades compute for memory; loss curve unchanged). A100/A800/H100 (80-94GB) keep it ON
   # or they OOM. Either way DISABLE_RECOMPUTE=/OV2_RECOMPUTE_FULL= override it.
-  if [[ "$HWNAME" == "gb200" ]]; then
-    DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"   # GB200: SELECTIVE recompute (core_attn + MoE layer) -- recomputes only the big MoE activations, far cheaper than full/uniform yet fits 192GB. OV2_RECOMPUTE_FULL=1 for AIAK full parity; DISABLE_RECOMPUTE=1 to turn off.
-  else
-    DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-1}"   # A100/A800/H100: recompute ON (AIAK full/uniform/1) to fit 80-94GB
-  fi
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"   # GB200: SELECTIVE recompute (core_attn + MoE layer) -- recomputes only the big MoE activations, far cheaper than full/uniform yet fits 192GB. OV2_RECOMPUTE_FULL=1 for AIAK full parity; DISABLE_RECOMPUTE=1 to turn off.
   FLEX_BACKEND="${FLEX_BACKEND:-}"
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_BF16}"
 fi
