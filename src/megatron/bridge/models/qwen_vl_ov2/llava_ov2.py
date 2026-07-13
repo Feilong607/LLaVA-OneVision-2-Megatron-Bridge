@@ -437,6 +437,7 @@ def build_llava_ov2(
     sequence_parallel: bool = False,
     moe_expert_capacity_factor: Optional[float] = None,
     moe_pad_expert_input_to_capacity: bool = False,
+    fp8_fields: Optional[dict] = None,
     load_llm_weights: bool = False,
     # Per-backbone vision-tower geometry. Defaults == the VERIFIED 4B p16m33 tower, so an
     # un-parameterized call (and the 4B recipe) build the exact same vision_model/adapter as before.
@@ -619,6 +620,24 @@ def build_llava_ov2(
                     getattr(prov, "moe_flex_dispatcher_backend", None),
                     getattr(prov, "moe_hybridep_num_sms", None),
                     getattr(prov, "moe_permute_fusion_into_hybridep", None))
+    # fp8/MXFP8 is a BUILD-TIME choice for the MoE grouped experts: TEGroupedMLP.__init__ builds its
+    # `quantization_padding` submodule only when fp8 is set at build time. OV2's post-build fp8 set
+    # (ov2_provider) reaches the attention/dense GEMMs (forward-read via get_fp8_context) but NOT that
+    # __init__-created submodule -> ACCEL=1 crashed with
+    # `AttributeError: 'TEGroupedMLP' object has no attribute 'quantization_padding'` (experts.py).
+    # Set the runtime-compute fp8 fields on `prov` HERE (before provide()) so __init__ creates it --
+    # exactly like the flex dispatcher / mrope build-time sets above. We do NOT set fp8_param/
+    # fp8_param_gather (those need fp8_model_init the HF-rebuild path skips; params stay bf16 = standard
+    # MXFP8). Escape hatch: OV2_FP8_PREBUILD=0 reverts to the (crashing) post-build-only path.
+    if fp8_fields and fp8_fields.get("fp8") and _os.environ.get("OV2_FP8_PREBUILD", "1") == "1":
+        for _f, _v in fp8_fields.items():
+            if hasattr(prov, _f):
+                setattr(prov, _f, _v)
+        logger.info(
+            "[ov2 build] fp8 wired on PROVIDER (pre-build, enables TEGroupedMLP.quantization_padding): fp8=%s recipe=%s",
+            getattr(prov, "fp8", None),
+            getattr(prov, "fp8_recipe", None),
+        )
     language_model = prov.provide(pre_process=pre_process, post_process=post_process)
     # Interleaved M-RoPE: Qwen3.5 config has mrope_interleaved=True, but stock mcore builds the CHUNKED
     # MultimodalRotaryEmbedding (cat([m[i%3]...])). For text tokens t==h==w so chunked==interleaved, but
