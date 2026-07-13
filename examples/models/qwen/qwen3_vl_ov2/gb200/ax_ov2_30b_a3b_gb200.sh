@@ -101,14 +101,15 @@ if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-}"                       # MUST stay empty: alltoall (HybridEP+fp8 unsupported)
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_FP8}"        # fp8 tensor-core peak (MFU vs fp8)
-  # MXFP8 aligns the token/M dim to 32 (1x32 block scaling). The dense/attention GEMMs are handled by
-  # ov2_step's packed-seq pad (this repo). The 128-expert grouped-GEMM would ALSO need per-expert
-  # M-alignment via moe_router_padding_for_fp8 -- BUT the pinned mcore's TEGroupedMLP has no
-  # `quantization_padding` (that path is newer-mcore only), so OV2_MOE_ROUTER_PAD_FP8=1 crashes with
-  # `AttributeError: 'TEGroupedMLP' object has no attribute 'quantization_padding'` (experts.py:664).
-  # Default OFF so ACCEL=1 RUNS: MXFP8 covers attention, experts stay bf16 (no crash). When the mcore
-  # submodule is advanced to a version that has TEGroupedMLP.quantization_padding, set
-  # OV2_MOE_ROUTER_PAD_FP8=1 to also run the expert FFN in MXFP8.
+  # MXFP8 aligns the token/M dim to 32 (1x32 block scaling) on BOTH GEMM families. Dense/attention is
+  # handled by ov2_step's packed-seq pad (this repo). The 128-expert grouped-GEMM uses TEGroupedMLP's
+  # `quantization_padding` (Fp8Padding) submodule, which mcore creates in TEGroupedMLP.__init__ ONLY when
+  # config.fp8 is set at BUILD time (experts.py: `if self.config.fp8 or self.config.fp4:`). OV2 now wires
+  # fp8 on the LLM provider PRE-build (ov2_provider -> build_llava_ov2 fp8_fields), so the submodule
+  # exists -- this fixed the earlier `AttributeError: 'TEGroupedMLP' object has no attribute
+  # quantization_padding` (experts.py:664). Requires transformer_engine >= 2.14.0 (fused grouped path).
+  # OV2_MOE_ROUTER_PAD_FP8=0 (default): forward uses that expert-side Fp8Padding = experts run MXFP8.
+  # =1: skip_routed_expert_padding() pads on the router side instead (a different, semantics-changing path).
   export OV2_MOE_ROUTER_PAD_FP8="${OV2_MOE_ROUTER_PAD_FP8:-0}"
 elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best on NVL72; allowed elsewhere)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' is NOT a recipe -> ValueError)
