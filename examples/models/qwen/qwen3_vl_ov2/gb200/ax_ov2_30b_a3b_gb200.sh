@@ -129,13 +129,15 @@ if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (fp8 HW onl
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-}"                       # MUST stay empty: alltoall (HybridEP+fp8 unsupported)
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_FP8}"        # fp8 tensor-core peak (MFU vs fp8)
-  # MXFP8 aligns the token/M dim to 32 (1x32 block scaling) in BOTH GEMM families or the GEMM SILENTLY
-  # runs bf16: (1) dense/attention -> ov2_step pads the packed seq automatically (this repo); (2) the
-  # 128-expert grouped-GEMM -> per-expert token counts need moe_router_padding_for_fp8. Default it ON
-  # for ACCEL=1 so the BIGGEST GEMMs (expert FFN) actually run MXFP8 -- without it the experts fell back
-  # to bf16 and MXFP8 gave ~no speedup (see ov2_bench_gb200.sh 'fp8' vs 'fp8_pad'). Override
-  # OV2_MOE_ROUTER_PAD_FP8=0 to A/B the un-padded (expert-bf16) path.
-  export OV2_MOE_ROUTER_PAD_FP8="${OV2_MOE_ROUTER_PAD_FP8:-1}"
+  # MXFP8 aligns the token/M dim to 32 (1x32 block scaling). The dense/attention GEMMs are handled by
+  # ov2_step's packed-seq pad (this repo). The 128-expert grouped-GEMM would ALSO need per-expert
+  # M-alignment via moe_router_padding_for_fp8 -- BUT the pinned mcore's TEGroupedMLP has no
+  # `quantization_padding` (that path is newer-mcore only), so OV2_MOE_ROUTER_PAD_FP8=1 crashes with
+  # `AttributeError: 'TEGroupedMLP' object has no attribute 'quantization_padding'` (experts.py:664).
+  # Default OFF so ACCEL=1 RUNS: MXFP8 covers attention, experts stay bf16 (no crash). When the mcore
+  # submodule is advanced to a version that has TEGroupedMLP.quantization_padding, set
+  # OV2_MOE_ROUTER_PAD_FP8=1 to also run the expert FFN in MXFP8.
+  export OV2_MOE_ROUTER_PAD_FP8="${OV2_MOE_ROUTER_PAD_FP8:-0}"
 elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best on NVL72; allowed elsewhere)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' is NOT a recipe -> ValueError)
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
