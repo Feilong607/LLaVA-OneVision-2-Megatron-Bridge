@@ -177,6 +177,33 @@ def forward_step(
             image_grid_thw.prod(dim=-1).sum().item()
         )
 
+    if return_schedule_plan:
+        # EP a2a comm-overlap (combined-1F1B, OV2_EP_OVERLAP=1): mcore's combined_1f1b calls this
+        # step with the UNWRAPPED LlavaOnevision2 (the module exposing build_schedule_plan) and
+        # expects (schedule_plan, loss_function) back -- mirrors vlm_step.py. The model runs the
+        # multimodal prefix eagerly and delegates the plan to its inner GPTModel (see
+        # LlavaOnevision2.build_schedule_plan). Never taken on the plain path: the runtime-config
+        # flag gates the combined-1F1B schedule itself (wired in ov2_provider.provide()).
+        from megatron.core.utils import get_model_config
+        assert get_model_config(model).overlap_moe_expert_parallel_comm, (
+            "return_schedule_plan=True requires overlap_moe_expert_parallel_comm on the runtime "
+            "LLM config (set OV2_EP_OVERLAP=1; wired in ov2_provider.provide())"
+        )
+        schedule_plan = model.build_schedule_plan(
+            images=pixel_values,
+            image_grid_thw=image_grid_thw,
+            input_ids=tokens,
+            position_ids=None,        # LlavaOnevision2 / Qwen3 LLM compute positions internally
+            attention_mask=attention_mask,
+            labels=labels,            # PRE-SHIFTED by the task encoder; mcore does not shift
+            loss_mask=loss_mask,
+            patch_positions=patch_positions,
+            packed_seq_params=packed_seq_params,   # THD block-diagonal when offline-packed (else None)
+        )
+        check_nan = state.cfg.rerun_state_machine.check_for_nan_in_loss
+        check_spiky = state.cfg.rerun_state_machine.check_for_spiky_loss
+        return schedule_plan, _create_loss_function(loss_mask, check_nan, check_spiky)
+
     output_tensor = model(
         images=pixel_values,
         image_grid_thw=image_grid_thw,
