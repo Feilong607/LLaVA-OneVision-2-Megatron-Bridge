@@ -530,6 +530,12 @@ def build_llava_ov2(
             prov.moe_shared_expert_overlap = _shared
         if hasattr(prov, "moe_router_padding_for_fp8"):
             prov.moe_router_padding_for_fp8 = _os_pp.environ.get("OV2_MOE_ROUTER_PAD_FP8", "0") == "1"
+        logger.info(
+            "[ov2] MoE perf knobs wired on provider: shared_expert_overlap=%s moe_router_padding_for_fp8=%s "
+            "(env OV2_MOE_SHARED_EXPERT_OVERLAP / OV2_MOE_ROUTER_PAD_FP8)",
+            getattr(prov, "moe_shared_expert_overlap", None),
+            getattr(prov, "moe_router_padding_for_fp8", None),
+        )
     prov.share_embeddings_and_output_weights = False  # OV2 ckpt has a separate output_layer.weight
     # AIAK sets scatter_embedding_sequence_parallel=False: the VLM does its own SP scatter on the
     # fused (text+image) embeddings (see forward step 3), so the LLM embedding must NOT pre-scatter.
@@ -656,6 +662,9 @@ def build_llava_ov2(
     # cuts launch overhead on the routing path (48 MoE layers x microbatches). No change unless =1.
     if hasattr(language_model.config, "moe_router_fusion"):
         language_model.config.moe_router_fusion = _os.environ.get("OV2_MOE_ROUTER_FUSION", "0") == "1"
+        logger.info(
+            "[ov2] moe_router_fusion=%s (env OV2_MOE_ROUTER_FUSION)", language_model.config.moe_router_fusion
+        )
     # NOTE: OV2_MOE_SHARED_EXPERT_OVERLAP (moe_shared_expert_overlap) and OV2_MOE_ROUTER_PAD_FP8
     # (moe_router_padding_for_fp8) are now set on `prov` BEFORE prov.provide() (see the num_moe_experts
     # block above) -- they are init-cached / __post_init__-derived, so a post-build set here would be a
