@@ -6,11 +6,13 @@
 # HARDWARE: GB200 (sm_100) ONLY -- NPROC=4, MFU peak, NVLS, fp8 HW, /datasets paths hardwired.
 #   All values stay env-overridable.
 #
-# ACCEL MODES (ACCEL=0|1|2; default 2):
+# ACCEL MODES (ACCEL=0|1|2|3; default 2):
 #   0  bf16 baseline + alltoall + full recompute (AIAK parity)
 #   1  MXFP8 expert/matmul GEMMs + alltoall dispatch
 #   2  bf16 + HybridEP flex dispatcher (NVL72 topology-aware)
-#   (MXFP8 + HybridEP-fp8-dispatch is unsupported; the provider errors if you force both.)
+#   3  MXFP8 + HybridEP -- NVIDIA's measured-optimal GB200 combo (dispatch stays bf16; mcore
+#      hardcodes fp8_dispatch=False and HybridEP pads internally for fp8 GEMM alignment).
+#      UNVALIDATED on OV2 -- A/B loss vs 1/2 before trusting.
 # =============================================================================
 set -euo pipefail
 # REPO: env override wins; else auto-detected below from this script's location. Don't hardcode a path.
@@ -68,7 +70,7 @@ ACCEL="${ACCEL:-2}"
 if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 HW)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
-  FLEX_BACKEND="${FLEX_BACKEND:-}"                       # MUST stay empty: alltoall (HybridEP+fp8 unsupported)
+  FLEX_BACKEND="${FLEX_BACKEND:-}"                       # default alltoall (validated fp8 lane); ACCEL=3 for MXFP8+HybridEP
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_FP8}"        # fp8 tensor-core peak
   # MXFP8 aligns the token/M dim to 32 (1x32 block scaling). Dense/attention: ov2_step's packed-seq pad.
   # Grouped-GEMM experts use TEGroupedMLP's `quantization_padding` submodule, created in __init__ ONLY when
@@ -76,21 +78,21 @@ if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 
   # Requires transformer_engine >= 2.14.0 (fused grouped path).
   # OV2_MOE_ROUTER_PAD_FP8=0 (default): experts run MXFP8. =1: pad router-side instead (different path).
   export OV2_MOE_ROUTER_PAD_FP8="${OV2_MOE_ROUTER_PAD_FP8:-0}"
-elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best on NVL72)
+elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best bf16 config on NVL72)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' -> ValueError)
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_BF16}"
-  # HybridEP runtime requirements on GB200 (both needed or the first nvshmem kernel dies). Env-gated. ---
-  #  (1) GB200 nvshmem symmetric-heap uses CUDA VMM which is broken here -> disable it.
-  export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"
-  #  (2) HybridEP JIT needs MAX_NUM_OF_TOKENS_PER_RANK % 64 == 0 and identical across EP ranks. Derived
-  #      from SEQ_LEN (round up to 64) so the cap tracks the seq you run. An explicit override still wins.
-  _hep_cap=$(( (SEQ_LEN + 63) / 64 * 64 ))
-  export HYBRID_EP_MAX_TOKENS_PER_RANK="${HYBRID_EP_MAX_TOKENS_PER_RANK:-$_hep_cap}"
-  #  (2b) GUARD: a cap below round64(SEQ_LEN) -> EP ranks pad to different targets -> allgather-timeout hang.
-  (( HYBRID_EP_MAX_TOKENS_PER_RANK >= _hep_cap )) || {
-    echo "[ov2-30b] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK < round64(SEQ_LEN=$SEQ_LEN)=$_hep_cap -> EP ranks would pad to different targets -> HybridEP allgather-timeout hang. Set it >= $_hep_cap, or lower OV2_SEQ_LEN." >&2; exit 1; }
+elif [[ "$ACCEL" == "3" ]]; then        # Phase-2c: MXFP8 + HybridEP -- NVIDIA's measured-optimal GB200 combo
+  # (QWEN3_VL_30B_A3B_PRETRAIN_CONFIG_GB200_FP8_MX pairs hybridep with mxfp8). The dispatch/combine
+  # itself stays bf16 -- mcore hardcodes fp8_dispatch=False (fused_a2a.py) and HybridEP pads
+  # internally for fp8 GEMM alignment -- only the GEMMs run MXFP8. UNVALIDATED on OV2: A/B loss
+  # vs ACCEL=1/2 before trusting.
+  MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+  FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
+  MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_FP8}"
+  export OV2_MOE_ROUTER_PAD_FP8="${OV2_MOE_ROUTER_PAD_FP8:-0}"   # hybridep pads internally (skip_routed_expert_padding)
 else                                    # Phase-1: bf16 baseline
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' -> ValueError)
   # recompute OFF by default on GB200 (192GB) -> faster AND numerically identical to AIAK full/uniform/1.
@@ -102,6 +104,27 @@ OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-0}"   # selective MoE-layer recompute wh
 export OV2_RECOMPUTE_FULL OV2_RECOMPUTE_MOE MFU_PEAK_TFLOPS
 # OV2_FLEX_BACKEND is read by ov2_provider.provide() to wire the runtime dispatcher (the cfg.model field is dead).
 export OV2_FLEX_BACKEND="$FLEX_BACKEND"
+
+# --- HybridEP runtime gates + tuning (keyed on the DISPATCHER, not the ACCEL mode, so ACCEL=2 and
+# ACCEL=3 share them; all env-overridable). Both gates are needed or the first nvshmem kernel dies. ---
+if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
+  #  (1) GB200 nvshmem symmetric-heap uses CUDA VMM which is broken here -> disable it.
+  export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"
+  #  (2) HybridEP JIT needs MAX_NUM_OF_TOKENS_PER_RANK % 64 == 0 and identical across EP ranks. Derived
+  #      from SEQ_LEN (round up to 64) so the cap tracks the seq you run. An explicit override still wins.
+  _hep_cap=$(( (SEQ_LEN + 63) / 64 * 64 ))
+  export HYBRID_EP_MAX_TOKENS_PER_RANK="${HYBRID_EP_MAX_TOKENS_PER_RANK:-$_hep_cap}"
+  #  (2b) GUARD: a cap below round64(SEQ_LEN) -> EP ranks pad to different targets -> allgather-timeout hang.
+  (( HYBRID_EP_MAX_TOKENS_PER_RANK >= _hep_cap )) || {
+    echo "[ov2-30b] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK < round64(SEQ_LEN=$SEQ_LEN)=$_hep_cap -> EP ranks would pad to different targets -> HybridEP allgather-timeout hang. Set it >= $_hep_cap, or lower OV2_SEQ_LEN." >&2; exit 1; }
+  #  (3) comm-kernel SM count: NVIDIA's GB200 perf preset forces 32 for every hybridep run
+  #      (scripts/performance/utils/overrides.py; their TODO says lower it only when overlapping
+  #      HybridEP with compute). Was unset (internal default); sweep 16/24/32 via OV2_HYBRIDEP_NUM_SMS.
+  export OV2_HYBRIDEP_NUM_SMS="${OV2_HYBRIDEP_NUM_SMS:-32}"
+  #  (4) unfused-combine perf-regression workaround from NVIDIA's perf plugin (drop after
+  #      Megatron-LM PR #4089 lands in our pinned mcore).
+  export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API="${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-128}"
+fi
 
 # --- rendezvous: auto-detect master/worker (no hardcoded IPs -> survives pod reschedules). Priority:
 #   (1) operator-injected env (PyTorchJob/Run:AI PET_* + MASTER_ADDR/WORLD_SIZE); (2) manual LIST_IP; (3) single-node.
@@ -200,7 +223,7 @@ mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 # --- HybridEP topology (ACCEL=2 only): # of EP ranks (of EP=8) sharing one NVLink domain. mcore asserts
 # EP(8) % value == 0, so it must DIVIDE 8. Full NVL72 rack -> 8; EP8 split 4+4 across two domains -> 4.
 # A wrong value -> mcore assert / perf-correctness loss. ---
-if [[ "$ACCEL" == "2" ]]; then
+if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}"
   (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
     echo "ERROR: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8." >&2; exit 1; }
