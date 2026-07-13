@@ -377,6 +377,12 @@ def _ov2_common(
         freeze_vision_model = __import__("os").environ.get("OV2_FREEZE_VISION") == "1"   # TRAIN vision (OV2_FREEZE_VISION=1 freezes it for ablation)
         freeze_language_model = (stage != "midtrain") or __import__("os").environ.get("OV2_FREEZE_LLM") == "1"  # midtrain unfreezes the LLM; stage2 keeps it frozen
 
+    logger.info(
+        "[ov2] freeze: vision=%s language=%s (stage=%s; env OV2_FREEZE_VISION / OV2_FREEZE_LLM)",
+        freeze_vision_model,
+        freeze_language_model,
+        stage,
+    )
     # OV2_SKIP_BASE_STITCH=1 (set by the GB200 launcher): mid-train resumes straight from a FULL
     # stage-2 ckpt, so skip the stage_0 base stitch entirely (no stage_0 needed on the box). SAFE-
     # GUARDED: a real OV2_INIT_CKPT must exist, else building on random weights -> refuse (the exact
@@ -644,8 +650,14 @@ def _ov2_common(
             overlap_moe_expert_parallel_comm=True,
             delay_wgrad_compute=(os.environ.get("OV2_EP_DELAY_WGRAD", "0") == "1"),
         )
+        logger.info(
+            "[ov2] EP comm-overlap ON: overlap_moe_expert_parallel_comm=True delay_wgrad=%s "
+            "(env OV2_EP_OVERLAP=1; needs CUDA_DEVICE_MAX_CONNECTIONS>=32; re-validate 2-node grad-norm)",
+            cfg.comm_overlap.delay_wgrad_compute,
+        )
     else:
         cfg.comm_overlap = None
+        logger.info("[ov2] EP comm-overlap OFF (set OV2_EP_OVERLAP=1 to enable)")
     # CUDA graphs OFF (match AIAK, which trains without them). With the OV2 MIMO model + CUDA
     # graphs, the captured step bypasses the standard Python grad-finalize and mis-scales the
     # adapter gradient across NODES (2-node grad norm ~10x single-node / AIAK ~1.3). Disabling

@@ -13,6 +13,7 @@ Assumes CP = 1 (LlavaOnevision2.forward asserts CP==1). Offline-packed OV2 sampl
 THD block-diagonal attention via cu_seqlens; unlike qwen3_vl_step there is no CP split here.
 """
 import logging
+import math
 import os
 from typing import Iterable
 
@@ -45,6 +46,36 @@ def get_batch(data_iterator: Iterable):
     return tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw, cu_seqlens, patch_positions
 
 
+def _ov2_fp8_pad_mult(state) -> int:
+    """Token-dim alignment the packed sequence needs so TE fp8/MXFP8 GEMMs stay engaged.
+
+    Returns 1 for bf16 runs (ACCEL=0/2) so the pad block is byte-identical to the TP-only pad.
+    Returns 32 (override: OV2_FP8_PAD_MULT) for fp8/fp4 runs (ACCEL=1, mixed_precision.fp8 set):
+    the TE crash assert_dim_for_fp8_exec only needs the token dim %8 (last dim %16), but MXFP8 uses
+    1x32 block scaling and in the weight-gradient GEMM the token dim is the contraction dim, so
+    MXFP8Quantizer.is_quantizable requires the token dim %32 or the GEMM silently falls back to bf16.
+    OV2_FP8_SEQ_PAD=1/0 force-enables/disables regardless of the resolved precision.
+    """
+    _ovr = os.environ.get("OV2_FP8_SEQ_PAD")
+    if _ovr is not None:
+        _on = _ovr == "1"
+    else:
+        mp = getattr(getattr(state, "cfg", None), "mixed_precision", None)
+        _lp = getattr(mp, "fp8", None) or getattr(mp, "fp4", None)  # resolved MixedPrecisionConfig
+        if _lp is not None:
+            _on = bool(_lp)
+        elif isinstance(mp, str):  # defensive: pre-resolution registry key (e.g. MIMO path)
+            _on = ("fp8" in mp) or ("fp4" in mp)
+        else:
+            _on = False
+    if not _on:
+        return 1
+    try:
+        return max(1, int(os.environ.get("OV2_FP8_PAD_MULT", "32")))
+    except ValueError:
+        return 32
+
+
 def forward_step(
     state: GlobalState,
     data_iterator: Iterable,
@@ -73,8 +104,14 @@ def forward_step(
     if tokens is not None:
         from megatron.core import parallel_state
         _tp = parallel_state.get_tensor_model_parallel_world_size()
-        if _tp > 1 and tokens.shape[1] % _tp:
-            _pad = _tp - tokens.shape[1] % _tp
+        # Base alignment: SP scatter needs a TP multiple. FP8/MXFP8 (ACCEL=1) ALSO needs the packed
+        # token dim aligned or TE's fp8 GEMMs fail assert_dim_for_fp8_exec (crash); and for MXFP8's
+        # 1x32 block scaling the wgrad GEMM (token dim = contraction) silently drops to bf16 unless
+        # the token dim is a multiple of 32. _ov2_fp8_pad_mult(state) returns 1 for bf16 (ACCEL=0/2)
+        # -> lcm(_tp, 1) == _tp -> byte-identical to the old TP-only pad; 32 for fp8/fp4 (ACCEL=1).
+        _pad_mult = math.lcm(_tp, _ov2_fp8_pad_mult(state))
+        if _pad_mult > 1 and tokens.shape[1] % _pad_mult:
+            _pad = _pad_mult - tokens.shape[1] % _pad_mult
             tokens = torch.nn.functional.pad(tokens, (0, _pad), value=0)
             if labels is not None:    labels = torch.nn.functional.pad(labels, (0, _pad), value=-100)
             if loss_mask is not None: loss_mask = torch.nn.functional.pad(loss_mask, (0, _pad), value=0)
