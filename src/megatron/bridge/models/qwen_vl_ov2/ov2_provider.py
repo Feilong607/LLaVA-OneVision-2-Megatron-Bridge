@@ -185,6 +185,25 @@ class LlavaOnevision2Provider(GPTModelProvider):
             sequence_parallel=bool(getattr(self, "sequence_parallel", False)),
             moe_expert_capacity_factor=getattr(self, "moe_expert_capacity_factor", None),
             moe_pad_expert_input_to_capacity=bool(getattr(self, "moe_pad_expert_input_to_capacity", False)),
+            # fp8/MXFP8 must be set on the inner LLM provider BEFORE build so the MoE grouped experts
+            # (TEGroupedMLP.__init__) create their `quantization_padding` submodule (else ACCEL=1 crashes
+            # in the expert forward). Pass the runtime-compute fp8 fields; build_llava_ov2 applies them
+            # pre-build. Only when fp8 is actually on (bf16 ACCEL=0/2 -> None -> no-op). Excludes
+            # fp8_param/fp8_param_gather (kept bf16, same as the post-build set below).
+            fp8_fields=(
+                {
+                    _f: getattr(self, _f)
+                    for _f in (
+                        "fp8", "fp8_recipe", "fp8_margin", "fp8_interval", "fp8_amax_history_len",
+                        "fp8_amax_compute_algo", "fp8_wgrad", "fp8_output_proj",
+                        "fp8_dot_product_attention", "fp8_multi_head_attention",
+                        "first_last_layers_bf16", "num_layers_at_start_in_bf16", "num_layers_at_end_in_bf16",
+                    )
+                    if hasattr(self, _f)
+                }
+                if getattr(self, "fp8", None)
+                else None
+            ),
             load_llm_weights=self.load_llm_weights,
             image_token_id=getattr(self, "image_token_id", 151655),
             adapter_init_scale=getattr(self, "adapter_init_scale", 1.0),
