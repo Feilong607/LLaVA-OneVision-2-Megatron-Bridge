@@ -153,8 +153,8 @@ if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   #      hybrid_ep_backend.cuh's cudaMemsetAsync (observed on GB200). Default = UNSET = deep_ep's own
   #      internal values (the known-good path that ran at ~4300 tok/s). Sweep only when validated:
   #      OV2_HYBRIDEP_NUM_SMS=16|24|32  and/or  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=128.
-  [[ -n "${OV2_HYBRIDEP_NUM_SMS:-}" ]] && export OV2_HYBRIDEP_NUM_SMS
-  [[ -n "${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-}" ]] && export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API
+  [[ -n "${OV2_HYBRIDEP_NUM_SMS:-}" ]] && { export OV2_HYBRIDEP_NUM_SMS; echo "[ov2-30b] WARN: OV2_HYBRIDEP_NUM_SMS=$OV2_HYBRIDEP_NUM_SMS is set (non-default). It steals SMs from the expert GEMMs; if this is a leftover shell export, 'unset OV2_HYBRIDEP_NUM_SMS' to restore deep_ep's default." >&2; }
+  [[ -n "${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-}" ]] && { export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API; echo "[ov2-30b] WARN: NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=$NUM_OF_TOKENS_PER_CHUNK_COMBINE_API is set (unlanded-PR-4089 workaround; can mis-size combine buffers on the pinned deep_ep -> memory/throughput hit). 'unset NUM_OF_TOKENS_PER_CHUNK_COMBINE_API' unless validated." >&2; }
 fi
 
 # --- rendezvous: auto-detect master/worker (no hardcoded IPs -> survives pod reschedules). Priority:
@@ -280,9 +280,17 @@ mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 # NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4 so deep_ep uses the intra-machine NVLink + inter-machine IB
 # path. ---
 if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
+  _dom_ext="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-}"   # capture an EXTERNAL (shell-exported) override
   export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}"
   (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
     echo "[ov2-30b] FATAL: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8 (use 1/2/4/8)." >&2; exit 1; }
+  # STALE-ENV GUARD: a shell-exported value < 8 beats the default and forces deep_ep's 2-node internode
+  # path (num_nodes=EP/value>1) -> extra RDMA symmetric buffers (OOM) + IB hop instead of pure NVLink
+  # (throughput drop). On this NVL72 all 8 EP ranks are ONE domain (deep_ep detects 8). Warn loudly so a
+  # leftover `export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4` from debugging is obvious in the log.
+  if [[ -n "$_dom_ext" && "$_dom_ext" != "8" ]]; then
+    echo "[ov2-30b] WARN: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$_dom_ext is set in the SHELL (overrides default 8). On this NVL72 all 8 EP ranks are one NVLink domain -> a value <8 forces deep_ep's internode-RDMA path = extra buffers (OOM) + slower IB hop. Run 'unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN' unless your ranks are genuinely split across NVLink domains." >&2
+  fi
 fi
 # --- HybridEP fabric diagnostic (once per node): echo the resolved HybridEP env so an illegal-address /
 # allgather-timeout is debuggable straight from the log. Expected values: cuda_vmm=off,
