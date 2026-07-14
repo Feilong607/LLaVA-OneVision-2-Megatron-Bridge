@@ -201,10 +201,14 @@ DP=$(( WORLD / TP ))
 (( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs DP=$DP (WORLD=$WORLD / TP=$TP) to be a multiple of 8 and >=8. For 2 GB200 nodes (WORLD=8) keep TP=1; TP=2 needs >=4 GB200 nodes." >&2; exit 1; }
 
 # --- in-container env ---
-# OV2_EXTRA_PYLIBS: extra import dir(s) for OFFLINE-extracted packages that are not pip-installed in the
-# container (GB200 has no network). Set it to a dir holding unpacked wheels -- e.g. emerging_optimizers
-# for distributed Muon:  OV2_EXTRA_PYLIBS=/path/to/pylibs  (no username path is committed here). Appended
-# AFTER the repo paths so the fork's megatron/bridge always win.
+# Offline packages (GB200 has no network) that are not pip-installed -- e.g. emerging_optimizers for
+# distributed Muon. Two ways to make them importable, both committed WITHOUT any username/env path:
+#   1. AUTO: drop or symlink the unpacked wheels into "$REPO/pylibs" -> picked up on EVERY node (it is
+#      under the auto-detected repo root, so no env var, no per-pod setup). One-time on the shared FS:
+#      ln -s /your/pylibs "$REPO/pylibs"
+#   2. ENV: OV2_EXTRA_PYLIBS=/abs/path/to/pylibs  (set it in the job/Run:AI env so all pods inherit it).
+# Both are folded in AFTER the repo paths so the fork's megatron/bridge always win.
+[[ -d "$REPO/pylibs" ]] && OV2_EXTRA_PYLIBS="$REPO/pylibs${OV2_EXTRA_PYLIBS:+:$OV2_EXTRA_PYLIBS}"
 export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${OV2_EXTRA_PYLIBS:+:$OV2_EXTRA_PYLIBS}${PYTHONPATH:+:$PYTHONPATH}"  # _verify_stubs FIRST: sitecustomize stubs must load before transformers->boto3
 # HybridEP (ACCEL=2) needs deep_ep, whose .so requires a symbol present ONLY in the pip nvidia-nvshmem lib
 # (not CUDA's bundled libnvshmem_host.so.3). Prepend the pip nvshmem ONLY when it exists (no-op otherwise).
