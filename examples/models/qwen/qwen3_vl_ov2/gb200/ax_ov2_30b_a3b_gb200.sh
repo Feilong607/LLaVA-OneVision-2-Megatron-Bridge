@@ -265,24 +265,23 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/ov2_triton_cache}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/ov2_inductor_cache}"
 mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 
-# --- HybridEP topology (# of EP ranks of the EP=8 group sharing one NVLink domain). This MUST match the
-# real fabric: one GB200 machine here is 4 cards = one 4-GPU NVLink domain, and EP=8 spans 2 machines, so
-# 4 EP ranks share each machine's NVLink domain (the other 4 reach over IB). => DEFAULT = GPUs-per-machine
-# (NPROC), capped at EP=8. A value of 8 (whole EP group as one domain) is only correct if the 2 machines
-# are ONE NVL72 rack; on separate 4-GPU machines it makes deep_ep memset a peer buffer on the OTHER machine
-# that is NOT NVLink-mapped -> cudaErrorIllegalAddress at hybrid_ep_backend.cuh cudaMemsetAsync
-# (preprocessing_tmp) -- exactly the observed ACCEL=2 crash. mcore asserts EP(8) % value == 0. Override
-# =8 only on a verified single NVL72 rack (gb200_check.sh topo shows NV* across all 8). ---
+# --- HybridEP topology (# of EP ranks of the EP=8 group sharing one NVLink domain). DEFAULT 8 -- the
+# value the verified-good ACCEL=2 run (commit 63e1085) used, i.e. the 2 GB200 machines behave as ONE
+# NVLink domain (NVL72 MNNVL: NCCL_MNNVL_ENABLE=1 / NVLINK_DOMAIN_SIZE=72 above). NOTE: the first-dispatch
+# crash was NOT this value -- it was the missing fused_a2a.py THD-padding patch (gate (0) above); domain is
+# a separate, transport-only axis. mcore asserts EP(8) % value == 0. If your 2 machines are genuinely
+# SEPARATE 4-GPU NVLink domains (verify: gb200_check.sh topo does NOT show NV* across all 8), override
+# NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4 so deep_ep uses the intra-machine NVLink + inter-machine IB
+# path. ---
 if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
-  _hep_domain=$(( NPROC < 8 ? NPROC : 8 ))   # GPUs per machine = NVLink domain; capped at EP=8
-  export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-$_hep_domain}"
+  export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}"
   (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
-    echo "[ov2-30b] FATAL: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8 (use 1/2/4/8). GPUs/machine (NPROC)=$NPROC." >&2; exit 1; }
+    echo "[ov2-30b] FATAL: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8 (use 1/2/4/8)." >&2; exit 1; }
 fi
 # --- HybridEP fabric diagnostic (once per node): echo the resolved HybridEP env so an illegal-address /
-# allgather-timeout is debuggable straight from the log. Expected values on this cluster (4-GPU machines):
-# cuda_vmm=off, ranks_per_nvlink_domain=4 (= GPUs/machine). A ranks_per_nvlink_domain of 8 (or "auto") on
-# separate 4-GPU machines is the usual ACCEL=2 crash cause. ---
+# allgather-timeout is debuggable straight from the log. Expected values: cuda_vmm=off,
+# ranks_per_nvlink_domain=8 (matches 63e1085; set =4 if the 2 machines are separate NVLink domains). The
+# THD-padding patch (gate 0) is the crash fix; this line just aids post-patch transport debugging. ---
 if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   _imex="absent"; compgen -G "/dev/nvidia-caps-imex-channels/*" >/dev/null 2>&1 && _imex="present"
   _pipnvsh="absent"; [[ -e "$_nvshmem_lib/libnvshmem_host.so.3" ]] && _pipnvsh="present"
