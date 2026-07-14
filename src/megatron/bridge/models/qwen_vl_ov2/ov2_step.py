@@ -163,7 +163,11 @@ def forward_step(
     if tokens is not None:
         mbs = tokens.shape[0]
         seq_len = tokens.shape[1]
-        if cu_seqlens is not None:
+        # Block-diagonal O(sum Li^2) accounting ONLY when the pack actually ran block-diagonal (the same
+        # condition that built packed_seq_params above). Under OV2_PACK_FULL_CAUSAL=1 the pack runs as one
+        # full-causal sequence O((sum Li)^2), so cu_seqlens (still non-None from the batch) must NOT drive
+        # the per-segment sum -> fall through to the mbs*seq_len branch, else MODEL_TFLOP/s underreports.
+        if cu_seqlens is not None and os.environ.get("OV2_PACK_FULL_CAUSAL", "0") != "1":
             _cu_stats = cu_seqlens.flatten()
             _sl = (_cu_stats[1:] - _cu_stats[:-1]).to(torch.float64)
             state._flops_seqlen_sum = getattr(state, "_flops_seqlen_sum", 0) + int(_sl.sum().item())

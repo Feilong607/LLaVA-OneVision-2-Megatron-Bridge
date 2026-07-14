@@ -128,6 +128,11 @@ def _vision_config_from(
         ("moe_router_topk", None),
         ("qk_layernorm", False),
         ("attention_output_gate", False),
+        # fp8/MXFP8 is deep-copied from the LLM cfg on ACCEL=1/3 but the fp8 plan is scoped to the LLM
+        # (params-stay-bf16). Clear it so the (frozen) vision tower keeps bf16 numerics -- else MXFP8
+        # would silently quantize the frozen vision features feeding the adapter during alignment.
+        ("fp8", None),
+        ("fp8_recipe", None),
     ):
         if hasattr(vc, f):
             setattr(vc, f, d)
@@ -152,7 +157,10 @@ def _adapter_config_from(llm_cfg):
     for _f, _d in (("num_moe_experts", None), ("moe_router_topk", None),
                    ("expert_model_parallel_size", 1), ("expert_tensor_parallel_size", 1),
                    ("tensor_model_parallel_size", 1), ("sequence_parallel", False),
-                   ("pipeline_model_parallel_size", 1), ("context_parallel_size", 1)):
+                   ("pipeline_model_parallel_size", 1), ("context_parallel_size", 1),
+                   # Clear the deep-copied fp8/MXFP8 (see _vision_config_from): the fp8 plan is the LLM's;
+                   # keep the small dense m33 adapter in bf16 rather than silently MXFP8 on ACCEL=1/3.
+                   ("fp8", None), ("fp8_recipe", None)):
         if hasattr(ac, _f):
             setattr(ac, _f, _d)
     return ac
@@ -684,7 +692,16 @@ def build_llava_ov2(
         apply_flex_dispatcher_backend(prov, _flex_backend)
         _hnsms = _os.environ.get("OV2_HYBRIDEP_NUM_SMS")
         if _hnsms:
-            prov.moe_hybridep_num_sms = int(_hnsms)
+            # Guard: only a positive int is applied ("0" -> 0-SM comm kernels hang; non-numeric ->
+            # ValueError at build). Mirrors the post-build guard in ov2_provider.provide().
+            try:
+                _hn = int(_hnsms)
+            except ValueError:
+                _hn = 0
+            if _hn > 0:
+                prov.moe_hybridep_num_sms = _hn
+            else:
+                logger.warning("[ov2 build] ignoring OV2_HYBRIDEP_NUM_SMS=%r (need a positive int)", _hnsms)
         if _os.environ.get("OV2_HYBRIDEP_PERMUTE_FUSION", "0") == "1":
             prov.moe_permute_fusion_into_hybridep = True
         logger.info("[ov2 build] flex dispatcher wired on PROVIDER (pre-build): type=%s backend=%s num_sms=%s permute_into=%s",

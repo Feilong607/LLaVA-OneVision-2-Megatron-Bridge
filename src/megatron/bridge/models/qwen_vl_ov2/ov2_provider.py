@@ -86,7 +86,8 @@ def _init_ov2_adapter(adapter) -> None:
     if _env is not None and _env.strip() != "":
         _sc = float(_env)                                            # explicit env override wins
     else:
-        _sc = float(getattr(cfg, "adapter_init_scale", 1.0) or 1.0)  # per-backbone default (qwen3.5=0.0184; 1.0=no-op)
+        _cfg_sc = getattr(cfg, "adapter_init_scale", None)           # per-backbone default (qwen3.5=0.0184; 1.0=no-op)
+        _sc = float(_cfg_sc) if _cfg_sc is not None else 1.0          # explicit None check: a configured 0.0 must survive (not be `or 1.0`-coerced)
     if _sc != 1.0:
         with torch.no_grad():
             for n, p in adapter.named_parameters():
@@ -332,9 +333,20 @@ class LlavaOnevision2Provider(GPTModelProvider):
                 # DeepSeek-V3 GB200 ref uses 32, gpt_oss 128 -> SWEEP it (16/24/32). OV2_HYBRIDEP_PERMUTE_FUSION=1:
                 # fuse permute/unpermute INTO the HybridEP dispatch/combine kernels -- the REAL HybridEP permute
                 # fusion (OV2_MOE_PERMUTE_FUSION / moe_permute_fusion is a NO-OP on the flex/hybridep lane).
+                # Guard the parse: a non-empty-but-non-positive/non-numeric OV2_HYBRIDEP_NUM_SMS
+                # (e.g. "0" -> 0-SM comm kernels hang; "auto"/"32 " -> ValueError at build) must not
+                # silently mis-set or crash. Only a positive int is applied; anything else is ignored
+                # (falls back to the mcore internal default) with a warning.
                 _num_sms = os.environ.get("OV2_HYBRIDEP_NUM_SMS")
                 if _num_sms:
-                    model.config.moe_hybridep_num_sms = int(_num_sms)
+                    try:
+                        _n = int(_num_sms)
+                    except ValueError:
+                        _n = 0
+                    if _n > 0:
+                        model.config.moe_hybridep_num_sms = _n
+                    else:
+                        logger.warning("[ov2 provider] ignoring OV2_HYBRIDEP_NUM_SMS=%r (need a positive int)", _num_sms)
                 if os.environ.get("OV2_HYBRIDEP_PERMUTE_FUSION", "0") == "1":
                     model.config.moe_permute_fusion_into_hybridep = True
                 logger.info("[ov2 provider] hybridep tuning: num_sms=%s permute_into_hybridep=%s",
@@ -354,12 +366,24 @@ class LlavaOnevision2Provider(GPTModelProvider):
             # build_llava_ov2 sets recompute on the INNER config from recompute_activations +
             # OV2_RECOMPUTE_FULL, so the runtime config can be full-recompute even when the provider
             # passed setup()'s recompute_granularity check. Full recompute breaks combined-1F1B.
-            if getattr(model.config, "recompute_granularity", None) == "full":
+            # mcore forbids full recompute, recompute_method/num_layers, AND "moe" in recompute_modules
+            # under overlap (transformer_config.py validate_config asserts). Those run at BUILD time when
+            # overlap is still False (OV2 sets it post-build here), so they are BYPASSED -> replicate them.
+            _rmods = getattr(model.config, "recompute_modules", None) or []
+            _bad_recompute = (
+                getattr(model.config, "recompute_granularity", None) == "full"
+                or getattr(model.config, "recompute_method", None) is not None
+                or getattr(model.config, "recompute_num_layers", None) is not None
+                or "moe" in _rmods
+            )
+            if _bad_recompute:
                 raise SystemExit(
-                    "[ov2 provider] OV2_EP_OVERLAP=1 is incompatible with FULL activation recompute "
-                    "on the runtime LLM config (combined-1F1B cannot re-schedule a full-recompute "
-                    "layer). Run with DISABLE_RECOMPUTE=1 (or selective recompute), or unset "
-                    "OV2_EP_OVERLAP.")
+                    "[ov2 provider] OV2_EP_OVERLAP=1 is incompatible with this recompute config "
+                    f"(granularity={getattr(model.config, 'recompute_granularity', None)}, "
+                    f"modules={_rmods}). combined-1F1B cannot re-schedule a recomputed MoE/full layer "
+                    "(mcore asserts: no full recompute, no recompute_method/num_layers, no 'moe' in "
+                    "recompute_modules). Run with DISABLE_RECOMPUTE=1 (or selective recompute WITHOUT "
+                    "OV2_RECOMPUTE_MOE), or unset OV2_EP_OVERLAP.")
             model.config.overlap_moe_expert_parallel_comm = True
             if getattr(self, "delay_wgrad_compute", None) and hasattr(model.config, "delay_wgrad_compute"):
                 model.config.delay_wgrad_compute = True
