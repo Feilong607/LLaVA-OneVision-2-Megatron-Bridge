@@ -69,7 +69,6 @@ export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before s
 # Muon on the unfrozen EP8 experts is unvalidated (a prior A800 run NaN'd at iter-2); GB200's 192GB removes the
 # A800 blockers, so the iter-2 NaN is the open question. Set OV2_MIDTRAIN_MUON=0 for the validated AdamW path. ---
 export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
-export PYTHONPATH=/home/ftanO055/pylibs:$PYTHONPATH
 ACCEL="${ACCEL:-2}"
 if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 HW)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
