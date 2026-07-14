@@ -76,7 +76,12 @@ if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 
   FLEX_BACKEND="${FLEX_BACKEND:-}"                       # default alltoall (validated fp8 lane); ACCEL=3 for MXFP8+HybridEP
 elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best bf16 config on NVL72)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' -> ValueError)
-  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+  # Recompute ON (selective MoE) by DEFAULT for HybridEP -- unlike alltoall, HybridEP holds a PERSISTENT
+  # nvshmem symmetric buffer sized to HYBRID_EP_MAX_TOKENS_PER_RANK (10240) tok/rank, and the THD-padding
+  # patch pads every dispatch to that target; together with Muon's fp32 momentum on the unfrozen 30B this
+  # OOMs at 192GB with recompute OFF. Selective MoE recompute is the cheapest lever back under budget.
+  # DISABLE_RECOMPUTE=1 to force recompute off if you have headroom (smaller seq / AdamW / capacity factor).
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
 elif [[ "$ACCEL" == "3" ]]; then        # Phase-2c: MXFP8 + HybridEP -- NVIDIA's measured-optimal GB200 combo
   # (QWEN3_VL_30B_A3B_PRETRAIN_CONFIG_GB200_FP8_MX pairs hybridep with mxfp8). The dispatch/combine
@@ -84,7 +89,8 @@ elif [[ "$ACCEL" == "3" ]]; then        # Phase-2c: MXFP8 + HybridEP -- NVIDIA's
   # internally for fp8 GEMM alignment -- only the GEMMs run MXFP8. UNVALIDATED on OV2: A/B loss
   # vs ACCEL=1/2 before trusting.
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
-  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+  # Same HybridEP memory pressure as ACCEL=2 -> selective MoE recompute ON by default (see ACCEL=2 note).
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
 else                                    # Phase-1: bf16 baseline
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' -> ValueError)
