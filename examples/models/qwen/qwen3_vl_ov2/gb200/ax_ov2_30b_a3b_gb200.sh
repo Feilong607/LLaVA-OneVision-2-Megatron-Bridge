@@ -248,13 +248,18 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/ov2_triton_cache}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/ov2_inductor_cache}"
 mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 
-# --- HybridEP topology (ACCEL=2 only): # of EP ranks (of EP=8) sharing one NVLink domain. mcore asserts
-# EP(8) % value == 0, so it must DIVIDE 8. Full NVL72 rack -> 8; EP8 split 4+4 across two domains -> 4.
-# A wrong value -> mcore assert / perf-correctness loss. ---
-if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
-  export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}"
+# --- HybridEP topology: # of EP ranks (of EP=8) sharing one NVLink domain. OPT-IN ONLY. When UNSET,
+# deep_ep AUTO-DETECTS it (fused_a2a.py: allocator.detect_accessible_ranks(group)) from the real fabric.
+# Forcing 8 was WRONG once the EP=8 group spans >1 NVLink domain (e.g. 4-node 16-GPU where EP8 is 4+4
+# across two domains): deep_ep then treats all 8 EP ranks as one NVLink domain and reaches across the
+# node boundary over NVLink that isn't there -> cudaErrorIllegalAddress in hybrid_ep_backend.cuh's
+# preprocessing (observed: ACCEL=0/alltoall runs, ACCEL=2/HybridEP crashes). Default = let deep_ep
+# detect; set NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=4|8 explicitly only if detection is wrong (it
+# must divide EP=8). ---
+if [[ "$FLEX_BACKEND" == "hybridep" && -n "${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-}" ]]; then
   (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
-    echo "ERROR: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8." >&2; exit 1; }
+    echo "[ov2-30b] FATAL: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8 (use 1/2/4/8), or unset it to let deep_ep auto-detect." >&2; exit 1; }
+  export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
 fi
 # EP comm-overlap (OV2_EP_OVERLAP=1) requires CUDA_DEVICE_MAX_CONNECTIONS>=32; couple them so the lever
 # actually engages. Default path (overlap off) keeps the historical 1.
