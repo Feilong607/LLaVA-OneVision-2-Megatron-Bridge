@@ -169,16 +169,21 @@ else
   RUN_MODE="single-node TEST"
 fi
 # --- k8s DNS hardening: the operator injects MASTER_ADDR as a SHORT pod name that intermittently fails to
-# resolve from workers -> rendezvous times out. If it is a bare short name and its k8s FQDN resolves, switch to
-# the FQDN. Namespace via POD_NAMESPACE / OV2_K8S_NAMESPACE (default runai-mv0004). ---
+# resolve from workers -> rendezvous times out. Resolution order: (1) if the FQDN resolves, prefer it (most
+# reliable); (2) else if the SHORT name already resolves, use it as-is -- NO warning (the common Run:AI case,
+# where /etc/resolv.conf search domains resolve the short name); (3) else warn. Namespace via POD_NAMESPACE ->
+# OV2_K8S_NAMESPACE -> the pod's OWN serviceaccount namespace (portable, no hardcoded cluster ns). ---
 if [[ "$NNODES" -gt 1 && -n "${MASTER_ADDR:-}" && "$MASTER_ADDR" != *.* && "$MASTER_ADDR" != "127.0.0.1" ]]; then
-  _ns="${POD_NAMESPACE:-${OV2_K8S_NAMESPACE:-runai-mv0004}}"
-  _fqdn="${MASTER_ADDR}.${_ns}.svc.cluster.local"
-  if getent hosts "$_fqdn" >/dev/null 2>&1; then
+  _sa_ns_file="/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+  _ns="${POD_NAMESPACE:-${OV2_K8S_NAMESPACE:-$([ -r "$_sa_ns_file" ] && cat "$_sa_ns_file" 2>/dev/null || echo "")}}"
+  _fqdn=""; [[ -n "$_ns" ]] && _fqdn="${MASTER_ADDR}.${_ns}.svc.cluster.local"
+  if [[ -n "$_fqdn" ]] && getent hosts "$_fqdn" >/dev/null 2>&1; then
     echo "[ov2-30b-gb200] rdzv: short MASTER_ADDR '$MASTER_ADDR' -> FQDN '$_fqdn' (avoids gai-error rendezvous timeout)" >&2
     MASTER_ADDR="$_fqdn"
+  elif getent hosts "$MASTER_ADDR" >/dev/null 2>&1; then
+    echo "[ov2-30b-gb200] rdzv: short MASTER_ADDR '$MASTER_ADDR' resolves as-is (no FQDN swap needed)." >&2
   else
-    echo "[ov2-30b-gb200] WARN: MASTER_ADDR='$MASTER_ADDR' is a short name and FQDN '$_fqdn' does not resolve here; rendezvous may time out. Set OV2_K8S_NAMESPACE=<ns> or pass a resolvable MASTER_ADDR." >&2
+    echo "[ov2-30b-gb200] WARN: MASTER_ADDR='$MASTER_ADDR' does not resolve here (tried FQDN in ns='${_ns:-<unknown>}'); rendezvous may time out. Set OV2_K8S_NAMESPACE=<ns> or pass a resolvable MASTER_ADDR." >&2
   fi
 fi
 if [[ "$NNODES" -le 1 ]]; then RDZV="--standalone"; NNODES=1; NODE_RANK=0; else
