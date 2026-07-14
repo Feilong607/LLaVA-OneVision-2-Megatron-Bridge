@@ -199,7 +199,11 @@ DP=$(( WORLD / TP ))
 (( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs DP=$DP (WORLD=$WORLD / TP=$TP) to be a multiple of 8 and >=8. For 2 GB200 nodes (WORLD=8) keep TP=1; TP=2 needs >=4 GB200 nodes." >&2; exit 1; }
 
 # --- in-container env ---
-export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"  # _verify_stubs FIRST: sitecustomize stubs must load before transformers->boto3
+# OV2_EXTRA_PYLIBS: extra import dir(s) for OFFLINE-extracted packages that are not pip-installed in the
+# container (GB200 has no network). Set it to a dir holding unpacked wheels -- e.g. emerging_optimizers
+# for distributed Muon:  OV2_EXTRA_PYLIBS=/path/to/pylibs  (no username path is committed here). Appended
+# AFTER the repo paths so the fork's megatron/bridge always win.
+export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${OV2_EXTRA_PYLIBS:+:$OV2_EXTRA_PYLIBS}${PYTHONPATH:+:$PYTHONPATH}"  # _verify_stubs FIRST: sitecustomize stubs must load before transformers->boto3
 # HybridEP (ACCEL=2) needs deep_ep, whose .so requires a symbol present ONLY in the pip nvidia-nvshmem lib
 # (not CUDA's bundled libnvshmem_host.so.3). Prepend the pip nvshmem ONLY when it exists (no-op otherwise).
 _nvshmem_lib="${OV2_NVSHMEM_LIB:-/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib}"
@@ -283,6 +287,18 @@ OVERRIDES="$OVERRIDES optimizer.optimizer_cpu_offload=false optimizer.use_precis
 # BOTH optimizer AND scheduler start/end (the scheduler clobbers optimizer.weight_decay every iter otherwise).
 if [[ "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
   [[ "${OV2_FSDP:-0}" == "1" ]] && { echo "[ov2-30b-gb200] FATAL: OV2_FSDP=1 is incompatible with Muon (Muon forces use_distributed_optimizer=False; FSDP shards optim state). Unset one." >&2; exit 1; }
+  # Preflight: distributed Muon (mcore get_megatron_muon_optimizer) needs the 'emerging_optimizers' pip
+  # package. It ships in the mbridge:qwen35-muon image but NOT the base GB200 image, so without it the run
+  # crashes DEEP -- after full 16-rank NCCL init -- with a cryptic ImportError. Probe HERE (PYTHONPATH,
+  # incl. OV2_EXTRA_PYLIBS, is already set above) and fail loud EARLY with the real fixes.
+  if ! python -c "import emerging_optimizers" >/dev/null 2>&1; then
+    echo "[ov2-30b-gb200] FATAL: OV2_MIDTRAIN_MUON=1 but 'emerging_optimizers' is not importable (mcore's distributed Muon requires it)." >&2
+    echo "  Fix (pick one):" >&2
+    echo "    - point PYTHONPATH at an offline-extracted copy:  OV2_EXTRA_PYLIBS=/path/to/pylibs bash \$0" >&2
+    echo "    - install it (needs network / local wheel):        pip install emerging-optimizers" >&2
+    echo "    - or use the validated AdamW path (no package):    OV2_MIDTRAIN_MUON=0 bash \$0" >&2
+    exit 1
+  fi
   if [[ "${MUON_STABLE:-0}" == "1" ]]; then
     OV2_MUON_SCALE_MODE="${OV2_MUON_SCALE_MODE:-unit_rms_norm}"
     OV2_MUON_EXTRA_SCALE="${OV2_MUON_EXTRA_SCALE:-0.2}"
