@@ -127,13 +127,15 @@ if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   #       pass (2b) and then crash the first nvshmem kernel -- reject it here instead.
   (( HYBRID_EP_MAX_TOKENS_PER_RANK % 64 == 0 )) || {
     echo "[ov2-30b] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK is not a multiple of 64 (HybridEP JIT asserts % 64 == 0). Round it up to a multiple of 64." >&2; exit 1; }
-  #  (3) comm-kernel SM count: NVIDIA's GB200 perf preset forces 32 for every hybridep run
-  #      (scripts/performance/utils/overrides.py; their TODO says lower it only when overlapping
-  #      HybridEP with compute). Was unset (internal default); sweep 16/24/32 via OV2_HYBRIDEP_NUM_SMS.
-  export OV2_HYBRIDEP_NUM_SMS="${OV2_HYBRIDEP_NUM_SMS:-32}"
-  #  (4) unfused-combine perf-regression workaround from NVIDIA's perf plugin (drop after
-  #      Megatron-LM PR #4089 lands in our pinned mcore).
-  export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API="${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-128}"
+  #  (3) comm-kernel SM count + (4) unfused-combine chunk size: OPT-IN ONLY (NOT default-on). NVIDIA's
+  #      GB200 perf preset forces OV2_HYBRIDEP_NUM_SMS=32 and NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=128, but
+  #      the latter is a workaround for the UNLANDED Megatron-LM PR #4089 -- on our pinned (older) deep_ep
+  #      it can mis-size the HybridEP preprocessing_tmp buffer -> `cudaErrorIllegalAddress` in
+  #      hybrid_ep_backend.cuh's cudaMemsetAsync (observed on GB200). Default = UNSET = deep_ep's own
+  #      internal values (the known-good path that ran at ~4300 tok/s). Sweep only when validated:
+  #      OV2_HYBRIDEP_NUM_SMS=16|24|32  and/or  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=128.
+  [[ -n "${OV2_HYBRIDEP_NUM_SMS:-}" ]] && export OV2_HYBRIDEP_NUM_SMS
+  [[ -n "${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-}" ]] && export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API
 fi
 
 # --- rendezvous: auto-detect master/worker (no hardcoded IPs -> survives pod reschedules). Priority:
