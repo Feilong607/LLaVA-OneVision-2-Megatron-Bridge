@@ -30,7 +30,10 @@ MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"  # LLaVA-Next 780k defau
 ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
 # LR warmup = 0.002 * train_iters; gentle ramp 0->peak then constant. Override OV2_WARMUP_ITERS=.
 WARMUP_ITERS="${OV2_WARMUP_ITERS:-$(( ITERS * 2 / 1000 ))}"
-if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
+# Floor the AUTO-DERIVED value to 1 (a 0-iter auto-warmup is a degenerate ramp), but honor an EXPLICIT
+# OV2_WARMUP_ITERS=0 -- that is the documented way to run flat-LR-from-iter-1 (see the OV2_WARMUP_ITERS
+# comment on the scheduler.lr_warmup_iters override below).
+if [ -z "${OV2_WARMUP_ITERS:-}" ] && [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
 
 # --- HARDWARE: GB200 (sm_100) ONLY; per-HW values hardwired, all env-overridable. ---
@@ -119,6 +122,11 @@ if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   #  (2b) GUARD: a cap below round64(SEQ_LEN) -> EP ranks pad to different targets -> allgather-timeout hang.
   (( HYBRID_EP_MAX_TOKENS_PER_RANK >= _hep_cap )) || {
     echo "[ov2-30b] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK < round64(SEQ_LEN=$SEQ_LEN)=$_hep_cap -> EP ranks would pad to different targets -> HybridEP allgather-timeout hang. Set it >= $_hep_cap, or lower OV2_SEQ_LEN." >&2; exit 1; }
+  #  (2c) GUARD: the HybridEP JIT also requires the cap % 64 == 0 (line-115 invariant). The derived
+  #       default is always a multiple of 64, but an explicit large-enough-but-not-%64 override would
+  #       pass (2b) and then crash the first nvshmem kernel -- reject it here instead.
+  (( HYBRID_EP_MAX_TOKENS_PER_RANK % 64 == 0 )) || {
+    echo "[ov2-30b] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK is not a multiple of 64 (HybridEP JIT asserts % 64 == 0). Round it up to a multiple of 64." >&2; exit 1; }
   #  (3) comm-kernel SM count: NVIDIA's GB200 perf preset forces 32 for every hybridep run
   #      (scripts/performance/utils/overrides.py; their TODO says lower it only when overlapping
   #      HybridEP with compute). Was unset (internal default); sweep 16/24/32 via OV2_HYBRIDEP_NUM_SMS.
@@ -144,8 +152,15 @@ elif [[ -n "${LIST_IP:-}" ]]; then
   # (2) manual: derive NODE_RANK by matching this host's IP/name against the list; master = list[0].
   read -ra list_ip <<< "$LIST_IP"
   NNODES=${#list_ip[@]}; MASTER_ADDR="${list_ip[0]}"; MASTER_PORT="${MASTER_PORT:-26047}"
-  CURRENT_IP="$(hostname -I | awk '{print $1}')"; CURRENT_HOST="$(hostname)"; NODE_RANK=-1
-  for i in "${!list_ip[@]}"; do [[ "${list_ip[$i]}" == "$CURRENT_IP" || "${list_ip[$i]}" == "$CURRENT_HOST" ]] && NODE_RANK=$i && break; done
+  # Match against ALL of this host's IPs (hostname -I lists every iface), not just the first -- on a
+  # multi-homed GB200 node the fabric IP is often not enumerated first, so a first-IP-only match would
+  # miss a genuinely-listed node and abort. Hostname is also matched (for LIST_IP written with names).
+  read -ra _my_ips <<< "$(hostname -I 2>/dev/null)"; CURRENT_HOST="$(hostname)"; NODE_RANK=-1
+  for i in "${!list_ip[@]}"; do
+    if [[ "${list_ip[$i]}" == "$CURRENT_HOST" ]]; then NODE_RANK=$i && break; fi
+    for _ip in "${_my_ips[@]}"; do [[ "${list_ip[$i]}" == "$_ip" ]] && NODE_RANK=$i && break 2; done
+  done
+  CURRENT_IP="${_my_ips[0]:-}"   # kept for the diagnostic message below
   [[ "$NODE_RANK" -eq -1 ]] && { echo "[ov2-30b] ERROR: this host IP($CURRENT_IP)/name($CURRENT_HOST) not in LIST_IP (${list_ip[*]})" >&2; exit 1; }
   RUN_MODE="multi-node (manual LIST_IP)"
 else
@@ -296,7 +311,7 @@ OVERRIDES="$OVERRIDES mixed_precision=$MIXED_PRECISION"
 # (not activation) memory is the limit; OV2's long-sequence pain is activation-bound -> FSDP won't fix that.
 # fsdp_dtensor ckpts are a ONE-WAY door (not loadable by the torch_dist recipe or convert/ tools). ---
 if [[ "${OV2_FSDP:-0}" == "1" ]]; then
-  unset CUDA_DEVICE_MAX_CONNECTIONS            # Megatron-FSDP asserts CUDA_DEVICE_MAX_CONNECTIONS != 1
+  export CUDA_DEVICE_MAX_CONNECTIONS=32        # Megatron-FSDP asserts != 1; set 32 (a bare `unset` risks the consumer's '1' default re-tripping the assert)
   OVERRIDES="$OVERRIDES dist.use_megatron_fsdp=true ddp.use_megatron_fsdp=true"
   OVERRIDES="$OVERRIDES ddp.data_parallel_sharding_strategy=optim_grads_params ddp.average_in_collective=false"
   OVERRIDES="$OVERRIDES checkpoint.ckpt_format=fsdp_dtensor"   # FSDP forces this; see ckpt caveat below

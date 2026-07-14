@@ -9,9 +9,18 @@
 set -euo pipefail
 _lr="${LOCAL_RANK:-}"
 _bind=""
-if [[ -n "$_lr" ]] && command -v nvidia-smi >/dev/null 2>&1 && command -v numactl >/dev/null 2>&1; then
+# nvidia-smi -i indexes PHYSICAL GPUs, but LOCAL_RANK indexes the process's VISIBLE GPUs. If
+# CUDA_VISIBLE_DEVICES masks/reorders devices (e.g. "2,3"), map local_rank -> physical index through
+# it, else we'd bind to the wrong GPU's socket (a silent perf regression, the opposite of the win).
+_phys="$_lr"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" && -n "$_lr" ]]; then
+  IFS=',' read -ra _vis <<< "$CUDA_VISIBLE_DEVICES"
+  # Only remap when the visible list is plain integer indices (skip UUID/MIG forms we can't -i on).
+  if [[ "${_vis[$_lr]:-}" =~ ^[0-9]+$ ]]; then _phys="${_vis[$_lr]}"; else _phys=""; fi
+fi
+if [[ -n "$_phys" ]] && command -v nvidia-smi >/dev/null 2>&1 && command -v numactl >/dev/null 2>&1; then
   # nvidia-smi prints "00000000:1B:00.0"; sysfs wants lowercase with a 4-digit domain ("0000:1b:00.0").
-  _pci=$(nvidia-smi -i "$_lr" --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null \
+  _pci=$(nvidia-smi -i "$_phys" --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null \
       | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]' | sed -E 's/^00000000:/0000:/') || _pci=""
   _nf="/sys/bus/pci/devices/${_pci}/numa_node"
   if [[ -n "$_pci" && -r "$_nf" ]]; then
