@@ -39,6 +39,18 @@ from megatron.bridge.models.gpt_provider import GPTModelProvider
 
 logger = logging.getLogger(__name__)
 
+# Runtime-COMPUTE fp8 fields wired onto the inner LLM (pre-build via fp8_fields AND the post-build
+# escape-hatch copy below). Single source of truth: adding an fp8 knob here reaches both paths.
+# Deliberately EXCLUDES fp8 param-STORAGE flags (fp8_param / fp8_param_gather /
+# reuse_grad_buf_for_mxfp8_*): those need the fp8_model_init the OV2 HF-rebuild path skips; params
+# stay bf16 (standard MXFP8 = fp8 compute + bf16 master weights).
+_OV2_FP8_RUNTIME_FIELDS = (
+    "fp8", "fp8_recipe", "fp8_margin", "fp8_interval", "fp8_amax_history_len",
+    "fp8_amax_compute_algo", "fp8_wgrad", "fp8_output_proj",
+    "fp8_dot_product_attention", "fp8_multi_head_attention",
+    "first_last_layers_bf16", "num_layers_at_start_in_bf16", "num_layers_at_end_in_bf16",
+)
+
 
 def _init_ov2_adapter(adapter) -> None:
     """Initialize the m33 adapter (build used perform_init=False, leaving it uninitialized).
@@ -191,16 +203,7 @@ class LlavaOnevision2Provider(GPTModelProvider):
             # pre-build. Only when fp8 is actually on (bf16 ACCEL=0/2 -> None -> no-op). Excludes
             # fp8_param/fp8_param_gather (kept bf16, same as the post-build set below).
             fp8_fields=(
-                {
-                    _f: getattr(self, _f)
-                    for _f in (
-                        "fp8", "fp8_recipe", "fp8_margin", "fp8_interval", "fp8_amax_history_len",
-                        "fp8_amax_compute_algo", "fp8_wgrad", "fp8_output_proj",
-                        "fp8_dot_product_attention", "fp8_multi_head_attention",
-                        "first_last_layers_bf16", "num_layers_at_start_in_bf16", "num_layers_at_end_in_bf16",
-                    )
-                    if hasattr(self, _f)
-                }
+                {_f: getattr(self, _f) for _f in _OV2_FP8_RUNTIME_FIELDS if hasattr(self, _f)}
                 if getattr(self, "fp8", None)
                 else None
             ),
@@ -269,15 +272,11 @@ class LlavaOnevision2Provider(GPTModelProvider):
         # RUNTIME LLM config -> MXFP8 was a SILENT NO-OP (ran bf16). Copy them across (same dead-field
         # issue as calc_ptl / moe_router_dtype). Gated on self.fp8 (None in bf16 Phase-1 -> no-op).
         if getattr(self, "fp8", None):
-            # Runtime-compute fp8 fields ONLY: get_fp8_context(config) reads these at FORWARD time
-            # (mcore fp8_utils), so a post-build set engages MXFP8 GEMMs (the main speedup). We do NOT
-            # copy fp8 PARAM-STORAGE flags (fp8_param / fp8_param_gather / reuse_grad_buf_for_mxfp8_*):
-            # those need a build-time fp8_model_init the OV2 HF-rebuild path doesn't do -> params stay
-            # bf16 (standard MXFP8 = fp8 compute + bf16 master weights), which is correct + safe.
-            for _f in ("fp8", "fp8_recipe", "fp8_margin", "fp8_interval", "fp8_amax_history_len",
-                       "fp8_amax_compute_algo", "fp8_wgrad", "fp8_output_proj",
-                       "fp8_dot_product_attention", "fp8_multi_head_attention",
-                       "first_last_layers_bf16", "num_layers_at_start_in_bf16", "num_layers_at_end_in_bf16"):
+            # Runtime-compute fp8 fields ONLY (see _OV2_FP8_RUNTIME_FIELDS): get_fp8_context(config)
+            # reads these at FORWARD time (mcore fp8_utils), so a post-build set engages MXFP8 GEMMs.
+            # Redundant with the pre-build fp8_fields wiring on the DEFAULT path (OV2_FP8_PREBUILD=1);
+            # load-bearing only for the OV2_FP8_PREBUILD=0 escape hatch. Same tuple -> cannot drift.
+            for _f in _OV2_FP8_RUNTIME_FIELDS:
                 if hasattr(self, _f) and hasattr(model.config, _f):
                     setattr(model.config, _f, getattr(self, _f))
             logger.info("[ov2 provider] fp8 wired onto runtime LLM config: fp8=%s recipe=%s param_gather=%s",

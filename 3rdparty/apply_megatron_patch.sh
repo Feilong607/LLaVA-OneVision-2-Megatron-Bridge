@@ -28,12 +28,18 @@ else
 fi
 
 # --- patch 2: EP-overlap GPTModel-assert relaxation (combined_1f1b.py) ---
+# NON-FATAL on failure: this patch only matters for the OPT-IN OV2_EP_OVERLAP=1 path. A context
+# mismatch (e.g. a checkout whose mcore SHA differs from the pin) must not block the default
+# ACCEL=0/1/2/3 training lanes -- if the patch is missing and someone sets OV2_EP_OVERLAP=1,
+# mcore's own combined_1f1b assert fails with a clear "only GPTModel is supported" message.
 P2="$HERE/megatron_lm_ov2_ep_overlap.patch"
 CF="$M/megatron/core/pipeline_parallel/combined_1f1b.py"
-[ -f "$P2" ] || { echo "[megatron-patch] patch not found: $P2"; exit 1; }
-if grep -q 'OV2 EP-overlap patch' "$CF" 2>/dev/null; then
+if [ ! -f "$P2" ]; then
+  echo "[megatron-patch] WARN: ep-overlap patch not found: $P2 (OV2_EP_OVERLAP=1 will not work)" >&2
+elif grep -q 'OV2 EP-overlap patch' "$CF" 2>/dev/null; then
   echo "[megatron-patch] ep-overlap already applied (OV2 EP-overlap patch present)"
+elif git -C "$M" apply "$P2" 2>/dev/null && grep -q 'OV2 EP-overlap patch' "$CF"; then
+  echo "[megatron-patch] ep-overlap applied OK"
 else
-  git -C "$M" apply "$P2"
-  if grep -q 'OV2 EP-overlap patch' "$CF"; then echo "[megatron-patch] ep-overlap applied OK"; else echo "[megatron-patch] ep-overlap FAILED (marker missing after apply)"; exit 1; fi
+  echo "[megatron-patch] WARN: ep-overlap patch did NOT apply (mcore context mismatch?). Training lanes are unaffected; OV2_EP_OVERLAP=1 will fail with mcore's 'only GPTModel is supported' assert until the patch applies." >&2
 fi
