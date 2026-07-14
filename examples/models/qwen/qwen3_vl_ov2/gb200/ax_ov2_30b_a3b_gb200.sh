@@ -113,16 +113,11 @@ export OV2_FLEX_BACKEND="$FLEX_BACKEND"
 # --- HybridEP runtime gates + tuning (keyed on the DISPATCHER, not the ACCEL mode, so ACCEL=2 and
 # ACCEL=3 share them; all env-overridable). Both gates are needed or the first nvshmem kernel dies. ---
 if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
-  #  (1) CUDA VMM symmetric heap -- THE ACCEL=2/3 crash gate. Unlike alltoall (ACCEL=0/1), HybridEP does
-  #      NOT dispatch over NCCL; deep_ep builds its OWN nvshmem symmetric-memory heap. On the NVL72, EP=8
-  #      ALWAYS spans >=2 GB200 nodes (4 GPU/node), so that heap is MULTI-NODE and needs CUDA VMM + fabric
-  #      handles to map peers across the node boundary. NVSHMEM_DISABLE_CUDA_VMM=1 forces the legacy
-  #      cudaMalloc heap that cannot map cross-node peers -> the first dispatch's preprocessing kernel
-  #      memsets an unmapped peer buffer -> cudaErrorIllegalAddress in hybrid_ep_buffer.py
-  #      dispatch_with_permute (exactly the observed ACCEL=2 crash while ACCEL=0/1 alltoall run fine over
-  #      NCCL/MNNVL). Default = VMM ON (0). Set NVSHMEM_DISABLE_CUDA_VMM=1 ONLY for a single-node bring-up
-  #      where the VMM path misbehaves (it does not apply to this always-multi-node EP=8 config).
-  export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-0}"
+  #  (1) GB200 nvshmem symmetric-heap uses CUDA VMM which is broken on this platform -> disable it. =1 is
+  #      the EMPIRICALLY-VERIFIED working value for ACCEL=2 on this cluster (commit 63e1085 ran clean with
+  #      it); leaving VMM on (=0) fails here. Env-gated so a different fabric can flip it. Pairs with gate
+  #      (3) below -- the actual ACCEL=2 regression was the NVLink-domain default, NOT this.
+  export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"
   #  (2) HybridEP JIT needs MAX_NUM_OF_TOKENS_PER_RANK % 64 == 0 and identical across EP ranks. Derived
   #      from SEQ_LEN (round up to 64) so the cap tracks the seq you run. An explicit override still wins.
   _hep_cap=$(( (SEQ_LEN + 63) / 64 * 64 ))
@@ -260,28 +255,26 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/ov2_triton_cache}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/ov2_inductor_cache}"
 mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 
-# --- HybridEP topology: # of EP ranks (of EP=8) sharing one NVLink domain. OPT-IN. When UNSET, deep_ep
-# AUTO-DETECTS it (fused_a2a.py: allocator.detect_accessible_ranks(group)). On a real NVL72 all 8 EP ranks
-# are ONE NVLink domain (the 72-GPU rack), so =8 is the topology-correct value and lets deep_ep use the
-# pure intra-domain NVLink dispatch (num_nodes=1, no IB hop). Auto-detect can UNDER-report it as 4 (one
-# 4-GPU tray) if cross-node NVLink/IMEX isn't visible to deep_ep's probe -> deep_ep then uses the 2-domain
-# path (NVLink within each tray + IB between). Either path works ONLY with the CUDA-VMM symmetric heap ON
-# (gate (1) above) -- VMM-disabled was the real ACCEL=2 crash. If ACCEL=2 still hits an illegal address
-# after VMM is on, set NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8 (must divide EP=8) to force the single
-# NVLink domain. ---
-if [[ "$FLEX_BACKEND" == "hybridep" && -n "${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-}" ]]; then
+# --- HybridEP topology (# of EP ranks of the EP=8 group sharing one NVLink domain). DEFAULT 8 -- this is
+# the EMPIRICALLY-VERIFIED working value for ACCEL=2 on this cluster (commit 63e1085). On a full NVL72 rack
+# all 8 EP ranks share one NVLink domain -> 8. mcore asserts EP(8) % value == 0, so it must DIVIDE 8 (not
+# equal world size). Leaving it UNSET makes deep_ep auto-detect (allocator.detect_accessible_ranks), which
+# UNDER-reports it as 4 here and crashes the first dispatch (cudaErrorIllegalAddress in
+# hybrid_ep_buffer.py) -- that regression, not CUDA VMM, was the real ACCEL=2 break. Override to =4 only if
+# the EP=8 group is genuinely split 4+4 across two NVLink domains (verify with gb200_check.sh topo). ---
+if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
+  export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}"
   (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
-    echo "[ov2-30b] FATAL: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8 (use 1/2/4/8), or unset it to let deep_ep auto-detect." >&2; exit 1; }
-  export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
+    echo "[ov2-30b] FATAL: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8 (use 1/2/4/8)." >&2; exit 1; }
 fi
-# --- HybridEP fabric diagnostic (once per node): print the state that decides whether the cross-node
-# nvshmem symmetric heap can be built, so a dispatch illegal-address is debuggable straight from the log.
-# imex_dev=absent means cross-node NVLink is NOT exposed -> deep_ep cannot span nodes over NVLink; the
-# job then depends on the IB path (or use ACCEL=1 alltoall). ---
+# --- HybridEP fabric diagnostic (once per node): echo the resolved HybridEP env so an illegal-address /
+# allgather-timeout is debuggable straight from the log. Expected working values on this cluster:
+# cuda_vmm=off, ranks_per_nvlink_domain=8. If ranks_per_nvlink_domain shows anything but 8 (or "auto"),
+# that mismatch is the usual ACCEL=2 crash cause -- set NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=8. ---
 if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   _imex="absent"; compgen -G "/dev/nvidia-caps-imex-channels/*" >/dev/null 2>&1 && _imex="present"
   _pipnvsh="absent"; [[ -e "$_nvshmem_lib/libnvshmem_host.so.3" ]] && _pipnvsh="present"
-  _vmm="on"; [[ "${NVSHMEM_DISABLE_CUDA_VMM:-0}" == "1" ]] && _vmm="off"
+  _vmm="on"; [[ "${NVSHMEM_DISABLE_CUDA_VMM:-1}" == "1" ]] && _vmm="off"
   echo "[ov2-30b-gb200] hybridep-fabric: cuda_vmm=$_vmm ranks_per_nvlink_domain=${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-auto} mnnvl=${NCCL_MNNVL_ENABLE:-?} imex_dev=$_imex pip_nvshmem=$_pipnvsh max_tok_per_rank=${HYBRID_EP_MAX_TOKENS_PER_RANK:-?}" >&2
 fi
 # EP comm-overlap (OV2_EP_OVERLAP=1) requires CUDA_DEVICE_MAX_CONNECTIONS>=32; couple them so the lever
