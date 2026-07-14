@@ -15,9 +15,23 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 M="$HERE/Megatron-LM"
 
+# --- guard: UNINITIALIZED submodule (clone without --recurse-submodules). With an empty
+# 3rdparty/Megatron-LM, `git -C "$M" apply` resolves against the OUTER repo, SILENTLY SKIPS every
+# file in the patch, and returns 0 (verified: `apply --verbose` prints "Skipped patch '...'" x2) --
+# the old flow then died later with a misleading "FAILED (x0, expected >=3)". Fail HERE with the
+# real cause. This fail-loud matters: the launchers put $REPO/3rdparty/Megatron-LM on PYTHONPATH,
+# so continuing with an empty submodule would silently import the container's UNPATCHED mcore and
+# crash much deeper with "unexpected keyword argument 'apply_rotary_fn'". ---
+AT="$M/megatron/core/transformer/attention.py"
+[ -f "$AT" ] || {
+  echo "[megatron-patch] FATAL: Megatron-LM submodule not initialized ($M has no megatron/core tree)." >&2
+  echo "  Fix:  git -C \"$HERE/..\" submodule update --init --depth 1 3rdparty/Megatron-LM" >&2
+  echo "  (or re-clone with: git clone --recurse-submodules ...)" >&2
+  exit 1
+}
+
 # --- patch 1: rotary hook + nvrx degrade ---
 P1="$HERE/megatron_lm_ov2.patch"
-AT="$M/megatron/core/transformer/attention.py"
 [ -f "$P1" ] || { echo "[megatron-patch] patch not found: $P1"; exit 1; }
 if grep -q 'apply_rotary_fn' "$AT" 2>/dev/null; then
   echo "[megatron-patch] rotary/nvrx already applied (apply_rotary_fn present)"
