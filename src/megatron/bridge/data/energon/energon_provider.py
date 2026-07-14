@@ -43,6 +43,12 @@ class EnergonProvider(DatasetProvider):
 
     def build_datasets(self, context: DatasetBuildContext):
         assert self.path, "EnergonProvider.path must be set. Use CLI override: dataset.path=<path>"
+        # Upstream #4342 (minimal port): a CLI/config seq_length override updates THIS provider but the
+        # task encoder was already built with its import-time value -> re-sync here so the encoder pads/
+        # packs to the length the model actually runs. No-op for the OV2 launchers (OV2_SEQ_LEN is the
+        # single source for both), load-bearing only for dataset.seq_length= CLI overrides.
+        if self.task_encoder is not None and hasattr(self.task_encoder, "seq_length"):
+            self.task_encoder.seq_length = self.seq_length
         if (
             self.pack_sequences_in_batch
             and self.task_encoder is not None

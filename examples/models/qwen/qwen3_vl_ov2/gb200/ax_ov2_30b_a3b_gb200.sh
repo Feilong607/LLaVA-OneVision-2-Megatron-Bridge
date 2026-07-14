@@ -311,7 +311,20 @@ mkdir -p "$SAVE"; cd "$REPO"
 # NOTE: the old Muon resume-topology guard was removed -- distributed Muon now supports DP-reshard, so
 # resuming a Muon ckpt at a different WORLD size no longer corrupts the sharded momentum (guard obsolete).
 echo "[ov2-30b-gb200] in-container | hw=$HWNAME(cc=$_cc) repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY ep_overlap=${OV2_EP_OVERLAP:-0} ep_delay_wgrad=${OV2_EP_DELAY_WGRAD:-0} hybridep_num_sms=${OV2_HYBRIDEP_NUM_SMS:-default} hybridep_permute=${OV2_HYBRIDEP_PERMUTE_FUSION:-0} router_fusion=${OV2_MOE_ROUTER_FUSION:-0} router_pad_fp8=${OV2_MOE_ROUTER_PAD_FP8:-0} shared_overlap=${OV2_MOE_SHARED_EXPERT_OVERLAP:-0} freeze_vision=${OV2_FREEZE_VISION:-recipe-default} node_rank=$NODE_RANK nnodes=$NNODES"
+# --- per-rank NUMA binding (OPT-IN, OV2_NUMA_BIND=1): binds each rank's CPU threads + memory to its
+# GPU's local Grace socket via numa_bind_wrapper.sh (upstream Megatron-Bridge #4630 mechanism; NVIDIA
+# rates CPU affinity ~+15% on GB200 where host overhead co-limits). Default OFF -> the exec line below
+# is byte-identical to before. The wrapper soft-falls-back to unbound if resolution fails. ---
+_numa_args=()
+if [[ "${OV2_NUMA_BIND:-0}" == "1" ]]; then
+  if command -v numactl >/dev/null 2>&1 && [[ -f "$_SELF/numa_bind_wrapper.sh" ]]; then
+    _numa_args=(--no-python bash "$_SELF/numa_bind_wrapper.sh")
+    echo "[ov2-30b-gb200] NUMA binding ON: per-rank numactl cpunodebind+membind via numa_bind_wrapper.sh (OV2_NUMA_BIND=1)"
+  else
+    echo "[ov2-30b-gb200] WARN: OV2_NUMA_BIND=1 but numactl or numa_bind_wrapper.sh missing -> running unbound" >&2
+  fi
+fi
 # shellcheck disable=SC2086  # $RDZV and $OVERRIDES must word-split into separate args
-python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
+python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" ${_numa_args[@]+"${_numa_args[@]}"} scripts/training/run_recipe.py \
   --recipe "$RECIPE" --dataset vlm-energon --step_func ov2_step \
   $OVERRIDES ${EXTRA_ARGS:-} 2>&1 | tee "$SAVE/train_node${NODE_RANK}.log"
