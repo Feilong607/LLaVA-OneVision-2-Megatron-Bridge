@@ -1,0 +1,104 @@
+diff --git a/megatron/core/transformer/moe/fused_a2a.py b/megatron/core/transformer/moe/fused_a2a.py
+index defbe996a..f20a161f9 100644
+--- a/megatron/core/transformer/moe/fused_a2a.py
++++ b/megatron/core/transformer/moe/fused_a2a.py
+@@ -277,6 +277,9 @@ except ImportError:
+     HAVE_HYBRIDEP = False
+ 
+ _hybrid_ep_buffer = None
++# handle-id -> (orig_num_tokens, pad_rows): set by HybridEPDispatch when the input was padded to the
++# 64-token chunk multiple (HybridEP JIT static_assert), consumed by HybridEPCombine to un-pad.
++_HYBRID_EP_PAD_INFO = {}
+ _HYBRID_EP_TOKEN_ALIGNMENT = 16
+ _HYBRID_EP_MIN_BUFFER_TOKENS = 512
+ _HYBRID_EP_IB_QP_MAX_DEPTH = 65535
+@@ -451,13 +454,47 @@ class HybridEPDispatch(torch.autograd.Function):
+                 num_blocks_unpermute = None
+ 
+         num_tokens, hidden_dim = x.shape[-2:]
++        # HybridEP JIT compiles kernels PER actual token count (recorded in the dispatch handle) and
++        # statically requires MAX_NUM_OF_TOKENS_PER_RANK % NUM_OF_TOKENS_PER_CHUNK(64) == 0. THD-packed
++        # batches have arbitrary token counts (e.g. 8176/8560 -> %64=48 -> nvcc static_assert failure at
++        # runtime). Pad the input to the next 64 multiple; padded rows route to NO expert (routing_map
++        # False rows) so they contribute nothing; the combine un-pads via _HYBRID_EP_PAD_INFO.
++        _chunk = 64
++        _orig_num_tokens = num_tokens
++        # UNIFORM padding across EP ranks: THD-packed batches give every rank a DIFFERENT token count,
++        # and per-rank round-up-to-64 leaves them different -> each rank JITs a different
++        # MAX_NUM_OF_TOKENS_PER_RANK -> chunk-count mismatch in HybridEP's metadata allgather
++        # ("HYBRID-EP ALLGATHER TIMEOUT: expecting N got N-1"). Pad ALL ranks to the SAME target:
++        # HYBRID_EP_MAX_TOKENS_PER_RANK (set it >= max possible tokens/rank, e.g. seq_len rounded to 64).
++        # Fallback without the env: per-rank round64 (only safe when all ranks already match).
++        _pad_target = int(os.getenv("HYBRID_EP_MAX_TOKENS_PER_RANK", "0"))
++        _pad_target = _round_up_to_multiple(_pad_target, _chunk) if _pad_target > 0 else 0
++        _pad_target = max(_pad_target, _round_up_to_multiple(num_tokens, _chunk))
++        _pad_rows = _pad_target - num_tokens
++        if _pad_rows:
++            x = torch.nn.functional.pad(x, (0, 0, 0, _pad_rows))
++            routing_map = torch.nn.functional.pad(routing_map, (0, 0, 0, _pad_rows))
++            probs = torch.nn.functional.pad(probs, (0, 0, 0, _pad_rows))
++            num_tokens = num_tokens + _pad_rows
+         _validate_hybrid_ep_ib_tx_depth(num_tokens, group)
+         if _hybrid_ep_buffer is None:
+             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
++            # HybridEP JIT kernels statically require MAX_NUM_OF_TOKENS_PER_RANK to be a multiple of
++            # NUM_OF_TOKENS_PER_CHUNK (64 on GB200): passing the RAW per-batch token count (THD-packed
++            # batches -> arbitrary sizes, e.g. 8176/8560) fails the static_assert in
++            # deep_ep/backend/hybrid_ep_backend.cuh at JIT time (surfaces as async
++            # cudaErrorLaunchFailure). Round the buffer size up to the chunk multiple. Optional env
++            # HYBRID_EP_MAX_TOKENS_PER_RANK pre-sizes the buffer once (e.g. seq_len rounded up) so a
++            # later, larger batch does not trigger an internal reallocation with an unaligned size.
++            _chunk = 64
++            buffer_tokens = max(num_tokens, int(os.getenv("HYBRID_EP_MAX_TOKENS_PER_RANK", "0")))
++            buffer_tokens = _round_up_to_multiple(
++                max(buffer_tokens, _HYBRID_EP_MIN_BUFFER_TOKENS), _chunk
++            )
+             init_hybrid_ep_buffer(
+                 group,
+                 hidden_dim,
+-                num_tokens,
++                buffer_tokens,
+                 num_local_experts,
+                 num_sms_dispatch_api,
+                 num_sms_combine_api,
+@@ -491,6 +528,10 @@ class HybridEPDispatch(torch.autograd.Function):
+         ctx.handle = handle
+         ctx.pad_multiple = pad_multiple
+         ctx.fused = fused
++        ctx.orig_num_tokens = _orig_num_tokens
++        ctx.pad_rows = _pad_rows
++        if _pad_rows:
++            _HYBRID_EP_PAD_INFO[id(handle)] = (_orig_num_tokens, _pad_rows)
+         return (
+             dispatched_hidden,
+             dispatched_probs,
+@@ -512,6 +553,10 @@ class HybridEPDispatch(torch.autograd.Function):
+             pad_multiple=ctx.pad_multiple,
+             **({"fuse_unpermute_combine": ctx.fused} if ctx.fused else {}),
+         )
++        if ctx.pad_rows:
++            combined_hidden = combined_hidden[: ctx.orig_num_tokens]
++            if combined_probs is not None:
++                combined_probs = combined_probs[: ctx.orig_num_tokens]
+         return (
+             combined_hidden,
+             None,
+@@ -550,6 +595,9 @@ class HybridEPCombine(torch.autograd.Function):
+         ctx.pad_multiple = pad_multiple
+         ctx.num_permuted_tokens = num_permuted_tokens
+         ctx.fused = fused
++        ctx.pad_info = _HYBRID_EP_PAD_INFO.pop(id(handle), None)
++        if ctx.pad_info is not None:
++            combined_hidden = combined_hidden[: ctx.pad_info[0]]
+         return combined_hidden
+ 
+     @staticmethod
+@@ -558,6 +606,8 @@ class HybridEPCombine(torch.autograd.Function):
+         Backward pass of fused combine of the HybridEP backend
+         '''
+         handle = ctx.handle
++        if getattr(ctx, "pad_info", None) is not None:
++            grad_x = torch.nn.functional.pad(grad_x, (0, 0, 0, ctx.pad_info[1]))
+         dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
+             hidden=grad_x,
+             scaling_factor=None,

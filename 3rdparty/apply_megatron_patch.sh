@@ -10,6 +10,13 @@
 # Patch 2 (megatron_lm_ov2_ep_overlap.patch): combined_1f1b.py relax the isinstance-GPTModel assert to
 #   also accept MIMO VLM wrappers exposing build_schedule_plan (LlavaOnevision2 delegates to its inner
 #   GPTModel) -- required only for the OPT-IN EP a2a comm-overlap (OV2_EP_OVERLAP=1) -> non-fatal.
+# Patch 3 (megatron_lm_ov2_hybridep_pad.patch): fused_a2a.py pad the HybridEP dispatch input to a uniform
+#   64-token multiple (read from HYBRID_EP_MAX_TOKENS_PER_RANK). OV2's THD-packed batches give ragged
+#   per-rank token counts, but HybridEP's JIT static_asserts MAX_NUM_OF_TOKENS_PER_RANK % 64 == 0 and
+#   requires it identical across EP ranks -> without this, ACCEL=2/3 die at the first dispatch with an
+#   async cudaErrorIllegalAddress in hybrid_ep_backend.cuh (padded rows route to no expert; combine
+#   un-pads). Needed ONLY for the hybridep dispatcher (ACCEL=2/3); alltoall (ACCEL=0/1) unaffected ->
+#   non-fatal here, but the launcher hard-checks the marker when FLEX_BACKEND=hybridep.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 M="$HERE/Megatron-LM"
@@ -34,8 +41,8 @@ AT="$M/megatron/core/transformer/attention.py"
 #   - $M is its own git top-level       -> `git apply` (the tested submodule path)
 #   - else (files copied, no .git)      -> plain `patch -p1` (git-independent)
 #   - marker still absent after apply   -> fail (fatal for patch 1, warn for the opt-in patch 2)
-_apply_one() {   # $1=patch  $2=file-to-check  $3=marker  $4=label  $5=fatal(1|0)
-  local pf="$1" cf="$2" marker="$3" label="$4" fatal="$5" _top
+_apply_one() {   # $1=patch  $2=file-to-check  $3=marker  $4=label  $5=fatal(1|0)  $6=warn-hint(optional)
+  local pf="$1" cf="$2" marker="$3" label="$4" fatal="$5" hint="${6:-Training lanes are unaffected.}" _top
   if [ ! -f "$pf" ]; then
     if [ "$fatal" = "1" ]; then echo "[megatron-patch] FATAL: patch not found: $pf" >&2; exit 1; fi
     echo "[megatron-patch] WARN: patch not found: $pf ($label skipped)" >&2; return 0
@@ -60,9 +67,12 @@ _apply_one() {   # $1=patch  $2=file-to-check  $3=marker  $4=label  $5=fatal(1|0
     echo "  (or ensure 'patch' is installed for the files-only fallback)." >&2
     exit 1
   fi
-  echo "[megatron-patch] WARN: $label did not apply ($cf lacks '$marker'). Training lanes are unaffected; OV2_EP_OVERLAP=1 will hit mcore's 'only GPTModel is supported' assert until it applies." >&2
+  echo "[megatron-patch] WARN: $label did not apply ($cf lacks '$marker'). $hint" >&2
   return 0
 }
 
 _apply_one "$HERE/megatron_lm_ov2.patch"            "$AT"                                                  "apply_rotary_fn"      "rotary/nvrx" 1
-_apply_one "$HERE/megatron_lm_ov2_ep_overlap.patch" "$M/megatron/core/pipeline_parallel/combined_1f1b.py" "OV2 EP-overlap patch" "ep-overlap"  0
+_apply_one "$HERE/megatron_lm_ov2_ep_overlap.patch" "$M/megatron/core/pipeline_parallel/combined_1f1b.py" "OV2 EP-overlap patch" "ep-overlap"  0 \
+  "OV2_EP_OVERLAP=1 will hit mcore's 'only GPTModel is supported' assert until it applies."
+_apply_one "$HERE/megatron_lm_ov2_hybridep_pad.patch" "$M/megatron/core/transformer/moe/fused_a2a.py"     "_HYBRID_EP_PAD_INFO"  "hybridep-pad" 0 \
+  "ACCEL=2/3 (HybridEP) will crash (cudaErrorIllegalAddress in dispatch_with_permute) on THD-packed batches until it applies; ACCEL=0/1 alltoall unaffected."

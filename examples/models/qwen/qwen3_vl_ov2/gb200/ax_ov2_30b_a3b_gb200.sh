@@ -113,10 +113,20 @@ export OV2_FLEX_BACKEND="$FLEX_BACKEND"
 # --- HybridEP runtime gates + tuning (keyed on the DISPATCHER, not the ACCEL mode, so ACCEL=2 and
 # ACCEL=3 share them; all env-overridable). Both gates are needed or the first nvshmem kernel dies. ---
 if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
+  #  (0) HARD PREREQ -- THE ACCEL=2/3 crash gate. HybridEP's JIT static_asserts per-rank token count % 64
+  #      == 0 AND identical across EP ranks, but OV2's THD-packed batches give ragged counts (e.g. 8176).
+  #      The fused_a2a.py padding patch (apply_megatron_patch.sh patch 3) pads to a uniform 64-multiple.
+  #      Without it the first dispatch dies with an async cudaErrorIllegalAddress in hybrid_ep_backend.cuh
+  #      (cudaMemsetAsync preprocessing_tmp) -- exactly the observed crash. apply_megatron_patch.sh ran at
+  #      startup; verify the marker landed in the fused_a2a.py PYTHONPATH will import, and fail LOUD (clear
+  #      cause) instead of the cryptic runtime crash.
+  _fa2a="$REPO/3rdparty/Megatron-LM/megatron/core/transformer/moe/fused_a2a.py"
+  grep -q "_HYBRID_EP_PAD_INFO" "$_fa2a" 2>/dev/null || {
+    echo "[ov2-30b] FATAL: HybridEP (FLEX_BACKEND=hybridep, ACCEL=2/3) needs the fused_a2a.py THD-padding patch, but it is NOT applied ($_fa2a lacks _HYBRID_EP_PAD_INFO). Fix: bash \"$REPO/3rdparty/apply_megatron_patch.sh\" (applies patch 3). Without it the first MoE dispatch crashes with cudaErrorIllegalAddress. Or use the validated alltoall lane: ACCEL=1 (MXFP8) / ACCEL=0 (bf16)." >&2
+    exit 1; }
   #  (1) GB200 nvshmem symmetric-heap uses CUDA VMM which is broken on this platform -> disable it. =1 is
   #      the EMPIRICALLY-VERIFIED working value for ACCEL=2 on this cluster (commit 63e1085 ran clean with
-  #      it); leaving VMM on (=0) fails here. Env-gated so a different fabric can flip it. Pairs with gate
-  #      (3) below -- the actual ACCEL=2 regression was the NVLink-domain default, NOT this.
+  #      it); leaving VMM on (=0) fails here. Env-gated so a different fabric can flip it.
   export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"
   #  (2) HybridEP JIT needs MAX_NUM_OF_TOKENS_PER_RANK % 64 == 0 and identical across EP ranks. Derived
   #      from SEQ_LEN (round up to 64) so the cap tracks the seq you run. An explicit override still wins.
