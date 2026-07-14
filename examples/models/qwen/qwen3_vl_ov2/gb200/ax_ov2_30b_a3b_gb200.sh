@@ -71,18 +71,10 @@ if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-}"                       # default alltoall (validated fp8 lane); ACCEL=3 for MXFP8+HybridEP
-  MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_FP8}"        # fp8 tensor-core peak
-  # MXFP8 aligns the token/M dim to 32 (1x32 block scaling). Dense/attention: ov2_step's packed-seq pad.
-  # Grouped-GEMM experts use TEGroupedMLP's `quantization_padding` submodule, created in __init__ ONLY when
-  # config.fp8 is set at BUILD time -> OV2 wires fp8 on the LLM provider pre-build (ov2_provider fp8_fields).
-  # Requires transformer_engine >= 2.14.0 (fused grouped path).
-  # OV2_MOE_ROUTER_PAD_FP8=0 (default): experts run MXFP8. =1: pad router-side instead (different path).
-  export OV2_MOE_ROUTER_PAD_FP8="${OV2_MOE_ROUTER_PAD_FP8:-0}"
 elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best bf16 config on NVL72)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' -> ValueError)
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
-  MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_BF16}"
 elif [[ "$ACCEL" == "3" ]]; then        # Phase-2c: MXFP8 + HybridEP -- NVIDIA's measured-optimal GB200 combo
   # (QWEN3_VL_30B_A3B_PRETRAIN_CONFIG_GB200_FP8_MX pairs hybridep with mxfp8). The dispatch/combine
   # itself stays bf16 -- mcore hardcodes fp8_dispatch=False (fused_a2a.py) and HybridEP pads
@@ -91,16 +83,26 @@ elif [[ "$ACCEL" == "3" ]]; then        # Phase-2c: MXFP8 + HybridEP -- NVIDIA's
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
-  MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_FP8}"
-  export OV2_MOE_ROUTER_PAD_FP8="${OV2_MOE_ROUTER_PAD_FP8:-0}"   # hybridep pads internally (skip_routed_expert_padding)
 else                                    # Phase-1: bf16 baseline
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' -> ValueError)
   # recompute OFF by default on GB200 (192GB) -> faster AND numerically identical to AIAK full/uniform/1.
   DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"   # selective recompute (core_attn + MoE layer); OV2_RECOMPUTE_FULL=1 for AIAK full parity; DISABLE_RECOMPUTE=1 to turn off.
   FLEX_BACKEND="${FLEX_BACKEND:-}"
-  MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_BF16}"
 fi
 OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-0}"   # selective MoE-layer recompute when =1; only active when recompute ON and OV2_RECOMPUTE_FULL=0
+
+# --- MXFP8 lane knobs (keyed on the PRECISION, not the ACCEL mode, so ACCEL=1 and ACCEL=3 share one
+# source of truth; bf16 lanes take the else). MXFP8 aligns the token/M dim to 32 (1x32 block scaling):
+# dense/attention via ov2_step's packed-seq pad; grouped-GEMM experts via TEGroupedMLP's
+# `quantization_padding` submodule, created in __init__ ONLY when config.fp8 is set at BUILD time ->
+# ov2_provider wires fp8 on the LLM provider pre-build (fp8_fields). Requires transformer_engine >= 2.14.0.
+# OV2_MOE_ROUTER_PAD_FP8=0 (default): experts pad expert-side (alltoall) / hybridep pads internally.
+if [[ "$MIXED_PRECISION" == *mxfp8* || "$MIXED_PRECISION" == *fp8* || "$MIXED_PRECISION" == *fp4* ]]; then
+  MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_FP8}"        # fp8 tensor-core peak
+  export OV2_MOE_ROUTER_PAD_FP8="${OV2_MOE_ROUTER_PAD_FP8:-0}"
+else
+  MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_BF16}"
+fi
 export OV2_RECOMPUTE_FULL OV2_RECOMPUTE_MOE MFU_PEAK_TFLOPS
 # OV2_FLEX_BACKEND is read by ov2_provider.provide() to wire the runtime dispatcher (the cfg.model field is dead).
 export OV2_FLEX_BACKEND="$FLEX_BACKEND"

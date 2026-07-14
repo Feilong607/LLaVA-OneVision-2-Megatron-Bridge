@@ -177,6 +177,12 @@ def forward_step(
             image_grid_thw.prod(dim=-1).sum().item()
         )
 
+    # One loss function for BOTH return paths (eager and schedule-plan) so a future change to its
+    # construction cannot diverge between the well-tested eager lane and the EP-overlap lane.
+    check_nan = state.cfg.rerun_state_machine.check_for_nan_in_loss
+    check_spiky = state.cfg.rerun_state_machine.check_for_spiky_loss
+    loss_function = _create_loss_function(loss_mask, check_nan, check_spiky)
+
     if return_schedule_plan:
         # EP a2a comm-overlap (combined-1F1B, OV2_EP_OVERLAP=1): mcore's combined_1f1b calls this
         # step with the UNWRAPPED LlavaOnevision2 (the module exposing build_schedule_plan) and
@@ -200,9 +206,7 @@ def forward_step(
             patch_positions=patch_positions,
             packed_seq_params=packed_seq_params,   # THD block-diagonal when offline-packed (else None)
         )
-        check_nan = state.cfg.rerun_state_machine.check_for_nan_in_loss
-        check_spiky = state.cfg.rerun_state_machine.check_for_spiky_loss
-        return schedule_plan, _create_loss_function(loss_mask, check_nan, check_spiky)
+        return schedule_plan, loss_function
 
     output_tensor = model(
         images=pixel_values,
@@ -216,7 +220,4 @@ def forward_step(
         packed_seq_params=packed_seq_params,   # THD block-diagonal when offline-packed (else None)
     )
 
-    check_nan = state.cfg.rerun_state_machine.check_for_nan_in_loss
-    check_spiky = state.cfg.rerun_state_machine.check_for_spiky_loss
-    loss_function = _create_loss_function(loss_mask, check_nan, check_spiky)
     return output_tensor, loss_function
