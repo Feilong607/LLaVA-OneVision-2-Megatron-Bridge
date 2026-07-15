@@ -53,12 +53,18 @@ fi
 
 # --- CARD PATHS (GB200); per-path defaults, all env-overridable. ---
 OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/datasets/qwen-models-ea5jyi/Qwen3-30B-A3B-Instruct-2507}"
-OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"            # bundled processor
-OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"   # bundled processor (p16m33 recipe)
+# Checkpoint bundle (processor + init ckpt): PREFER a per-user copy under $HOME if it exists, else the
+# shared /datasets mount. $HOME resolves PER-MACHINE (no username committed -> portable + AGENTS.md-safe);
+# on this pod it is $HOME/llava-ov2-30b-a3b-m9lvdn. This also dodges the /datasets copy whose latest iter
+# can be a bad-format save -> NotImplementedError "Unknown checkpoint format in .../iter_XXXX".
+_ov2_ckpt_bundle="/datasets/llava-ov2-30b-a3b-m9lvdn"
+[[ -n "${HOME:-}" && -d "$HOME/llava-ov2-30b-a3b-m9lvdn" ]] && _ov2_ckpt_bundle="$HOME/llava-ov2-30b-a3b-m9lvdn"
+OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-$_ov2_ckpt_bundle/auto_model}"            # bundled processor ($HOME copy if present)
+OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-$_ov2_ckpt_bundle/auto_model}"   # bundled processor (p16m33 recipe)
 OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"      # processor root (stage_0 skipped; bundled auto_model above)
 DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"   # /datasets/llava/11May data
-INIT_CKPT="${INIT_CKPT:-/datasets/llava-ov2-30b-a3b-m9lvdn}"   # trained ckpt to resume (has iter_0001000 + auto_model)
-SAVE="${SAVE:-/home/ftan0055/ckpts_video_sft/ov2_30b_a3b_gb200}"     # output dir (override with SAVE=)
+INIT_CKPT="${INIT_CKPT:-$_ov2_ckpt_bundle}"   # trained ckpt to resume ($HOME copy if present; else /datasets)
+SAVE="${SAVE:-${HOME:-/tmp}/ckpts_video_sft/ov2_30b_a3b_gb200}"     # output dir ($HOME-relative; override with SAVE=)
 OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # mid-train from stage2 -> skip the stage_0 stitch
 OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b/auto_model}"
 OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_30b_a3b_p16_m33/auto_model}"   # p16m33 processor (patch16/merge3)
