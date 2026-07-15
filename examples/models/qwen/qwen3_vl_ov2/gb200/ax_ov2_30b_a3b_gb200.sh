@@ -25,7 +25,7 @@ REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ 
 bash "$REPO/3rdparty/apply_megatron_patch.sh"   # apply OV2 mcore submodule patch (apply_rotary_fn hook); idempotent. FAIL LOUD -- a missing hook -> cryptic build error.
 RECIPE="${RECIPE:-ov2_30b_a3b_p16m33_midtrain}"  # must be a p16m33 recipe (the /datasets ckpt is p16m33; a merge2 recipe -> vision-config mismatch).
 # Tunable constants (mirror the A800 midtrain launcher); the recipe reads the exported OV2_* values below.
-MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-384}"                  # global batch size; override with OV2_MIDTRAIN_GBS=
+MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-64}"                   # global batch size (matches base launcher); override with OV2_MIDTRAIN_GBS=
 MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"  # LLaVA-Next 780k default
 ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
 # LR warmup = 0.002 * train_iters; gentle ramp 0->peak then constant. Override OV2_WARMUP_ITERS=.
@@ -34,7 +34,7 @@ WARMUP_ITERS="${OV2_WARMUP_ITERS:-$(( ITERS * 2 / 1000 ))}"
 # OV2_WARMUP_ITERS=0 -- that is the documented way to run flat-LR-from-iter-1 (see the OV2_WARMUP_ITERS
 # comment on the scheduler.lr_warmup_iters override below).
 if [ -z "${OV2_WARMUP_ITERS:-}" ] && [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
-LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
+LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-6000}"   # SAVE_EVERY matches base launcher
 
 # --- HARDWARE: GB200 (sm_100) ONLY; per-HW values hardwired, all env-overridable. ---
 HWNAME=gb200; _cc=100; HW_NPROC=4; PEAK_BF16=2250; PEAK_FP8=4500; HW_NVLS=1; HW_FP8=1
@@ -65,28 +65,29 @@ OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-$OV2_PRETRAIN_ROOT/llava_onevi
 export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
 export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before skipping the stitch
 
-# --- OPTIMIZER on the MoE backbone: AdamW (validated, DEFAULT) or distributed Muon (OV2_MIDTRAIN_MUON=1, opt-in).
-# Muon is now OPT-IN because it has repeatedly broken the run: (1) forces use_distributed_optimizer=False, so
-# each rank holds the FULL (unsharded) optimizer state -> huge memory peak vs distributed AdamW (sharded across
-# DP=8); (2) its layer-wise chain builds non-distributed Float16OptimizerWithFloat16Params members, which crash
-# in the MXFP8 lanes (ACCEL=1/3) at the first step -- step_with_ready_grads -> _copy_main_params_to_param_buffer
-# AttributeError (exists only on DistributedOptimizer); (3) a prior A800 run NaN'd at iter-2. AdamW is the
-# recipe's validated path and keeps EP8 happy. Set OV2_MIDTRAIN_MUON=1 to opt back into Muon (bf16/ACCEL=2 only;
-# the config guard auto-disables the mxfp8 param-AG reuse for it). ---
-export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-0}"
+# --- OPTIMIZER on the MoE backbone: distributed Muon (DEFAULT, matches the base launcher) or AdamW
+# (OV2_MIDTRAIN_MUON=0, the recipe's validated fallback). The two prior Muon crashes are now handled:
+# the MXFP8 lanes (ACCEL=1/3) no longer die at step 1 because the config.py guard auto-disables
+# reuse_grad_buf_for_mxfp8_param_ag + fp8_param_gather for the non-distributed Muon optimizer. Remaining
+# caveats: Muon forces use_distributed_optimizer=False so each rank holds the FULL (unsharded) optimizer
+# state (higher memory than sharded AdamW), and a prior A800 run NaN'd at iter-2 -- watch iter 1-3 grad-norm.
+# Set OV2_MIDTRAIN_MUON=0 for the validated AdamW path (also frees optimizer memory). ---
+export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
 ACCEL="${ACCEL:-2}"
 if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 HW)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
-  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+  # Selective MoE recompute ON: recomputes the big expert activations -> fits 184GB (recompute-OFF OOMs
+  # the experts/logits). Matches the validated base launcher (ax_ov2_30b_a3b_gb200_base.sh).
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
   FLEX_BACKEND="${FLEX_BACKEND:-}"                       # default alltoall (validated fp8 lane); ACCEL=3 for MXFP8+HybridEP
 elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best bf16 config on NVL72)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' -> ValueError)
-  # Recompute MUST stay OFF for HybridEP. Recomputing the MoE layer re-enters the flex dispatch
-  # (dispatch_with_permute) during backward -> a fresh handle collides with the padding handle-map
-  # (_HYBRID_EP_PAD_INFO) and the nvshmem symmetric buffer; mcore also forbids "moe" in recompute_modules
-  # under EP-overlap (ov2_provider.py:369). So fix OOM via other levers (lower OV2_SEQ_LEN, MoE capacity
-  # factor, AdamW, or the alltoall lane ACCEL=1) -- NOT recompute.
-  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+  # Selective MoE recompute ON (recomputes the big expert activations -> fits 184GB). COMPATIBLE with
+  # HybridEP: mcore only forbids "moe" in recompute_modules under EP a2a overlap (ov2_provider.py:369),
+  # and OV2_EP_OVERLAP defaults OFF -- so recompute + HybridEP runs cleanly (validated by the base
+  # launcher). Recompute-OFF (DISABLE_RECOMPUTE=1) OOMs at seq=10192; only turn it off if you free memory
+  # elsewhere (lower OV2_SEQ_LEN / MoE capacity factor).
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
 elif [[ "$ACCEL" == "3" ]]; then        # Phase-2c: MXFP8 + HybridEP -- NVIDIA's measured-optimal GB200 combo
   # (QWEN3_VL_30B_A3B_PRETRAIN_CONFIG_GB200_FP8_MX pairs hybridep with mxfp8). The dispatch/combine
@@ -94,8 +95,8 @@ elif [[ "$ACCEL" == "3" ]]; then        # Phase-2c: MXFP8 + HybridEP -- NVIDIA's
   # internally for fp8 GEMM alignment -- only the GEMMs run MXFP8. UNVALIDATED on OV2: A/B loss
   # vs ACCEL=1/2 before trusting.
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
-  # Recompute MUST stay OFF for HybridEP (MoE recompute re-enters the flex dispatch -- see ACCEL=2 note).
-  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+  # Selective MoE recompute ON (same as ACCEL=2 -- fits memory; compatible with HybridEP when EP-overlap off).
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
 else                                    # Phase-1: bf16 baseline
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' -> ValueError)
