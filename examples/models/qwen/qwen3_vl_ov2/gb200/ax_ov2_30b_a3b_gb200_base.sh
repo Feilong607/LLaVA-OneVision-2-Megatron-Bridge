@@ -1,4 +1,3 @@
-##### [仍缺: 文件最顶部 —— shebang + ACCEL legend 注释块（正文里 "see ACCEL legend above" 所指），在 set -euo pipefail 之上] #####
 set -euo pipefail
 REPO=/home/ftan0055/LLaVA-OneVision-2-Megatron-Bridge
 
