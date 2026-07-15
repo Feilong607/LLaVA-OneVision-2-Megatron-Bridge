@@ -1234,10 +1234,30 @@ class ConfigContainer(Container):
             and self.mixed_precision.fp8_param_gather
             and self.mixed_precision.fp8_recipe == "mxfp8"
         ):
-            assert self.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag, (
-                "When fp8_param_gather=True and fp8_recipe='mxfp8', "
-                "reuse_grad_buf_for_mxfp8_param_ag must be set to True"
+            # reuse_grad_buf_for_mxfp8_param_ag and fp8 param-gather both need the DistributedOptimizer's
+            # param buffer: the optimizer step calls _copy_main_params_to_param_buffer, which exists ONLY
+            # on DistributedOptimizer. A non-distributed optimizer -- e.g. the Muon / layer-wise chain,
+            # which forces use_distributed_optimizer=False and builds Float16OptimizerWithFloat16Params
+            # members -- raises AttributeError at the first optimizer step. Auto-deactivate for that case
+            # (mirroring the Megatron-FSDP guard in _validate_and_apply_megatron_fsdp_configs) instead of
+            # asserting, so an MXFP8 + Muon config degrades gracefully rather than crashing at iter 1.
+            _non_distributed_optimizer = ("muon" in getattr(self.optimizer, "optimizer", "")) or (
+                not self.optimizer.use_distributed_optimizer or not self.ddp.use_distributed_optimizer
             )
+            if _non_distributed_optimizer:
+                print_rank_0(
+                    "reuse_grad_buf_for_mxfp8_param_ag / fp8_param_gather require the distributed "
+                    "optimizer; deactivating (non-distributed optimizer, e.g. Muon, detected)."
+                )
+                self.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag = False
+                self.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+                self.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
+                self.mixed_precision.fp8_param_gather = False
+            else:
+                assert self.mixed_precision.reuse_grad_buf_for_mxfp8_param_ag, (
+                    "When fp8_param_gather=True and fp8_recipe='mxfp8', "
+                    "reuse_grad_buf_for_mxfp8_param_ag must be set to True"
+                )
 
         # Deterministic mode validations and settings
         self._validate_and_apply_deterministic_mode()

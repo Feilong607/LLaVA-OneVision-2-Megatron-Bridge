@@ -65,10 +65,15 @@ OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-$OV2_PRETRAIN_ROOT/llava_onevi
 export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
 export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before skipping the stitch
 
-# --- OPTIMIZER on the MoE backbone: AdamW (validated) or distributed Muon (OV2_MIDTRAIN_MUON=1, default ON).
-# Muon on the unfrozen EP8 experts is unvalidated (a prior A800 run NaN'd at iter-2); GB200's 192GB removes the
-# A800 blockers, so the iter-2 NaN is the open question. Set OV2_MIDTRAIN_MUON=0 for the validated AdamW path. ---
-export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
+# --- OPTIMIZER on the MoE backbone: AdamW (validated, DEFAULT) or distributed Muon (OV2_MIDTRAIN_MUON=1, opt-in).
+# Muon is now OPT-IN because it has repeatedly broken the run: (1) forces use_distributed_optimizer=False, so
+# each rank holds the FULL (unsharded) optimizer state -> huge memory peak vs distributed AdamW (sharded across
+# DP=8); (2) its layer-wise chain builds non-distributed Float16OptimizerWithFloat16Params members, which crash
+# in the MXFP8 lanes (ACCEL=1/3) at the first step -- step_with_ready_grads -> _copy_main_params_to_param_buffer
+# AttributeError (exists only on DistributedOptimizer); (3) a prior A800 run NaN'd at iter-2. AdamW is the
+# recipe's validated path and keeps EP8 happy. Set OV2_MIDTRAIN_MUON=1 to opt back into Muon (bf16/ACCEL=2 only;
+# the config guard auto-disables the mxfp8 param-AG reuse for it). ---
+export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-0}"
 ACCEL="${ACCEL:-2}"
 if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 HW)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
