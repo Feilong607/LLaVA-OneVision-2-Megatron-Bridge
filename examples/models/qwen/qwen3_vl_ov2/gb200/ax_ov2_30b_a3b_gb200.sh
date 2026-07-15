@@ -375,6 +375,12 @@ OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-1
 OVERRIDES="$OVERRIDES logger.tensorboard_dir=$SAVE/tensorboard"
 OVERRIDES="$OVERRIDES mixed_precision=$MIXED_PRECISION"
 [[ "$DISABLE_RECOMPUTE" == "1" ]] && OVERRIDES="$OVERRIDES model.recompute_activations=false model.recompute_granularity=null"
+# Cross-entropy loss fusion OFF by default. At TP=1 the vocab (151936) is NOT sharded, so the fused CE's
+# torch.compile/inductor path materializes the full [seq, vocab] fp32 logits in one buffer -- a multi-GB
+# spike that OOM'd the LM head (empty_strided_cuda((s,1,151936), f32)) AND recompiled per-shape (a "compile
+# storm" that tanked step time). The unfused vocab-parallel CE gives the SAME loss without that buffer.
+# Override OV2_CE_FUSION=true to re-enable (only sensible with TP>1 vocab sharding).
+OVERRIDES="$OVERRIDES model.cross_entropy_loss_fusion=${OV2_CE_FUSION:-false}"
 # NB: the dispatcher is wired in ov2_provider.provide() via OV2_FLEX_BACKEND; model.moe_token_dispatcher_type here would be dead.
 
 # --- OPT-IN: EP comm-overlap (~1.3x on exposed EP a2a) is NOT a flag here -- the OV2 recipe sets
