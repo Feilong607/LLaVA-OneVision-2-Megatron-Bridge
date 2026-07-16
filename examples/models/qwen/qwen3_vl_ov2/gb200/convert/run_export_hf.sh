@@ -50,4 +50,8 @@ echo "[run-export-hf] dispatch cfg : $CFG"
 echo "[run-export-hf] HF output    : $HF_OUT"
 echo "[run-export-hf] mode         : $([[ "${VERIFY:-0}" == 1 ]] && echo '30b (export + roundtrip allclose)' || echo 'export')"
 
+# Create scratch + output dirs before convert.sh runs. convert.sh's ensure_dispatch_cfg copies the dispatch
+# config into "$WORK/cfg_dispatch" -- cp -r can't create that if $WORK's parent is missing. Idempotent.
+mkdir -p "$WORK" "$HF_OUT"
+
 exec bash "$HERE/convert.sh" "$([[ "${VERIFY:-0}" == 1 ]] && echo 30b || echo export)"

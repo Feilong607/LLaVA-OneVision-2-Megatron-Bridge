@@ -32,6 +32,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="${REPO:-$({ d="$HERE"; while [[ "$d" != "/" && ! -d "$d/src/megatron/bridge" ]]; do d="$(dirname "$d")"; done; echo "$d"; })}"
 [[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found above $HERE (set REPO=)" >&2; exit 1; }
 
+# Resolve home robustly for the gb200 scratch default (some launch contexts clear $HOME, which would collapse
+# "$HOME/..." to "/..."). Prefer $HOME, else the passwd-db home, else /home/<user>. Resolves to the real home
+# dir at runtime; no username literal is committed (id -un supplies it).
+_HOME="${HOME:-}"
+[[ -n "$_HOME" ]] || _HOME="$(getent passwd "$(id -un 2>/dev/null)" 2>/dev/null | cut -d: -f6)"
+[[ -n "$_HOME" ]] || _HOME="/home/$(id -un 2>/dev/null)"
+
 # --- legacy bespoke modes: delegate to the preserved per-dir bespoke launcher (platform-correct paths) ---
 case "$MODE" in
   from_base|reshard|export_hf)
@@ -56,8 +63,8 @@ if [[ "$PLAT" == "gb200" ]]; then
   CKPTA_DEF="${CKPTA:-/datasets/llava-ov2-30b-a3b-m9lvdn}"
   FOURB_DEF="${FOURB:-/datasets/llava/11May/lmms-lab/LLaVA-OneVision-2-4B-p16m33}"
   # /datasets is the READ-ONLY dataset mount on GB200 -> scratch (cfg_dispatch + HF export) MUST be writable.
-  # The gb200 training launcher writes to /home/ftan0055/...; mirror that. Override WORK= for a different user/path.
-  WORK="${WORK:-/home/ftan0055/_ov2_convert}"
+  # The gb200 training launcher writes under $HOME; mirror that for scratch. Override WORK= for a different path.
+  WORK="${WORK:-$_HOME/_ov2_convert}"
 else
   PLAT=a800; DEF_NPROC=8
   CFG_DEF="${CFG:-/ov2/pretrain_models/llava_onevision2/llava_onevision2_30b_a3b_p16_m33/auto_model}"
@@ -76,6 +83,11 @@ for _v in WORK HF_OUT; do
 done
 case "$HF_OUT/" in "$REPO/"*) echo "FATAL: HF_OUT=$HF_OUT is UNDER the repo ($REPO). Weights must NOT live in the Bridge repo -- set HF_OUT to an off-repo path (e.g. \$WORK/hf_export)." >&2; exit 1;; esac
 case "$WORK/"   in "$REPO/"*) echo "FATAL: WORK=$WORK is UNDER the repo ($REPO). Set WORK to an off-repo scratch dir." >&2; exit 1;; esac
+
+# Create scratch + export dirs up-front. ensure_dispatch_cfg does `cp -r "$CFG" "$WORK/cfg_dispatch"`, which
+# fails ("cannot create directory ... No such file or directory") when $WORK's parent doesn't exist yet;
+# save_hf_pretrained/do_fixup likewise assume $HF_OUT exists. mkdir -p is idempotent, so this is safe to always run.
+mkdir -p "$WORK" "$HF_OUT"
 
 # env contract: offline HF; PYTHONPATH incl aiak_shim + _verify_stubs (shims optional modelopt/diffusers);
 # MoE permute fusion OFF (OV2 wedge gotcha).
