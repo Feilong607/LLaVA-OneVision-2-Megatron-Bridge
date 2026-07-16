@@ -22,7 +22,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Resolve the home dir robustly -- some launch contexts (operators, minimal shells) clear $HOME, which would
 # collapse "$HOME/..." to "/..." and break the defaults. Prefer $HOME, else the passwd-db home, else
-# /home/<user>. On your pod this is /home/ftan0055; no username literal is committed (id -un supplies it).
+# /home/<user>. Resolves to your real home dir at runtime; no username literal is committed (id -un supplies it).
 _HOME="${HOME:-}"
 [[ -n "$_HOME" ]] || _HOME="$(getent passwd "$(id -un 2>/dev/null)" 2>/dev/null | cut -d: -f6)"
 [[ -n "$_HOME" ]] || _HOME="/home/$(id -un 2>/dev/null)"
