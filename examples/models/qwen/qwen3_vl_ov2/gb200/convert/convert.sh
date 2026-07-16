@@ -95,11 +95,20 @@ export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REP
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TE_EXTRA_STATE_MISSING_CHECK="${TE_EXTRA_STATE_MISSING_CHECK:-1}" OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"
 
-# torchrun rendezvous, 3 priorities (mirrors the training launcher -> LIST_IP is now OPTIONAL):
+# torchrun rendezvous, priorities (mirrors the training launcher -> LIST_IP is now OPTIONAL):
+#   (0) FORCE_STANDALONE=1 -> single node, IGNORE any injected multi-node env (escape hatch, see below)
 #   (1) operator-injected env (PyTorchJob/Run:AI auto-inject PET_* + MASTER_ADDR/WORLD_SIZE) -> TRUE auto, NO LIST_IP
 #   (2) manual LIST_IP="<ip0> <ip1> ..." (run SAME cmd on each node)
 #   (3) single-node standalone
-if [[ -n "${PET_NNODES:-}" || ( -n "${MASTER_ADDR:-}" && -n "${WORLD_SIZE:-}" ) ]]; then
+if [[ "${FORCE_STANDALONE:-0}" == 1 ]]; then
+  # Single-node override. A dedicated convert pod is often ONE pod of a multi-node PyTorchJob, so the operator
+  # still injects PET_NNODES / MASTER_ADDR+WORLD_SIZE for the FULL job (e.g. world=8). Without this override,
+  # branch (1) below would set --nnodes=2 and torchrun's rendezvous would wait forever for a peer node that is
+  # not running -> silent hang right after the OMP banner. FORCE_STANDALONE=1 pins single node; pair it with
+  # OV2_EP<=NPROC (e.g. OV2_EP=4 NPROC=4 on a 4-GPU node) so do_export's WORLD==EP guard matches.
+  RDZV="--standalone --nnodes=1"; WORLD="$NPROC"; NN=1; NR=0
+  echo "==> rdzv: FORCE_STANDALONE=1 -> single node (world=$WORLD), ignoring any injected multi-node env"
+elif [[ -n "${PET_NNODES:-}" || ( -n "${MASTER_ADDR:-}" && -n "${WORLD_SIZE:-}" ) ]]; then
   NN="${PET_NNODES:-$(( WORLD_SIZE / NPROC ))}"
   NR="${PET_NODE_RANK:-$(( ${RANK:-0} / NPROC ))}"
   MA="${MASTER_ADDR:-${PET_MASTER_ADDR:-}}"; MP="${MASTER_PORT:-${PET_MASTER_PORT:-26060}}"

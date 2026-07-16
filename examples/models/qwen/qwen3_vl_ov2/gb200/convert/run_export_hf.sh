@@ -14,8 +14,11 @@
 #
 # EP8 export needs world==8. On GB200 (4 GPU/node) run the SAME command on BOTH nodes:
 #   NPROC=4 LIST_IP="<ip0> <ip1>" bash .../convert/run_export_hf.sh [CKPT_DIR]
-# Single 4-GPU node (EP4, UNVALIDATED -> always VERIFY=1 afterwards): OV2_EP=4 NPROC=4 bash .../run_export_hf.sh
-# Add allclose roundtrip verification (export + HF->mcore->HF allclose; needs the 8 GPUs again): VERIFY=1
+# Single 4-GPU node (EP4, UNVALIDATED -> always VERIFY=1 afterwards). If this is ONE pod of a multi-node
+# PyTorchJob, the operator still injects PET_*/WORLD_SIZE for the full job, so torchrun would wait forever for
+# the missing peer -> add FORCE_STANDALONE=1 to pin single node:
+#   FORCE_STANDALONE=1 OV2_EP=4 NPROC=4 VERIFY=1 bash .../run_export_hf.sh [CKPT_DIR]
+# Add allclose roundtrip verification (export + HF->mcore->HF allclose): VERIFY=1
 # =============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
