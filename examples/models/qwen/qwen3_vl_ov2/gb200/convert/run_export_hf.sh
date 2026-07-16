@@ -20,23 +20,30 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Resolve the home dir robustly -- some launch contexts (operators, minimal shells) clear $HOME, which would
+# collapse "$HOME/..." to "/..." and break the defaults. Prefer $HOME, else the passwd-db home, else
+# /home/<user>. On your pod this is /home/ftan0055; no username literal is committed (id -un supplies it).
+_HOME="${HOME:-}"
+[[ -n "$_HOME" ]] || _HOME="$(getent passwd "$(id -un 2>/dev/null)" 2>/dev/null | cut -d: -f6)"
+[[ -n "$_HOME" ]] || _HOME="/home/$(id -un 2>/dev/null)"
+
 # The TRAINED checkpoint to export: parent dir holding iter_* + latest_checkpointed_iteration.txt.
-# Arg 1 wins, else $CKPT_DIR, else the training launcher's $HOME SAVE convention.
-CKPT_DIR="${1:-${CKPT_DIR:-$HOME/ckpts_video_sft/ov2_30b_a3b_gb200}}"
+# Arg 1 wins, else $CKPT_DIR, else the training launcher's home SAVE convention.
+CKPT_DIR="${1:-${CKPT_DIR:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200}}"
 [[ -f "$CKPT_DIR/latest_checkpointed_iteration.txt" ]] || {
   echo "FATAL: '$CKPT_DIR' is not a trained ckpt root (no latest_checkpointed_iteration.txt)." >&2
   echo "  Pass it explicitly:  bash run_export_hf.sh /path/to/your/ckpt_dir   (or set CKPT_DIR=)" >&2
   exit 1; }
 
-# Dispatch config skeleton (HF auto_model with architectures for AutoBridge). Prefer the $HOME copy, else
+# Dispatch config skeleton (HF auto_model with architectures for AutoBridge). Prefer the home copy, else
 # the /datasets mount. convert.sh's ensure_dispatch_cfg sets architectures if the skeleton ships null.
-_cfg="$HOME/llava-ov2-30b-a3b-m9lvdn/auto_model"
+_cfg="$_HOME/llava-ov2-30b-a3b-m9lvdn/auto_model"
 [[ -d "$_cfg" ]] || _cfg="/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model"
 
-export CKPTA="${CKPTA:-$CKPT_DIR}"                                        # <-- THE key override: your trained ckpt
+export CKPTA="${CKPTA:-$CKPT_DIR}"                                         # <-- THE key override: your trained ckpt
 export CFG="${CFG:-$_cfg}"
-export HF_OUT="${HF_OUT:-$HOME/ov2_hf_export/$(basename "$CKPT_DIR")_hf}"  # off-repo HF output (30-58G)
-export WORK="${WORK:-$HOME/_ov2_convert}"                                 # off-repo scratch (cfg_dispatch)
+export HF_OUT="${HF_OUT:-$_HOME/ov2_hf_export/$(basename "$CKPT_DIR")_hf}"  # off-repo HF output (30-58G)
+export WORK="${WORK:-$_HOME/_ov2_convert}"                                 # off-repo scratch (cfg_dispatch)
 
 echo "[run-export-hf] trained ckpt : $CKPTA  (latest iter $(cat "$CKPT_DIR/latest_checkpointed_iteration.txt" 2>/dev/null || echo '?'))"
 echo "[run-export-hf] dispatch cfg : $CFG"
