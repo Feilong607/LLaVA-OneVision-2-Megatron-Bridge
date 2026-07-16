@@ -373,12 +373,14 @@ if [[ "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
   echo "[ov2-30b-gb200] MUON resume CAUTION: checkpoint.load=$SAVE -- Muon cannot cross-optimizer-resume from an AdamW ckpt (KeyError on momentum). Use a FRESH SAVE (e.g. SAVE=${SAVE}_muon) or a Muon-saved ckpt." >&2
 fi
 # ---------------------------------------------------------------------------------------------------------
-# dataloader workers/rank. 16 is safe here (the 85M-sample data has plenty of shards, Grace has ~1TB RAM);
-# lower via OV2_NUM_WORKERS= if host memory gets tight.
-OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-16}"
+# dataloader workers/rank. DEFAULT 8 (matches base): LLaVA samples are large, so 16 workers x 4 ranks/node
+# doubles the host-RAM buffer pressure vs base for no throughput gain here. Raise via OV2_NUM_WORKERS= only
+# if the input pipeline is starving GPUs.
+OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-8}"
 # c10d rendezvous + the 30B ckpt-load all_gather both run on this PG timeout (default 10min -> jobs died there).
-# 60min is a safety margin; the FQDN fix above is the real rendezvous cure.
-OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-100}"
+# DEFAULT 300min (matches base): doesn't change success/failure, only how long a stall waits before the
+# collective aborts -- generous for the big-ckpt load. The FQDN fix above is the real rendezvous cure.
+OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-300}"
 # Pin tensorboard to the WRITABLE $SAVE: the recipe default $CWD=$REPO may be read-only -> rank N-1's
 # makedirs -> PermissionError -> the crash masquerades as a collective timeout on another rank.
 OVERRIDES="$OVERRIDES logger.tensorboard_dir=$SAVE/tensorboard"
