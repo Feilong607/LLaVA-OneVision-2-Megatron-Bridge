@@ -95,6 +95,30 @@ export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REP
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export TE_EXTRA_STATE_MISSING_CHECK="${TE_EXTRA_STATE_MISSING_CHECK:-1}" OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"
 
+# GB200/NVL72 NCCL + CUDA env. The working training launcher sets a whole block of these; convert.sh set NONE,
+# so a plain single-node export could hang at NCCL init with NO error -- a silent stall BEFORE the worker prints
+# anything. Two GB200-specific init hazards dominate on a standalone convert pod:
+#   * NCCL_SOCKET_IFNAME: a multi-NIC k8s pod's TCP bootstrap can pick loopback/docker and never connect.
+#     Excluding lo+docker is the #1 fix for "NCCL init hangs forever, no message" -- even for ONE node.
+#   * NCCL_MNNVL_ENABLE: cross-node NVLink fabric probe. A convert pod is usually NOT in a configured NVL72
+#     fabric partition (unlike the training job), so the probe can hang. Single-node export doesn't need it.
+# Conversion is single-node + weight-only (tiny collectives, perf irrelevant), so we DISABLE MNNVL and NVLS
+# (NVLink SHARP, a collective optimization export doesn't use) to remove the two worst init-hang sources, and
+# keep only the connectivity settings. All overridable; a real 2-node EP8 convert can set NCCL_MNNVL_ENABLE=1.
+if [[ "$PLAT" == "gb200" ]]; then
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+  export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker}"
+  export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"
+  export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-1}"
+  export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
+  export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+  export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+  export NCCL_DEBUG="${NCCL_DEBUG:-${OV2_NCCL_DEBUG:-WARN}}"
+fi
+# Unbuffer worker stdout/stderr so the export's per-rank diag lines (and any traceback) appear live instead of
+# being swallowed until exit when torchrun's console is a pipe -- essential for seeing WHERE an init stalls.
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+
 # torchrun rendezvous, priorities (mirrors the training launcher -> LIST_IP is now OPTIONAL):
 #   (0) FORCE_STANDALONE=1 -> single node, IGNORE any injected multi-node env (escape hatch, see below)
 #   (1) operator-injected env (PyTorchJob/Run:AI auto-inject PET_* + MASTER_ADDR/WORLD_SIZE) -> TRUE auto, NO LIST_IP
