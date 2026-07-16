@@ -123,7 +123,9 @@ elif [[ -n "${LIST_IP:-}" ]]; then
   RDZV="--nnodes=$NN --node_rank=$NR --master_addr=$MA --master_port=$MP"; WORLD=$((NN*NPROC))
 else
   RDZV="--standalone --nnodes=1"; WORLD="$NPROC"
+  echo "==> rdzv: standalone single node (world=$WORLD) -- no operator env / LIST_IP detected"
 fi
+echo "==> launch: RDZV='$RDZV' NPROC=$NPROC WORLD=$WORLD OV2_EP=${OV2_EP:-8}"
 cd "$REPO"
 dist(){ python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" "$@"; }
 
