@@ -43,7 +43,7 @@ bash "$REPO/3rdparty/apply_megatron_patch.sh"   # OV2 mcore submodule patch (app
 RECIPE="${RECIPE:-ov2_qwen35_35b_a3b_midtrain}"
 # DATA_PATH / INIT_CKPT / SAVE / model paths: set per-card by the CARD PATH PROFILE (after HW detect).
 MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-16}"                  # global batch size; override with OV2_MIDTRAIN_GBS=
-MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-780000}"  # LLaVA-Next 780k default
+MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"  # seed85m budget, aligned with the 30B launcher (the old 780000 was the llava_next-data budget, stale vs the seed85m DATA default)
 ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
 WARMUP_ITERS="${OV2_WARMUP_ITERS:-$(( ITERS * 2 / 1000 ))}"
 if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
@@ -176,7 +176,7 @@ WORLD=$(( NPROC * NNODES ))
 (( TP >= 1 )) || { echo "[ov2-qwen35] FATAL: TP must be >=1, got TP=$TP" >&2; exit 1; }
 (( WORLD % TP == 0 )) || { echo "[ov2-qwen35] FATAL: WORLD=$WORLD must be divisible by TP=$TP." >&2; exit 1; }
 DP=$(( WORLD / TP ))
-(( MIDTRAIN_GBS % DP == 0 )) || echo "[ov2-qwen35] WARN: DP=$DP (WORLD=$WORLD / TP=$TP) does not divide GBS=$MIDTRAIN_GBS -> mcore microbatch assert will fire; adjust TP/NNODES or OV2_MIDTRAIN_GBS." >&2
+(( MIDTRAIN_GBS % DP == 0 )) || { echo "[ov2-qwen35] FATAL: DP=$DP (WORLD=$WORLD / TP=$TP) does not divide GBS=$MIDTRAIN_GBS -> mcore's num_microbatches assert fires deep in startup; adjust TP/NNODES or OV2_MIDTRAIN_GBS. (Was a WARN; failing early is cheaper.)" >&2; exit 1; }
 # EP=8 fixed in the recipe -> DP must be a multiple of EP and >= EP.
 (( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-qwen35] FATAL: EP=8 needs DP=$DP (WORLD=$WORLD / TP=$TP) to be a multiple of 8 and >=8. For 2 GB200 nodes (WORLD=8) keep TP=1; TP=2 needs >=4 GB200 nodes." >&2; exit 1; }
 
@@ -187,6 +187,8 @@ export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REP
 _nvshmem_lib="${OV2_NVSHMEM_LIB:-/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib}"
 [[ -e "$_nvshmem_lib/libnvshmem_host.so.3" ]] && export LD_LIBRARY_PATH="$_nvshmem_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OV2_SKIP_HELPERS="${OV2_SKIP_HELPERS:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"   # HF tokenizer Rust threads x forked energon workers -> warn/deadlock (mirrors 30B)
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"                   # tee'd logs keep their tail on crash (offline GB200 debugging)
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"  # avoid TE Triton MoE-permute wedge
 export OV2_MOE_AUX_LOSS_COEFF="${OV2_MOE_AUX_LOSS_COEFF:-0.01}"  # AIAK midtrain load-balance coeff; build_llava_ov2 forces it on the built LLM (provider zeros it again when the LLM is frozen -> stage-1/2)
@@ -286,6 +288,10 @@ else
 fi
 OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-8}"    # 8 = the value validated on this GB200 (30B base launcher); raise only if input-bound
 OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-300}"  # 300 = validated on this GB200 (first-step JIT + ckpt load exceed 100)
+# CE fusion OFF (mirrors 30B): TP=1 -> vocab unsplit -> fused CE materializes the full [seq, vocab] fp32
+# logits in one buffer + recompiles per shape. Q3.5's vocab (~256k, image_token 248056) is LARGER than the
+# 30B's 151936, so the spike (~10GB at seq=10192) is WORSE here. OV2_CE_FUSION=true to re-enable knowingly.
+OVERRIDES="$OVERRIDES model.cross_entropy_loss_fusion=${OV2_CE_FUSION:-false}"
 OVERRIDES="$OVERRIDES logger.tensorboard_dir=$SAVE/tensorboard"
 OVERRIDES="$OVERRIDES mixed_precision=$MIXED_PRECISION"
 [[ "$DISABLE_RECOMPUTE" == "1" ]] && OVERRIDES="$OVERRIDES model.recompute_activations=false model.recompute_granularity=null"
@@ -301,31 +307,15 @@ if [[ "${OV2_FSDP:-0}" == "1" ]]; then
 fi
 
 mkdir -p "$SAVE"; cd "$REPO"
-# --- Muon resume-topology guard: distributed Muon shards momentum across DP with NO reshard support,
-# so resuming a Muon ckpt at a DIFFERENT world size silently loads mismatched momentum. AdamW reshards
-# fine -> guard Muon only (stage2 default). Marker lives in $SAVE so it travels with the ckpt dir. ---
-_is_muon=0; [[ "$RECIPE" == *stage2* && "${OV2_STAGE2_ADAMW:-0}" != "1" ]] && _is_muon=1
-[[ "$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1" ]] && _is_muon=1   # midtrain Muon momentum is ALSO DP-sharded -> same reshard guard
+# NOTE: the old Muon resume-topology guard was removed -- distributed Muon (shared ov2.py impl, same as
+# the 30B) now supports DP-reshard, so resuming a Muon ckpt at a different WORLD size no longer corrupts
+# the sharded momentum (guard obsolete; mirrors the 30B launcher's removal).
 # STALE-ENV GUARD: the 30B gb200 launcher EXPORTS OV2_MIDTRAIN_MUON=1, and ov2.py routes midtrain to
 # AdamW only when it is !=1 -- so a leftover export from a 30B shell silently flips THIS midtrain to
 # distributed Muon, which deadlocks EP backward on trainable 256-expert MoE (header note). Warn loudly.
 if [[ "$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
   echo "[ov2-qwen35] WARN: OV2_MIDTRAIN_MUON=1 is set -> Q3.5 midtrain will use distributed Muon, but Muon+trainable-experts DEADLOCKS EP backward on this build. If this is a leftover from a 30B shell, 'unset OV2_MIDTRAIN_MUON' (midtrain then auto-routes to AdamW)." >&2
 fi
-_wf="$SAVE/.ov2_train_world"
-_has_ckpt=0; { [[ -f "$SAVE/latest_checkpointed_iteration.txt" ]] || compgen -G "$SAVE/iter_*" >/dev/null 2>&1; } && _has_ckpt=1
-if [[ "$_is_muon" == "1" && "$_has_ckpt" == "1" && -f "$_wf" ]]; then
-  _saved_world="$(cat "$_wf" 2>/dev/null || echo "")"
-  if [[ -n "$_saved_world" && "$_saved_world" != "$WORLD" ]]; then
-    if [[ "${OV2_ALLOW_DP_RESHARD:-0}" == "1" ]]; then
-      echo "[ov2-qwen35] WARN: Muon ckpt in $SAVE saved at WORLD=$_saved_world, resuming at WORLD=$WORLD -> DP-sharded momentum MISMATCH; OV2_ALLOW_DP_RESHARD=1 set, continuing (optimizer state WILL be wrong)." >&2
-    else
-      echo "[ov2-qwen35] FATAL: distributed-Muon ckpt in $SAVE was saved at WORLD=$_saved_world but resuming at WORLD=$WORLD. Muon momentum is DP-sharded with NO reshard support. Resume at WORLD=$_saved_world, OR set OV2_ALLOW_DP_RESHARD=1 to override (momentum garbage)." >&2
-      exit 1
-    fi
-  fi
-fi
-[[ "$NODE_RANK" -eq 0 ]] && { echo "$WORLD" > "$_wf" 2>/dev/null || true; }
 echo "[ov2-qwen35-gb200] in-container | hw=$HWNAME(cc=$_cc) repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF mtp_scale=${OV2_MTP_LOSS_SCALE:-default} alloc=${PYTORCH_CUDA_ALLOC_CONF} offload=${OV2_OPT_OFFLOAD:-false} node_rank=$NODE_RANK nnodes=$NNODES"
 # shellcheck disable=SC2086
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
