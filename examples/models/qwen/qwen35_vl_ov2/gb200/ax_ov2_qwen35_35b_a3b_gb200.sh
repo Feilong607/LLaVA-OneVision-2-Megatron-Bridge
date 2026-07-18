@@ -33,9 +33,9 @@
 #       fp8/dispatcher + mrope/fp32-softmax). If you switch REPO, sync those edits there too.
 # =============================================================================
 set -euo pipefail
-REPO="${REPO:-/ov2/feilong/gb200/Megatron-Bridge}"
-
-# Auto-detect repo root from this script's location (works on /ov2 AND a GB200 ~/LLaVA-... clone).
+# Auto-detect repo root from this script's location (works on /ov2 AND a GB200 ~/LLaVA-... clone);
+# an explicit REPO= env override wins. NB: this MUST be the only REPO default -- a hardcoded path
+# default before this line made the auto-detect dead code and FATALed on any box without that path.
 REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
 [[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found from ${BASH_SOURCE[0]} (no src/megatron/bridge above it). Set REPO=/path/to/Megatron-Bridge" >&2; exit 1; }
 bash "$REPO/3rdparty/apply_megatron_patch.sh"   # OV2 mcore submodule patch (apply_rotary_fn hook). FAIL LOUD: a silently-missing hook -> cryptic "unexpected keyword argument 'apply_rotary_fn'" at build. Idempotent.
@@ -79,6 +79,11 @@ fi
 
 # --- CARD PATH PROFILE: GB200 (/datasets or /home) <-> A100 (/ov2). All env-overridable.
 #     The recipe (ov2_qwen35.py) reads OV2_PRETRAIN_ROOT + the OV2_*_QWEN35 vars below. ---
+# Resolve home robustly (some launch contexts clear $HOME -> "$HOME/..." collapses to "/..."). Prefer
+# $HOME, else the passwd-db home, else /home/<user>. No username literal committed (id -un supplies it).
+_HOME="${HOME:-}"
+[[ -n "$_HOME" ]] || _HOME="$(getent passwd "$(id -un 2>/dev/null)" 2>/dev/null | cut -d: -f6)"
+[[ -n "$_HOME" ]] || _HOME="/home/$(id -un 2>/dev/null)"
 if [[ "${HWNAME:-}" == "gb200" || -d /datasets/qwen-models-ea5jyi ]]; then
   OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"
   # Q3.5: text-only HF dir (extract_qwen35_text.py --weights) + p16m33 processor + stage_0 base.
@@ -86,8 +91,8 @@ if [[ "${HWNAME:-}" == "gb200" || -d /datasets/qwen-models-ea5jyi ]]; then
   OV2_HF_PROC_QWEN35_P16M33="${OV2_HF_PROC_QWEN35_P16M33:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_qwen35_35b_a3b_p16_m33/auto_model}"
   OV2_MCORE_QWEN35_P16M33="${OV2_MCORE_QWEN35_P16M33:-$OV2_PRETRAIN_ROOT/llava_onevision2/llava_onevision2_qwen35_35b_a3b_p16_m33/stage_0_tp1_pp1_ep8}"
   DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_seed85m.yaml}"   # see SEQ_LEN caveat above
-  INIT_CKPT="${INIT_CKPT:-/home/ftan0055/ckpts_video_sft/ov2_qwen35_35b_a3b_p16m33_stage2_muon_v2/iter_0006094}"   # trained stage-2 to resume (stage the v2 ckpt onto the GB200 box)
-  SAVE="${SAVE:-/home/ftan0055/ckpts_video_sft/ov2_qwen35_35b_a3b_gb200}"
+  INIT_CKPT="${INIT_CKPT:-$_HOME/ckpts_video_sft/ov2_qwen35_35b_a3b_p16m33_stage2_muon_v2/iter_0006094}"   # trained stage-2 to resume (stage the v2 ckpt onto the GB200 box, under your home)
+  SAVE="${SAVE:-$_HOME/ckpts_video_sft/ov2_qwen35_35b_a3b_gb200}"
   OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # midtrain from stage-2 -> skip the stage_0 stitch
 else
   OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/ov2/pretrain_models}"
@@ -111,12 +116,15 @@ if [[ "$ACCEL" == "1" && "$HW_FP8" != "1" ]]; then
 fi
 if [[ "$ACCEL" == "1" ]]; then          # MXFP8 + alltoall (fp8 HW only)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
-  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+  # Recompute ON by default (was OFF): the SMALLER 30B OOMs recompute-OFF at seq=10192 on these 4-GPU
+  # nodes, and 35B/256-expert is tighter still (ACCEL=0 note). DISABLE_RECOMPUTE=1 once fit is proven.
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-1}"
   FLEX_BACKEND="${FLEX_BACKEND:-}"
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_FP8}"
 elif [[ "$ACCEL" == "2" ]]; then        # bf16 + HybridEP
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"
-  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+  # Recompute ON by default (was OFF) -- same OOM rationale as ACCEL=1 above.
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-1}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-$PEAK_BF16}"
 else                                    # bf16 baseline -- DEFAULT
@@ -173,7 +181,11 @@ DP=$(( WORLD / TP ))
 (( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-qwen35] FATAL: EP=8 needs DP=$DP (WORLD=$WORLD / TP=$TP) to be a multiple of 8 and >=8. For 2 GB200 nodes (WORLD=8) keep TP=1; TP=2 needs >=4 GB200 nodes." >&2; exit 1; }
 
 # --- in-container env (were docker -e flags) ---
-export PYTHONPATH="$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"  # _verify_stubs FIRST (offline stubs; mirrors 30B gb200)
+# HybridEP (ACCEL=2) needs deep_ep, whose .so requires a symbol present ONLY in the pip nvidia-nvshmem lib
+# (not CUDA's bundled libnvshmem_host.so.3). Prepend the pip nvshmem ONLY when it exists (no-op otherwise).
+_nvshmem_lib="${OV2_NVSHMEM_LIB:-/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib}"
+[[ -e "$_nvshmem_lib/libnvshmem_host.so.3" ]] && export LD_LIBRARY_PATH="$_nvshmem_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export OV2_SKIP_HELPERS="${OV2_SKIP_HELPERS:-1}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"  # avoid TE Triton MoE-permute wedge
@@ -208,13 +220,25 @@ export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/tmp/ov2_triton_cache}"
 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/ov2_inductor_cache}"
 mkdir -p "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 
-# --- HybridEP topology (ACCEL=2 only): # of EP-communicating ranks sharing one NVLink domain. Must
-# DIVIDE EP=8 (mcore asserts EP % value == 0). Full NVL72 rack -> 8; EP8 split 4+4 across domains -> 4. ---
-if [[ "$ACCEL" == "2" ]]; then
+# --- HybridEP runtime gates + topology (keyed on the DISPATCHER, not ACCEL, so an env FLEX_BACKEND
+# override still gets them; mirrors the 30B gb200 launcher's validated gate set). ---
+if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
+  # (0) HARD PREREQ -- the crash gate. HybridEP's JIT static_asserts per-rank token count %64==0 AND
+  #     identical across EP ranks; OV2's THD-packed batches are ragged. Without the fused_a2a.py padding
+  #     patch (apply_megatron_patch.sh patch 3, marker _HYBRID_EP_PAD_INFO) the FIRST MoE dispatch dies
+  #     with an async cudaErrorIllegalAddress in hybrid_ep_backend.cuh. Fail LOUD instead.
+  _fa2a="$REPO/3rdparty/Megatron-LM/megatron/core/transformer/moe/fused_a2a.py"
+  grep -q "_HYBRID_EP_PAD_INFO" "$_fa2a" 2>/dev/null || {
+    echo "[ov2-qwen35] FATAL: HybridEP (FLEX_BACKEND=hybridep) needs the fused_a2a.py THD-padding patch, but it is NOT applied ($_fa2a lacks _HYBRID_EP_PAD_INFO). Fix: bash \"$REPO/3rdparty/apply_megatron_patch.sh\" (applies patch 3). Or use the alltoall lane: ACCEL=0/1." >&2
+    exit 1; }
+  # Topology: # of EP ranks sharing one NVLink domain; must divide EP=8. Full NVL72 -> 8 (deep_ep detects 8).
+  _dom_ext="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-}"   # capture an EXTERNAL (shell) override
   export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}"
   (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
     echo "ERROR: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8." >&2; exit 1; }
-  # HybridEP flex a2a env (baked so ACCEL=2 is self-sufficient; all env-gated, override wins).
+  # STALE-ENV GUARD: a shell value <8 forces deep_ep's internode-RDMA path (extra buffers=OOM + IB hop).
+  [[ -n "$_dom_ext" && "$_dom_ext" != "8" ]] && \
+    echo "[ov2-qwen35] WARN: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$_dom_ext set in the SHELL (default 8). On NVL72 all 8 EP ranks are ONE domain; <8 forces the internode-RDMA path (OOM risk + slower). 'unset' it unless ranks are genuinely split across domains." >&2
   # (1) GB200 nvshmem symmetric-heap uses CUDA VMM which is broken on this platform -> disable it.
   export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"
   # (2) HybridEP JIT needs MAX_NUM_OF_TOKENS_PER_RANK %64==0 AND identical across EP ranks; THD packing
@@ -224,6 +248,13 @@ if [[ "$ACCEL" == "2" ]]; then
   export HYBRID_EP_MAX_TOKENS_PER_RANK="${HYBRID_EP_MAX_TOKENS_PER_RANK:-$_hep_cap}"
   (( HYBRID_EP_MAX_TOKENS_PER_RANK >= _hep_cap )) || {
     echo "[ov2] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK < round64(SEQ_LEN=$SEQ_LEN)=$_hep_cap -> EP ranks pad to different targets -> HybridEP allgather hang. Set >= $_hep_cap or lower OV2_SEQ_LEN." >&2; exit 1; }
+  # (2c) an explicit large-but-not-%64 override passes the >= guard then crashes the JIT -- reject here.
+  (( HYBRID_EP_MAX_TOKENS_PER_RANK % 64 == 0 )) || {
+    echo "[ov2-qwen35] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK is not a multiple of 64 (HybridEP JIT asserts %64==0)." >&2; exit 1; }
+  # (3)/(4) comm-SM count + unfused-combine chunk: OPT-IN only; on the pinned deep_ep the chunk env can
+  #     mis-size buffers (unlanded MLM PR #4089 workaround) -> warn if a leftover shell export is present.
+  [[ -n "${OV2_HYBRIDEP_NUM_SMS:-}" ]] && { export OV2_HYBRIDEP_NUM_SMS; echo "[ov2-qwen35] WARN: OV2_HYBRIDEP_NUM_SMS=$OV2_HYBRIDEP_NUM_SMS set (non-default; steals SMs from expert GEMMs)." >&2; }
+  [[ -n "${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-}" ]] && { export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API; echo "[ov2-qwen35] WARN: NUM_OF_TOKENS_PER_CHUNK_COMBINE_API=$NUM_OF_TOKENS_PER_CHUNK_COMBINE_API set (PR-4089 workaround; can mis-size combine buffers on the pinned deep_ep). 'unset' unless validated." >&2; }
 fi
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 
@@ -253,8 +284,8 @@ if [[ "${OV2_OPT_OFFLOAD:-false}" == "true" ]]; then
 else
   OVERRIDES="$OVERRIDES optimizer.optimizer_cpu_offload=false optimizer.use_precision_aware_optimizer=false"
 fi
-OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-16}"   # Grace ~1TB RAM; lower if host mem tight
-OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-100}"
+OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-8}"    # 8 = the value validated on this GB200 (30B base launcher); raise only if input-bound
+OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-300}"  # 300 = validated on this GB200 (first-step JIT + ckpt load exceed 100)
 OVERRIDES="$OVERRIDES logger.tensorboard_dir=$SAVE/tensorboard"
 OVERRIDES="$OVERRIDES mixed_precision=$MIXED_PRECISION"
 [[ "$DISABLE_RECOMPUTE" == "1" ]] && OVERRIDES="$OVERRIDES model.recompute_activations=false model.recompute_granularity=null"
@@ -275,6 +306,12 @@ mkdir -p "$SAVE"; cd "$REPO"
 # fine -> guard Muon only (stage2 default). Marker lives in $SAVE so it travels with the ckpt dir. ---
 _is_muon=0; [[ "$RECIPE" == *stage2* && "${OV2_STAGE2_ADAMW:-0}" != "1" ]] && _is_muon=1
 [[ "$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1" ]] && _is_muon=1   # midtrain Muon momentum is ALSO DP-sharded -> same reshard guard
+# STALE-ENV GUARD: the 30B gb200 launcher EXPORTS OV2_MIDTRAIN_MUON=1, and ov2.py routes midtrain to
+# AdamW only when it is !=1 -- so a leftover export from a 30B shell silently flips THIS midtrain to
+# distributed Muon, which deadlocks EP backward on trainable 256-expert MoE (header note). Warn loudly.
+if [[ "$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
+  echo "[ov2-qwen35] WARN: OV2_MIDTRAIN_MUON=1 is set -> Q3.5 midtrain will use distributed Muon, but Muon+trainable-experts DEADLOCKS EP backward on this build. If this is a leftover from a 30B shell, 'unset OV2_MIDTRAIN_MUON' (midtrain then auto-routes to AdamW)." >&2
+fi
 _wf="$SAVE/.ov2_train_world"
 _has_ckpt=0; { [[ -f "$SAVE/latest_checkpointed_iteration.txt" ]] || compgen -G "$SAVE/iter_*" >/dev/null 2>&1; } && _has_ckpt=1
 if [[ "$_is_muon" == "1" && "$_has_ckpt" == "1" && -f "$_wf" ]]; then
