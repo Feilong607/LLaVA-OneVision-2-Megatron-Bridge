@@ -14,7 +14,7 @@ bash "$REPO/3rdparty/apply_megatron_patch.sh"   # mcore submodule patches (apply
 
 RECIPE="${RECIPE:-ov2_30b_a3b_p16m33_midtrain}"   # the GB200 ckpt is p16m33 -> MUST stay a p16m33 recipe
 MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-384}"
-MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"
+MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-128000}"   # 180s data = ~64k packs -> x2 = 2 epochs
 ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
 WARMUP_ITERS="${OV2_WARMUP_ITERS:-$(( ITERS * 2 / 1000 ))}"   # 0.002*iters ramp; OV2_WARMUP_ITERS=0 disables
 if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
@@ -40,8 +40,7 @@ OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_mode
 OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"
 OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"
 DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_180s_packed_64k.yaml}"   # /datasets/180s-part0..9 64k packs
-INIT_CKPT="${INIT_CKPT:-/datasets/llava-ov2-30b-a3b-m9lvdn}"   # trained ckpt to resume; prefer the $HOME copy if staged
-[[ -d "$_HOME/llava-ov2-30b-a3b-m9lvdn" ]] && INIT_CKPT="${INIT_CKPT_OVERRIDE:-$_HOME/llava-ov2-30b-a3b-m9lvdn}"
+INIT_CKPT="${INIT_CKPT:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200}"   # the finished seed85m midtrain run (latest iter_0020834)
 SAVE="${SAVE:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200_packed64k}"
 OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # midtrain from a trained ckpt -> skip the stage_0 stitch
 export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
