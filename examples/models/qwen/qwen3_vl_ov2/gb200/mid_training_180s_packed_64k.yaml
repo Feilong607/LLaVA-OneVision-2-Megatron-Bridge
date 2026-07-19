@@ -1,0 +1,38 @@
+# 180s video data, offline THD-packed to 64k tokens (shards: 180s_partN_64k-*.tar + .tar.idx).
+# 10 near-equal parts -> equal weights (uniform sampling). Used by ax_ov2_30b_a3b_gb200_packed_64k.sh
+# with OV2_SEQ_LEN=65536 (the pack length -- a shorter seq_length would SkipSample every pack).
+__module__: megatron.energon
+__class__: Metadataset
+splits:
+  train:
+    datasets:
+      - weight: 1
+        path: /datasets/180s-part0-2lbdsg/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1
+        path: /datasets/180s-part1-eekjeu/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1
+        path: /datasets/180s-part2-7b61dt/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1
+        path: /datasets/180s-part3-eki17z/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1
+        path: /datasets/180s-part4-plhmr1/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1
+        path: /datasets/180s-part5-3gyii5/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1
+        path: /datasets/180s-part6-m56pv1/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1
+        path: /datasets/180s-part7-cniym0/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1
+        path: /datasets/180s-part8-7hwshy/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1
+        path: /datasets/180s-part9-mq7jfn/webdataset
+        subflavors: {augmentation: false}
