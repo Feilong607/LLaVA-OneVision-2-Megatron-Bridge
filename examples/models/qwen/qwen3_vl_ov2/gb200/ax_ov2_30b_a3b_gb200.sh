@@ -25,7 +25,7 @@ REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ 
 bash "$REPO/3rdparty/apply_megatron_patch.sh"   # apply OV2 mcore submodule patch (apply_rotary_fn hook); idempotent. FAIL LOUD -- a missing hook -> cryptic build error.
 RECIPE="${RECIPE:-ov2_30b_a3b_p16m33_midtrain}"  # must be a p16m33 recipe (the /datasets ckpt is p16m33; a merge2 recipe -> vision-config mismatch).
 # Tunable constants (mirror the A800 midtrain launcher); the recipe reads the exported OV2_* values below.
-MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-64}"                   # global batch size (matches base launcher); override with OV2_MIDTRAIN_GBS=
+MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-256}"                  # global batch size; override with OV2_MIDTRAIN_GBS=
 MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"  # LLaVA-Next 780k default
 ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
 # LR warmup = 0.002 * train_iters; gentle ramp 0->peak then constant. Override OV2_WARMUP_ITERS=.
@@ -88,12 +88,9 @@ if [[ "$ACCEL" == "1" ]]; then          # Phase-2a: MXFP8 + alltoall (GB200 fp8 
   FLEX_BACKEND="${FLEX_BACKEND:-}"                       # default alltoall (validated fp8 lane); ACCEL=3 for MXFP8+HybridEP
 elif [[ "$ACCEL" == "2" ]]; then        # Phase-2b: bf16 + HybridEP (best bf16 config on NVL72)
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"   # registry key is 'bf16_mixed' (plain 'bf16' -> ValueError)
-  # Selective MoE recompute ON (recomputes the big expert activations -> fits 184GB). COMPATIBLE with
-  # HybridEP: mcore only forbids "moe" in recompute_modules under EP a2a overlap (ov2_provider.py:369),
-  # and OV2_EP_OVERLAP defaults OFF -- so recompute + HybridEP runs cleanly (validated by the base
-  # launcher). Recompute-OFF (DISABLE_RECOMPUTE=1) OOMs at seq=10192; only turn it off if you free memory
-  # elsewhere (lower OV2_SEQ_LEN / MoE capacity factor).
-  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
+  # Recompute OFF by default (user-set); if it OOMs, DISABLE_RECOMPUTE=0 OV2_RECOMPUTE_MOE=1 restores
+  # the selective-MoE-recompute config.
+  DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-1}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-0}"
   FLEX_BACKEND="${FLEX_BACKEND:-hybridep}"
 elif [[ "$ACCEL" == "3" ]]; then        # Phase-2c: MXFP8 + HybridEP -- NVIDIA's measured-optimal GB200 combo
   # (QWEN3_VL_30B_A3B_PRETRAIN_CONFIG_GB200_FP8_MX pairs hybridep with mxfp8). The dispatch/combine
