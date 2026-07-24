@@ -113,7 +113,11 @@ DP=$(( WORLD / TP ))
 (( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (2 GB200 nodes + TP=1 -> DP=8)." >&2; exit 1; }
 
 # --- env ---
-export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"  # _verify_stubs FIRST (offline stubs)
+# Offline packages not pip-installed in the image (e.g. emerging_optimizers for Muon): picked up from
+# "$REPO/pylibs" or "$HOME/pylibs" (where the base launcher keeps them), or OV2_EXTRA_PYLIBS=/abs/path.
+[[ -d "$_HOME/pylibs" ]] && OV2_EXTRA_PYLIBS="$_HOME/pylibs${OV2_EXTRA_PYLIBS:+:$OV2_EXTRA_PYLIBS}"
+[[ -d "$REPO/pylibs" ]] && OV2_EXTRA_PYLIBS="$REPO/pylibs${OV2_EXTRA_PYLIBS:+:$OV2_EXTRA_PYLIBS}"
+export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${OV2_EXTRA_PYLIBS:+:$OV2_EXTRA_PYLIBS}${PYTHONPATH:+:$PYTHONPATH}"  # _verify_stubs FIRST (offline stubs)
 # deep_ep's .so needs the pip nvidia-nvshmem lib (not CUDA's bundled one); prepend only if present.
 _nvshmem_lib="${OV2_NVSHMEM_LIB:-/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib}"
 [[ -e "$_nvshmem_lib/libnvshmem_host.so.3" ]] && export LD_LIBRARY_PATH="$_nvshmem_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -190,6 +194,16 @@ OVERRIDES="$OVERRIDES optimizer.optimizer_cpu_offload=false optimizer.use_precis
 # knob individually overridable. wd must hit optimizer AND scheduler (scheduler clobbers it per-iter).
 if [[ "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
   [[ "${OV2_FSDP:-0}" == "1" ]] && { echo "[ov2-30b-gb200] FATAL: OV2_FSDP=1 is incompatible with Muon (forces use_distributed_optimizer=False)." >&2; exit 1; }
+  # Preflight: mcore's distributed Muon needs the 'emerging_optimizers' package (NOT in the base GB200
+  # image). Without it the run crashes AFTER full NCCL init with a cryptic ImportError -- probe early.
+  if ! python -c "import emerging_optimizers" >/dev/null 2>&1; then
+    echo "[ov2-30b-gb200] FATAL: OV2_MIDTRAIN_MUON=1 but 'emerging_optimizers' is not importable." >&2
+    echo "  Fix (pick one):" >&2
+    echo "    - offline copy on PYTHONPATH:  OV2_EXTRA_PYLIBS=/path/to/pylibs bash \$0  (auto-detected from \$REPO/pylibs or \$HOME/pylibs)" >&2
+    echo "    - install it:                  pip install emerging-optimizers" >&2
+    echo "    - or use AdamW instead:        OV2_MIDTRAIN_MUON=0 bash \$0" >&2
+    exit 1
+  fi
   if [[ "${MUON_STABLE:-0}" == "1" ]]; then
     OV2_MUON_SCALE_MODE="${OV2_MUON_SCALE_MODE:-unit_rms_norm}"
     OV2_MUON_EXTRA_SCALE="${OV2_MUON_EXTRA_SCALE:-0.2}"
