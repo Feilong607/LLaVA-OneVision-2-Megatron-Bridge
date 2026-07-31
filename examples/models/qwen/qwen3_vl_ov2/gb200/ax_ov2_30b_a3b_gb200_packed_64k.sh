@@ -42,7 +42,7 @@ OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_mode
 OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"
 OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"
 DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_180s_packed_64k.yaml}"   # /datasets/180s-part0..9 64k packs
-INIT_CKPT="${INIT_CKPT:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200_tp2_ep8_etp1}"   # TP2/EP8/ETP1 seed85m checkpoint
+INIT_CKPT="${INIT_CKPT:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200_tp4_ep8_etp1}"   # TP4/EP8/ETP1 seed85m checkpoint
 SAVE="${SAVE:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200_packed64k}"
 OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # midtrain from a trained ckpt -> skip the stage_0 stitch
 export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
