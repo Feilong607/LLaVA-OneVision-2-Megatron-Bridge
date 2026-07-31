@@ -66,8 +66,22 @@ else                                    # bf16 baseline
 fi
 # Recompute ON (selective core_attn + MoE) for EVERY lane: at seq=65536 activations dwarf the 10k case,
 # and even at 10k recompute-OFF OOMs 192GB. DISABLE_RECOMPUTE=1 only if you have freed memory elsewhere.
-DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"; OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
+DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"
+OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
+
 export OV2_RECOMPUTE_FULL OV2_RECOMPUTE_MOE MFU_PEAK_TFLOPS
+
+# ViT full activation recompute；不会冻结 ViT。
+export OV2_VISION_RECOMPUTE=1
+
+# 防止父 shell / Pod 遗留变量误冻结模型。
+export OV2_FREEZE_VISION=0
+export OV2_FREEZE_LLM=0
+export OV2_FREEZE_ADAPTER=0
+
+# 强制保留 LLM recompute 开关。
+DISABLE_RECOMPUTE=0
 export OV2_FLEX_BACKEND="$FLEX_BACKEND"   # read by ov2_provider.provide(); the cfg.model field is dead
 
 # --- rendezvous: operator env (PET_*/MASTER_ADDR) -> manual LIST_IP -> single-node ---
