@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # OV2-30B-A3B (Qwen3-30B-A3B MoE) midtrain on 180s 64k-packed data - GB200-only IN-CONTAINER launcher
-# (4 GPU/node; TP2 + EP8 needs 4 nodes for DP8). Data: /datasets/180s-part0..9 THD-packed to 64k tokens
+# (4 GPU/node; TP4 + EP8 needs 8 nodes for DP8). Data: /datasets/180s-part0..9 THD-packed to 64k tokens
 # (mid_training_180s_packed_64k.yaml); seq_length MUST stay 65536 or every pack is skipped.
 #
 # ACCEL:  0 = bf16 + alltoall   1 = MXFP8 + alltoall   2 = bf16 + HybridEP (DEFAULT)
@@ -23,8 +23,8 @@ if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
 
 NPROC="${NPROC:-4}"   # GB200 = 4 GPU/node
-TP="${TP:-2}"         # 4-node world=16 -> TP=2, DP=8 satisfies EP=8
-if [[ "$TP" -gt 1 ]]; then SP=true; else SP=false; fi
+TP="${TP:-4}"         # explicit TP= wins; SP/DP/HybridEP caps derive from this value
+if [[ "$TP" =~ ^[0-9]+$ ]] && (( TP > 1 )); then SP=true; else SP=false; fi
 SEQ_LEN="${OV2_SEQ_LEN:-73728}"    # headroom above the offline-packed 64k samples; shorter than 64k would SkipSample packs
 MOE_CAPACITY_FACTOR="${MOE_CAPACITY_FACTOR:-none}"
 MOE_PAD_TO_CAPACITY="${MOE_PAD_TO_CAPACITY:-false}"
@@ -119,12 +119,12 @@ if [[ "$NNODES" -le 1 ]]; then RDZV="--standalone"; NNODES=1; NODE_RANK=0; else
   RDZV="--nnodes=$NNODES --node_rank=$NODE_RANK --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT"; fi
 echo "[ov2-30b-gb200] --- rdzv: $RUN_MODE --- master=${MASTER_ADDR:-n/a}:${MASTER_PORT} nnodes=$NNODES node_rank=$NODE_RANK gpus/node=$GPUS_PER_NODE"
 WORLD=$(( NPROC * NNODES ))
-(( TP >= 1 )) || { echo "[ov2-30b] FATAL: TP must be >=1, got TP=$TP" >&2; exit 1; }
+[[ "$TP" =~ ^[0-9]+$ ]] && (( TP >= 1 )) || { echo "[ov2-30b] FATAL: TP must be a positive integer, got TP=$TP" >&2; exit 1; }
 (( WORLD % TP == 0 )) || { echo "[ov2-30b] FATAL: WORLD=$WORLD must be divisible by TP=$TP." >&2; exit 1; }
 DP=$(( WORLD / TP ))
 (( MIDTRAIN_GBS % DP == 0 )) || { echo "[ov2-30b] FATAL: GBS=$MIDTRAIN_GBS not divisible by DP=$DP; adjust OV2_MIDTRAIN_GBS / TP / NNODES." >&2; exit 1; }
 # EP=8 fixed in the recipe.
-(( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (4 GB200 nodes + TP=2 -> DP=8)." >&2; exit 1; }
+(( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (WORLD=32 with TP=4 gives DP=8)." >&2; exit 1; }
 
 # --- env ---
 # Offline packages not pip-installed in the image (e.g. emerging_optimizers for Muon): picked up from
@@ -146,7 +146,7 @@ export OV2_SEQ_LEN="$SEQ_LEN"
 export OV2_MIDTRAIN_GBS="$MIDTRAIN_GBS" OV2_MIDTRAIN_N_SAMPLES="$MIDTRAIN_N_SAMPLES"
 export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"  # energon default 16 chokes WekaFS
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export NVTE_FWD_LAYERNORM_SM_MARGIN="${NVTE_FWD_LAYERNORM_SM_MARGIN:-0}"   # TP=2 default; keep 0 unless overlap tuning is validated
+export NVTE_FWD_LAYERNORM_SM_MARGIN="${NVTE_FWD_LAYERNORM_SM_MARGIN:-0}"   # TP-derived topology; keep 0 unless overlap tuning is validated
 export NVTE_BWD_LAYERNORM_SM_MARGIN="${NVTE_BWD_LAYERNORM_SM_MARGIN:-0}"
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}" NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
 [[ -n "${NCCL_IB_HCA:-}" ]] && export NCCL_IB_HCA NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
@@ -262,7 +262,7 @@ fi
 OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-2}"    # conservative WekaFS default; override with OV2_NUM_WORKERS after validation
 EXTRA_ARGS="${EXTRA_ARGS:-} dataset.shuffle_buffer_size=16"
 OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-300}"   # first-step JIT + big-ckpt all_gather exceed 100
-# CE fusion OFF: even with TP=2, 64k packed sequences make materialized fp32 logits too memory-intensive.
+# CE fusion OFF: 64k packed sequences make materialized fp32 logits too memory-intensive.
 OVERRIDES="$OVERRIDES model.cross_entropy_loss_fusion=${OV2_CE_FUSION:-false}"
 OVERRIDES="$OVERRIDES logger.tensorboard_dir=$SAVE/tensorboard"   # never write into a possibly read-only $REPO
 OVERRIDES="$OVERRIDES mixed_precision=$MIXED_PRECISION"
