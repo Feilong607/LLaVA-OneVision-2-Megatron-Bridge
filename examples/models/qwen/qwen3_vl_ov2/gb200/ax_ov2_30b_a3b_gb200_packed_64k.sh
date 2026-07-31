@@ -13,7 +13,7 @@ REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ 
 bash "$REPO/3rdparty/apply_megatron_patch.sh"   # mcore submodule patches (apply_rotary_fn hook, HybridEP pad); idempotent
 
 RECIPE="${RECIPE:-ov2_30b_a3b_p16m33_midtrain}"   # the GB200 ckpt is p16m33 -> MUST stay a p16m33 recipe
-MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-384}"
+MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-128}"
 TOTAL_SAMPLES="${OV2_TOTAL_SAMPLES:-386381}"   # 180s 64k-pack count
 EPOCHS="${OV2_EPOCHS:-2}"
 MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( TOTAL_SAMPLES * EPOCHS ))}"
