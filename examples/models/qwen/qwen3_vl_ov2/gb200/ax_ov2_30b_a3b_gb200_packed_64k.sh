@@ -13,14 +13,14 @@ REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ 
 bash "$REPO/3rdparty/apply_megatron_patch.sh"   # mcore submodule patches (apply_rotary_fn hook, HybridEP pad); idempotent
 
 RECIPE="${RECIPE:-ov2_30b_a3b_p16m33_midtrain}"   # the GB200 ckpt is p16m33 -> MUST stay a p16m33 recipe
-MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-128}"
+MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-64}"
 TOTAL_SAMPLES="${OV2_TOTAL_SAMPLES:-386381}"   # 180s 64k-pack count
 EPOCHS="${OV2_EPOCHS:-2}"
 MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( TOTAL_SAMPLES * EPOCHS ))}"
 ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
 WARMUP_ITERS="${OV2_WARMUP_ITERS:-$(( ITERS * 2 / 1000 ))}"   # 0.002*iters ramp; OV2_WARMUP_ITERS=0 disables
 if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
-LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
+LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-1000}"
 
 NPROC="${NPROC:-4}"   # GB200 = 4 GPU/node
 TP="${TP:-4}"         # explicit TP= wins; SP/DP/HybridEP caps derive from this value
@@ -173,13 +173,23 @@ if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   grep -q "_HYBRID_EP_PAD_INFO" "$_fa2a" 2>/dev/null || {
     echo "[ov2-30b] FATAL: HybridEP needs the fused_a2a.py THD-padding patch (marker _HYBRID_EP_PAD_INFO missing). Run: bash \"$REPO/3rdparty/apply_megatron_patch.sh\". Or use ACCEL=0/1." >&2
     exit 1; }
-  # EP ranks per NVLink domain: 8 on NVL72 (one domain). <8 forces the internode-RDMA path (OOM + slower).
-  _dom_ext="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-}"
-  export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}"
-  (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
-    echo "ERROR: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8." >&2; exit 1; }
-  [[ -n "$_dom_ext" && "$_dom_ext" != "8" ]] && \
-    echo "[ov2-30b] WARN: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$_dom_ext set in the shell (default 8); 'unset' it unless ranks are genuinely split across NVLink domains." >&2
+  # Let DeepEP detect the NVLink domain. A stale fixed value (previously 8)
+  # can split a detected 32-rank NVLink domain and incorrectly force IB QPs.
+  _hep_domain_override="${OV2_HYBRIDEP_NVLINK_DOMAIN_RANKS:-auto}"
+  if [[ "$_hep_domain_override" == "auto" ]]; then
+    if [[ -n "${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-}" ]]; then
+      echo "[ov2-30b] WARN: unsetting inherited NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN; DeepEP will auto-detect." >&2
+    fi
+    unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
+  else
+    [[ "$_hep_domain_override" =~ ^[0-9]+$ ]] && (( _hep_domain_override > 0 )) || {
+      echo "[ov2-30b] FATAL: OV2_HYBRIDEP_NVLINK_DOMAIN_RANKS must be auto or a positive integer, got $_hep_domain_override" >&2; exit 1; }
+    _hep_group_ranks=$(( TP * 8 ))   # HybridEP communicates over TP x EP.
+    (( _hep_group_ranks % _hep_domain_override == 0 )) || {
+      echo "[ov2-30b] FATAL: NVLink domain override=$_hep_domain_override must divide TPxEP=$_hep_group_ranks." >&2; exit 1; }
+    export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="$_hep_domain_override"
+    echo "[ov2-30b] HybridEP NVLink domain override: $_hep_domain_override ranks (TPxEP=$_hep_group_ranks)" >&2
+  fi
   export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"   # nvshmem CUDA-VMM broken on this platform
   # HybridEP receives SP-local rows, not the global packed width.
   # Current contract: MBS=1, CP=1.
