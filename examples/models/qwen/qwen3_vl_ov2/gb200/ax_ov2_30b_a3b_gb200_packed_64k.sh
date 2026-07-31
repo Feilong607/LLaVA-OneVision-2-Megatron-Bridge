@@ -21,11 +21,20 @@ ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
 WARMUP_ITERS="${OV2_WARMUP_ITERS:-$(( ITERS * 2 / 1000 ))}"   # 0.002*iters ramp; OV2_WARMUP_ITERS=0 disables
 if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-1000}"
+TIMING_LOG_LEVEL="${OV2_TIMING_LOG_LEVEL:-2}"
+TIMING_LOG_OPTION="${OV2_TIMING_LOG_OPTION:-minmax}"
+TIMING_PRINT_INTERVAL="${OV2_TIMING_PRINT_INTERVAL:-$LOG_EVERY}"
+[[ "$TIMING_LOG_LEVEL" =~ ^(-1|0|1|2)$ ]] || { echo "[ov2-30b] FATAL: OV2_TIMING_LOG_LEVEL must be -1, 0, 1, or 2; got $TIMING_LOG_LEVEL" >&2; exit 1; }
+[[ "$TIMING_PRINT_INTERVAL" =~ ^[0-9]+$ ]] && (( TIMING_PRINT_INTERVAL > 0 )) || { echo "[ov2-30b] FATAL: OV2_TIMING_PRINT_INTERVAL must be a positive integer; got $TIMING_PRINT_INTERVAL" >&2; exit 1; }
+case "$TIMING_LOG_OPTION" in max|minmax|all) ;; *) echo "[ov2-30b] FATAL: OV2_TIMING_LOG_OPTION must be max, minmax, or all; got $TIMING_LOG_OPTION" >&2; exit 1 ;; esac
+export OV2_TIMING_PRINT_INTERVAL="$TIMING_PRINT_INTERVAL"
 
 NPROC="${NPROC:-4}"   # GB200 = 4 GPU/node
 TP="${TP:-4}"         # explicit TP= wins; SP/DP/HybridEP caps derive from this value
-if [[ "$TP" =~ ^[0-9]+$ ]] && (( TP > 1 )); then SP=true; else SP=false; fi
+[[ "$TP" =~ ^[0-9]+$ ]] && (( TP >= 1 )) || { echo "[ov2-30b] FATAL: TP must be a positive integer, got TP=$TP" >&2; exit 1; }
+if (( TP > 1 )); then SP=true; else SP=false; fi
 SEQ_LEN="${OV2_SEQ_LEN:-73728}"    # headroom above the offline-packed 64k samples; shorter than 64k would SkipSample packs
+[[ "$SEQ_LEN" =~ ^[0-9]+$ ]] && (( SEQ_LEN > 0 )) || { echo "[ov2-30b] FATAL: OV2_SEQ_LEN must be a positive integer, got $SEQ_LEN" >&2; exit 1; }
 MOE_CAPACITY_FACTOR="${MOE_CAPACITY_FACTOR:-none}"
 MOE_PAD_TO_CAPACITY="${MOE_PAD_TO_CAPACITY:-false}"
 MOE_CAPACITY_ARGS=""
@@ -42,7 +51,7 @@ OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_mode
 OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"
 OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"
 DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/mid_training_180s_packed_64k.yaml}"   # /datasets/180s-part0..9 64k packs
-INIT_CKPT="${INIT_CKPT:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200_tp4_ep8_etp1}"   # TP4/EP8/ETP1 seed85m checkpoint
+INIT_CKPT="${INIT_CKPT:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200_tp${TP}_ep8_etp1}"   # follows explicit TP; override INIT_CKPT for a differently named torch_dist checkpoint
 SAVE="${SAVE:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200_packed64k}"
 OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # midtrain from a trained ckpt -> skip the stage_0 stitch
 export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
@@ -63,6 +72,15 @@ else                                    # bf16 baseline
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_mixed}"
   FLEX_BACKEND="${FLEX_BACKEND:-}"
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-2250}"
+fi
+# HybridEP's multi-node IB queue-pair depth is limited to 65535. With the THD
+# patch's 64-token chunks, each rank must stay at or below 21824 tokens. Keep
+# TP user-controlled, but safely adapt the dispatcher when TP is too small.
+_hep_safe_tokens=21824
+_hep_min_tp=$(( (SEQ_LEN + _hep_safe_tokens - 1) / _hep_safe_tokens ))
+if [[ "$FLEX_BACKEND" == "hybridep" ]] && (( TP < _hep_min_tp )); then
+  echo "[ov2-30b] WARN: TP=$TP gives ceil(SEQ_LEN/TP)=$(( (SEQ_LEN + TP - 1) / TP )) HybridEP tokens/rank, above $_hep_safe_tokens; falling back to AllToAll (minimum HybridEP TP=$_hep_min_tp)." >&2
+  FLEX_BACKEND=""
 fi
 # Recompute ON (selective core_attn + MoE) for EVERY lane: at seq=65536 activations dwarf the 10k case,
 # and even at 10k recompute-OFF OOMs 192GB. DISABLE_RECOMPUTE=1 only if you have freed memory elsewhere.
@@ -237,7 +255,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 OVERRIDES="dataset.path=$DATA_PATH"
 [[ "$INIT_CKPT" != "null" && -n "$INIT_CKPT" ]] && OVERRIDES="$OVERRIDES checkpoint.pretrained_checkpoint=$INIT_CKPT"
 OVERRIDES="$OVERRIDES checkpoint.save=$SAVE checkpoint.load=$SAVE dataset.dataloader_save=$SAVE"
-OVERRIDES="$OVERRIDES checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS validation.eval_iters=0 logger.log_interval=$LOG_EVERY logger.timing_log_level=${OV2_TIMING_LOG_LEVEL:-2} train.micro_batch_size=1"   # packing REQUIRES mbs=1
+OVERRIDES="$OVERRIDES checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS validation.eval_iters=0 logger.log_interval=$LOG_EVERY logger.timing_log_level=$TIMING_LOG_LEVEL logger.timing_log_option=$TIMING_LOG_OPTION logger.log_timers_to_tensorboard=true logger.tensorboard_log_interval=${OV2_TENSORBOARD_LOG_INTERVAL:-$LOG_EVERY} logger.log_throughput=true train.micro_batch_size=1"   # packing REQUIRES mbs=1
 OVERRIDES="$OVERRIDES model.tensor_model_parallel_size=$TP model.sequence_parallel=$SP $MOE_CAPACITY_ARGS"
 OVERRIDES="$OVERRIDES model.moe_router_dtype=${OV2_ROUTER_DTYPE:-fp32}"   # 128-expert router stability
 OVERRIDES="$OVERRIDES scheduler.lr_warmup_iters=$WARMUP_ITERS"
@@ -289,7 +307,7 @@ fi
 
 mkdir -p "$SAVE"; cd "$REPO"
 # NOTE: the old Muon resume-topology guard was removed -- distributed Muon supports DP-reshard now.
-echo "[ov2-30b-gb200] in-container | repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY muon=$OV2_MIDTRAIN_MUON node_rank=$NODE_RANK nnodes=$NNODES"
+echo "[ov2-30b-gb200] in-container | repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY muon=$OV2_MIDTRAIN_MUON timing_level=$TIMING_LOG_LEVEL timing_every=$TIMING_PRINT_INTERVAL timing_option=$TIMING_LOG_OPTION node_rank=$NODE_RANK nnodes=$NNODES"
 # shellcheck disable=SC2086
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
   --recipe "$RECIPE" --dataset vlm-energon --step_func ov2_step \
