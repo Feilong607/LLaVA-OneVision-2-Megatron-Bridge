@@ -12,12 +12,12 @@ splits:
       - weight: 1
         path: /datasets/180s-part1-eekjeu/webdataset
         subflavors: {augmentation: false}
-      - weight: 1
-        path: /datasets/180s-part2-7b61dt/webdataset
-        subflavors: {augmentation: false}
-      - weight: 1
-        path: /datasets/180s-part3-eki17z/webdataset
-        subflavors: {augmentation: false}
+      # - weight: 1
+      #   path: /datasets/180s-part2-7b61dt/webdataset
+      #   subflavors: {augmentation: false}
+      # - weight: 1
+      #   path: /datasets/180s-part3-eki17z/webdataset
+      #   subflavors: {augmentation: false}
       - weight: 1
         path: /datasets/180s-part4-plhmr1/webdataset
         subflavors: {augmentation: false}

@@ -148,7 +148,7 @@ class NemotronVLModelProvider(MambaModelProvider):
             image_token_index=131072,
             pixel_shuffle=True,
             max_num_tiles=12,
-            tokenizer_type="nemotron-h-5p5-reasoning",
+            tokenizer_type="nemotron-h-5p5-reasoning",  # gitleaks:allow
             use_vision_backbone_fp8_arch=True,
         )
 

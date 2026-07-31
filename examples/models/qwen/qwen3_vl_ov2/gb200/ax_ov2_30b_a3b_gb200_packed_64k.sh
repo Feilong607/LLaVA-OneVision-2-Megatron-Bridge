@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # OV2-30B-A3B (Qwen3-30B-A3B MoE) midtrain on 180s 64k-packed data - GB200-only IN-CONTAINER launcher
-# (4 GPU/node; EP8 = 2 nodes). Data: /datasets/180s-part0..9 THD-packed to 64k tokens
+# (4 GPU/node; TP2 + EP8 needs 4 nodes for DP8). Data: /datasets/180s-part0..9 THD-packed to 64k tokens
 # (mid_training_180s_packed_64k.yaml); seq_length MUST stay 65536 or every pack is skipped.
 #
 # ACCEL:  0 = bf16 + alltoall   1 = MXFP8 + alltoall   2 = bf16 + HybridEP (DEFAULT)
@@ -23,7 +23,7 @@ if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
 
 NPROC="${NPROC:-4}"   # GB200 = 4 GPU/node
-TP="${TP:-1}"         # 2-node world=8 needs TP=1 so DP=8 satisfies EP=8
+TP="${TP:-2}"         # 4-node world=16 -> TP=2, DP=8 satisfies EP=8
 if [[ "$TP" -gt 1 ]]; then SP=true; else SP=false; fi
 SEQ_LEN="${OV2_SEQ_LEN:-73728}"    # headroom above the offline-packed 64k samples; shorter than 64k would SkipSample packs
 MOE_CAPACITY_FACTOR="${MOE_CAPACITY_FACTOR:-none}"
@@ -124,7 +124,7 @@ WORLD=$(( NPROC * NNODES ))
 DP=$(( WORLD / TP ))
 (( MIDTRAIN_GBS % DP == 0 )) || { echo "[ov2-30b] FATAL: GBS=$MIDTRAIN_GBS not divisible by DP=$DP; adjust OV2_MIDTRAIN_GBS / TP / NNODES." >&2; exit 1; }
 # EP=8 fixed in the recipe.
-(( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (2 GB200 nodes + TP=1 -> DP=8)." >&2; exit 1; }
+(( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-30b] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (4 GB200 nodes + TP=2 -> DP=8)." >&2; exit 1; }
 
 # --- env ---
 # Offline packages not pip-installed in the image (e.g. emerging_optimizers for Muon): picked up from
@@ -146,7 +146,7 @@ export OV2_SEQ_LEN="$SEQ_LEN"
 export OV2_MIDTRAIN_GBS="$MIDTRAIN_GBS" OV2_MIDTRAIN_N_SAMPLES="$MIDTRAIN_N_SAMPLES"
 export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"  # energon default 16 chokes WekaFS
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-export NVTE_FWD_LAYERNORM_SM_MARGIN="${NVTE_FWD_LAYERNORM_SM_MARGIN:-0}"   # TP=1, no comm overlap -> no SM reservation
+export NVTE_FWD_LAYERNORM_SM_MARGIN="${NVTE_FWD_LAYERNORM_SM_MARGIN:-0}"   # TP=2 default; keep 0 unless overlap tuning is validated
 export NVTE_BWD_LAYERNORM_SM_MARGIN="${NVTE_BWD_LAYERNORM_SM_MARGIN:-0}"
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}" NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
 [[ -n "${NCCL_IB_HCA:-}" ]] && export NCCL_IB_HCA NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
@@ -181,13 +181,43 @@ if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   [[ -n "$_dom_ext" && "$_dom_ext" != "8" ]] && \
     echo "[ov2-30b] WARN: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$_dom_ext set in the shell (default 8); 'unset' it unless ranks are genuinely split across NVLink domains." >&2
   export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"   # nvshmem CUDA-VMM broken on this platform
-  # JIT cap: %64 and identical across EP ranks; derive from SEQ_LEN (round up to 64).
-  _hep_cap=$(( (SEQ_LEN + 63) / 64 * 64 ))
-  export HYBRID_EP_MAX_TOKENS_PER_RANK="${HYBRID_EP_MAX_TOKENS_PER_RANK:-$_hep_cap}"
-  (( HYBRID_EP_MAX_TOKENS_PER_RANK >= _hep_cap )) || {
-    echo "[ov2-30b] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK < round64(SEQ_LEN)=$_hep_cap -> ranks pad to different targets -> allgather hang." >&2; exit 1; }
-  (( HYBRID_EP_MAX_TOKENS_PER_RANK % 64 == 0 )) || {
-    echo "[ov2-30b] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK must be a multiple of 64." >&2; exit 1; }
+  # HybridEP receives SP-local rows, not the global packed width.
+  # Current contract: MBS=1, CP=1.
+  _hep_global_tokens="${OV2_HYBRIDEP_GLOBAL_TOKEN_CAP:-$SEQ_LEN}"
+
+  [[ "$_hep_global_tokens" =~ ^[0-9]+$ ]] && (( _hep_global_tokens > 0 )) || {
+    echo "[ov2-30b] FATAL: invalid global HybridEP token cap: $_hep_global_tokens" >&2
+    exit 1
+  }
+
+  _hep_token_shards=1
+  [[ "$SP" == "true" ]] && _hep_token_shards="$TP"
+
+  _hep_local_tokens=$(( (_hep_global_tokens + _hep_token_shards - 1) / _hep_token_shards ))
+  _hep_cap=$(( (_hep_local_tokens + 63) / 64 * 64 ))
+
+  # Reject inherited global values such as 73728.
+  if [[ -n "${HYBRID_EP_MAX_TOKENS_PER_RANK:-}" &&
+        "$HYBRID_EP_MAX_TOKENS_PER_RANK" != "$_hep_cap" ]]; then
+    echo "[ov2-30b] FATAL: stale HYBRID_EP_MAX_TOKENS_PER_RANK="\
+"$HYBRID_EP_MAX_TOKENS_PER_RANK; expected TP-local cap=$_hep_cap "\
+"from global=$_hep_global_tokens TP=$TP SP=$SP" >&2
+    exit 1
+  fi
+
+  export HYBRID_EP_MAX_TOKENS_PER_RANK="$_hep_cap"
+
+  # THD patch uses 64-token chunks. Therefore the effective safe maximum
+  # is 21824, not the generic 16-aligned limit 21840.
+  (( _hep_cap <= 21824 )) || {
+    echo "[ov2-30b] FATAL: HybridEP local cap=$_hep_cap exceeds "\
+"the inter-node safe limit 21824; increase TP or use AllToAll." >&2
+    exit 1
+  }
+
+  echo "[ov2-30b] HybridEP token cap: global=$_hep_global_tokens "\
+"TP=$TP SP=$SP local=$_hep_local_tokens cap64=$_hep_cap "\
+"ib_depth=$((3 * _hep_cap + 1))" >&2
   [[ -n "${OV2_HYBRIDEP_NUM_SMS:-}" ]] && { export OV2_HYBRIDEP_NUM_SMS; echo "[ov2-30b] WARN: OV2_HYBRIDEP_NUM_SMS=$OV2_HYBRIDEP_NUM_SMS set (steals SMs from expert GEMMs)." >&2; }
   [[ -n "${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-}" ]] && { export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API; echo "[ov2-30b] WARN: NUM_OF_TOKENS_PER_CHUNK_COMBINE_API set (can mis-size combine buffers on the pinned deep_ep); 'unset' unless validated." >&2; }
 fi
@@ -229,9 +259,10 @@ if [[ "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
   echo "[ov2-30b-gb200] MUON ENABLED: scale_mode=${OV2_MUON_SCALE_MODE:-spectral(recipe)} extra_scale=${OV2_MUON_EXTRA_SCALE:-0.15(recipe)} wd=${OV2_MUON_WD:-0.01(recipe)} stable=${MUON_STABLE:-0} -- watch iter-1->3 grad-norm/NaN." >&2
   echo "[ov2-30b-gb200] MUON resume CAUTION: Muon cannot cross-optimizer-resume from an AdamW ckpt; use a fresh SAVE or a Muon-saved ckpt." >&2
 fi
-OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-8}"    # validated on this GB200; 64k samples are big -> don't raise casually
+OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-2}"    # conservative WekaFS default; override with OV2_NUM_WORKERS after validation
+EXTRA_ARGS="${EXTRA_ARGS:-} dataset.shuffle_buffer_size=16"
 OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-300}"   # first-step JIT + big-ckpt all_gather exceed 100
-# CE fusion OFF: TP=1 -> fused CE materializes full [seq, vocab] fp32 logits; at seq=65536 that is ~40GB -> instant OOM.
+# CE fusion OFF: even with TP=2, 64k packed sequences make materialized fp32 logits too memory-intensive.
 OVERRIDES="$OVERRIDES model.cross_entropy_loss_fusion=${OV2_CE_FUSION:-false}"
 OVERRIDES="$OVERRIDES logger.tensorboard_dir=$SAVE/tensorboard"   # never write into a possibly read-only $REPO
 OVERRIDES="$OVERRIDES mixed_precision=$MIXED_PRECISION"
