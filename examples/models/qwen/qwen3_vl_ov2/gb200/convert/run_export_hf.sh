@@ -1,60 +1,125 @@
 #!/usr/bin/env bash
-# =============================================================================
-# Export a TRAINED OV2-30B-A3B GB200 checkpoint (EP8/TP1/PP1) -> HuggingFace VLM, via the registered bridge.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
-# WHY THIS WRAPPER: convert.sh's gb200 CKPTA/CFG DEFAULTS point at the /datasets *pretrained skeleton*, NOT
-# your trained run. Running `convert.sh export` without overriding CKPTA silently converts the WRONG (and,
-# on this cluster, bad-format) checkpoint. This wrapper sets CKPTA to YOUR trained ckpt + a valid dispatch
-# CFG, then runs convert.sh 'export' -- which loads the mcore ckpt at EP8 through the bridge, writes the HF
-# VLM, and runs do_fixup (repairs use_patch_position_encoding + preprocessor patch/merge in the HF skeleton
-# -- the two SILENT bugs that corrupt image features if skipped). Muon vs AdamW is irrelevant to export
-# (only model weights are read, never optimizer state).
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Paths default under $HOME (per-machine; no username committed). Override any via env.
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# EP8 export needs world==8. On GB200 (4 GPU/node) run the SAME command on BOTH nodes:
-#   NPROC=4 LIST_IP="<ip0> <ip1>" bash .../convert/run_export_hf.sh [CKPT_DIR]
-# Single 4-GPU node (EP4, UNVALIDATED -> always VERIFY=1 afterwards). If this is ONE pod of a multi-node
-# PyTorchJob, the operator still injects PET_*/WORLD_SIZE for the full job, so torchrun would wait forever for
-# the missing peer -> add FORCE_STANDALONE=1 to pin single node:
-#   FORCE_STANDALONE=1 OV2_EP=4 NPROC=4 VERIFY=1 bash .../run_export_hf.sh [CKPT_DIR]
-# Add allclose roundtrip verification (export + HF->mcore->HF allclose): VERIFY=1
-# =============================================================================
-set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# Resolve the home dir robustly -- some launch contexts (operators, minimal shells) clear $HOME, which would
-# collapse "$HOME/..." to "/..." and break the defaults. Prefer $HOME, else the passwd-db home, else
-# /home/<user>. Resolves to your real home dir at runtime; no username literal is committed (id -un supplies it).
+# Export a trained OV2-30B-A3B torch_dist checkpoint to a complete HuggingFace VLM.
+# This is the GB200 launch wrapper; convert.sh remains the backend because it performs
+# AutoBridge export, tokenizer/processor copying, HF skeleton fixups, and optional roundtrip verification.
+
+set -euo pipefail
+
+NPROC="${NPROC:-4}"
+EP="${OV2_EP:-8}"
+VERIFY="${VERIFY:-0}"
+
 _HOME="${HOME:-}"
 [[ -n "$_HOME" ]] || _HOME="$(getent passwd "$(id -un 2>/dev/null)" 2>/dev/null | cut -d: -f6)"
 [[ -n "$_HOME" ]] || _HOME="/home/$(id -un 2>/dev/null)"
 
-# The TRAINED checkpoint to export: parent dir holding iter_* + latest_checkpointed_iteration.txt.
-# Arg 1 wins, else $CKPT_DIR, else the training launcher's home SAVE convention.
-CKPT_DIR="${1:-${CKPT_DIR:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200}}"
-[[ -f "$CKPT_DIR/latest_checkpointed_iteration.txt" ]] || {
-  echo "FATAL: '$CKPT_DIR' is not a trained ckpt root (no latest_checkpointed_iteration.txt)." >&2
-  echo "  Pass it explicitly:  bash run_export_hf.sh /path/to/your/ckpt_dir   (or set CKPT_DIR=)" >&2
-  exit 1; }
+# Positional arg wins, followed by SRC, the legacy CKPT_DIR alias, and finally the GB200 training default.
+SRC="${1:-${SRC:-${CKPT_DIR:-$_HOME/ckpts_video_sft/ov2_30b_a3b_gb200}}}"
+OUT="${OUT:-${HF_OUT:-$_HOME/ov2_hf_export/$(basename "${SRC%/}")_hf}}"
+WORK="${WORK:-$_HOME/_ov2_convert}"
+LOGDIR="${LOGDIR:-$_HOME/export_hf_logs}"
 
-# Dispatch config skeleton (HF auto_model with architectures for AutoBridge). Prefer the home copy, else
-# the /datasets mount. convert.sh's ensure_dispatch_cfg sets architectures if the skeleton ships null.
+REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ "$__d" != "/" && ! -d "$__d/src/megatron/bridge" ]]; do __d="$(dirname "$__d")"; done; echo "$__d"; })}"
+[[ -d "$REPO/src/megatron/bridge" ]] || REPO="$_HOME/LLaVA-OneVision-2-Megatron-Bridge"
+[[ -d "$REPO/src/megatron/bridge" ]] || { echo "[export-hf] FATAL: OV2 fork root not found (set REPO=)" >&2; exit 1; }
+
+CONVDIR="$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/convert"
+DRIVER="$CONVDIR/convert.sh"
+WORKER="$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/ov2_30b_export_ep8.py"
+[[ -f "$DRIVER" ]] || { echo "[export-hf] FATAL: $DRIVER not found" >&2; exit 1; }
+[[ -f "$WORKER" ]] || { echo "[export-hf] FATAL: $WORKER not found" >&2; exit 1; }
+
+# Accept either a checkpoint root or a pinned iter_* directory, and fail before reserving all GPUs.
+if [[ -f "$SRC/.metadata" ]]; then
+  ITER="$(basename "$SRC")"
+  ITER="${ITER//[^0-9]/}"
+  [[ -n "$ITER" ]] && ITER=$((10#$ITER)) || ITER="pinned"
+elif [[ -f "$SRC/latest_checkpointed_iteration.txt" ]]; then
+  ITER="$(tr -d '\r\n\t ' < "$SRC/latest_checkpointed_iteration.txt")"
+  [[ "$ITER" =~ ^[0-9]+$ ]] || { echo "[export-hf] FATAL: $SRC tracker='$ITER' is not a numeric iteration" >&2; exit 1; }
+  ITER_DIR="$SRC/$(printf 'iter_%07d' "$ITER")"
+  [[ -f "$ITER_DIR/.metadata" ]] || { echo "[export-hf] FATAL: $ITER_DIR/.metadata not found" >&2; exit 1; }
+else
+  echo "[export-hf] FATAL: $SRC is neither a checkpoint root nor an iter_* directory" >&2
+  exit 1
+fi
+[[ -z "${EXPECT_ITER:-}" || "$ITER" == "$EXPECT_ITER" ]] || { echo "[export-hf] FATAL: iter=$ITER != EXPECT_ITER=$EXPECT_ITER" >&2; exit 1; }
+[[ "$SRC" != "$OUT" ]] || { echo "[export-hf] FATAL: source and output paths are identical: $SRC" >&2; exit 1; }
+[[ "$NPROC" =~ ^[1-9][0-9]*$ && "$EP" =~ ^[1-9][0-9]*$ ]] || { echo "[export-hf] FATAL: NPROC and OV2_EP must be positive integers" >&2; exit 1; }
+[[ "$VERIFY" == "0" || "$VERIFY" == "1" ]] || { echo "[export-hf] FATAL: VERIFY must be 0 or 1" >&2; exit 1; }
+
+# Dispatch skeleton: prefer a home-staged copy, then the GB200 /datasets mount.
 _cfg="$_HOME/llava-ov2-30b-a3b-m9lvdn/auto_model"
 [[ -d "$_cfg" ]] || _cfg="/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model"
+CFG="${CFG:-$_cfg}"
+[[ -f "$CFG/config.json" ]] || { echo "[export-hf] FATAL: dispatch config missing: $CFG/config.json" >&2; exit 1; }
 
-export CKPTA="${CKPTA:-$CKPT_DIR}"                                         # <-- THE key override: your trained ckpt
-export CFG="${CFG:-$_cfg}"
-export HF_OUT="${HF_OUT:-$_HOME/ov2_hf_export/$(basename "$CKPT_DIR")_hf}"  # off-repo HF output (30-58G)
-export WORK="${WORK:-$_HOME/_ov2_convert}"                                 # off-repo scratch (cfg_dispatch)
+export CKPT_DIR="$SRC" CKPTA="$SRC" HF_OUT="$OUT" WORK CFG NPROC OV2_EP="$EP"
+export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}" TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+export OV2_MOE_PERMUTE_FUSION="${OV2_MOE_PERMUTE_FUSION:-0}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker}"
+export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-NVL}"
+export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-1}"
+export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}"
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}" PYTHONUNBUFFERED=1
 
-echo "[run-export-hf] trained ckpt : $CKPTA  (latest iter $(cat "$CKPT_DIR/latest_checkpointed_iteration.txt" 2>/dev/null || echo '?'))"
-echo "[run-export-hf] dispatch cfg : $CFG"
-echo "[run-export-hf] HF output    : $HF_OUT"
-echo "[run-export-hf] mode         : $([[ "${VERIFY:-0}" == 1 ]] && echo '30b (export + roundtrip allclose)' || echo 'export')"
+# Mirror convert.sh's rendezvous priorities so bad world-size requests fail before torchrun starts.
+GPUS_PER_NODE="$NPROC"
+if [[ "${FORCE_STANDALONE:-0}" == "1" ]]; then
+  NNODES=1
+  NODE_RANK=0
+  RUN_MODE="single-node (FORCE_STANDALONE)"
+elif [[ -n "${PET_NNODES:-}" || ( -n "${MASTER_ADDR:-}" && -n "${WORLD_SIZE:-}" ) ]]; then
+  NNODES="${PET_NNODES:-$(( WORLD_SIZE / GPUS_PER_NODE ))}"
+  NODE_RANK="${PET_NODE_RANK:-$(( ${RANK:-0} / GPUS_PER_NODE ))}"
+  RUN_MODE="multi-node (K8s auto-detected)"
+elif [[ -n "${LIST_IP:-}" ]]; then
+  read -ra list_ip <<< "$LIST_IP"
+  (( ${#list_ip[@]} >= 1 )) || { echo "[export-hf] FATAL: LIST_IP is empty" >&2; exit 1; }
+  NNODES=${#list_ip[@]}
+  read -ra _my_ips <<< "$(hostname -I 2>/dev/null)"
+  CURRENT_HOST="$(hostname)"
+  NODE_RANK=-1
+  for i in "${!list_ip[@]}"; do
+    if [[ "${list_ip[$i]}" == "$CURRENT_HOST" ]]; then NODE_RANK=$i && break; fi
+    for _ip in "${_my_ips[@]}"; do [[ "${list_ip[$i]}" == "$_ip" ]] && NODE_RANK=$i && break 2; done
+  done
+  [[ "$NODE_RANK" -ge 0 ]] || { echo "[export-hf] FATAL: this host is not present in LIST_IP (${list_ip[*]})" >&2; exit 1; }
+  RUN_MODE="multi-node (manual LIST_IP)"
+else
+  NNODES=1
+  NODE_RANK=0
+  RUN_MODE="single-node"
+fi
+WORLD=$((NPROC * NNODES))
+(( WORLD == EP )) || { echo "[export-hf] FATAL: export requires world=$WORLD to equal OV2_EP=$EP (GB200 EP8 needs 2 nodes x 4 GPUs)" >&2; exit 1; }
 
-# Create scratch + output dirs before convert.sh runs. convert.sh's ensure_dispatch_cfg copies the dispatch
-# config into "$WORK/cfg_dispatch" -- cp -r can't create that if $WORK's parent is missing. Idempotent.
-mkdir -p "$WORK" "$HF_OUT"
+MODE="export"
+[[ "$VERIFY" == "1" ]] && MODE="30b"
+mkdir -p "$WORK" "$OUT" "$LOGDIR"
 
-exec bash "$HERE/convert.sh" "$([[ "${VERIFY:-0}" == 1 ]] && echo 30b || echo export)"
+echo "[export-hf] rdzv=$RUN_MODE nnodes=$NNODES node_rank=$NODE_RANK nproc=$NPROC world=$WORLD ep=$EP"
+echo "[export-hf] $SRC (iter=$ITER) -> $OUT"
+echo "[export-hf] cfg=$CFG mode=$MODE work=$WORK"
+
+cd "$REPO"
+bash "$DRIVER" "$MODE" 2>&1 | tee "$LOGDIR/export_hf_ep${EP}_iter${ITER}_node${NODE_RANK}.log"
+echo "[export-hf] DONE: $OUT"
