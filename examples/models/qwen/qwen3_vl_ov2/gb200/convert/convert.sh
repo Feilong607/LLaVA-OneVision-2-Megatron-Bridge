@@ -29,6 +29,7 @@
 set -euo pipefail
 MODE="${1:?usage: convert.sh 30b|4b|export|roundtrip|from_base|reshard|export_hf|verify ...}"; shift || true
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GB200_DIR="$(cd "$HERE/.." && pwd)"
 REPO="${REPO:-$({ d="$HERE"; while [[ "$d" != "/" && ! -d "$d/src/megatron/bridge" ]]; do d="$(dirname "$d")"; done; echo "$d"; })}"
 [[ -d "$REPO/src/megatron/bridge" ]] || { echo "FATAL: OV2 fork root not found above $HERE (set REPO=)" >&2; exit 1; }
 
@@ -151,6 +152,7 @@ else
 fi
 echo "==> launch: RDZV='$RDZV' NPROC=$NPROC WORLD=$WORLD OV2_EP=${OV2_EP:-8}"
 cd "$REPO"
+# shellcheck disable=SC2086  # RDZV intentionally expands into multiple torchrun arguments.
 dist(){ python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" "$@"; }
 
 # AutoBridge dispatches on config.architectures; p16m33 skeleton ships architectures:null -> WORK copy w/ it set.
@@ -205,9 +207,11 @@ FIXJSON
 
 do_export(){
   (( WORLD == ${OV2_EP:-8} )) || { echo "ERROR: 30B export needs world == EP (OV2_EP=${OV2_EP:-8}) but world=$WORLD (NPROC=$NPROC nodes=${NN:-1}). Verified path = EP8 on 8 GPUs (2 nodes). Single 4-GPU node: OV2_EP=4 (EP4 load-reshards the EP8 ckpt -> UNVALIDATED, check roundtrip allclose)." >&2; exit 1; }
+  local EXPORT_WORKER="$GB200_DIR/ov2_30b_export_ep8.py"
+  [[ -f "$EXPORT_WORKER" ]] || { echo "FATAL: export worker not found: $EXPORT_WORKER" >&2; exit 1; }
   local CFG_RDY; CFG_RDY="$(ensure_dispatch_cfg "$CFG_DEF" "$WORK/cfg_dispatch")"
   echo "==> [$PLAT] export: mcore $CKPTA_DEF -> HF $HF_OUT   (cfg=$CFG_RDY)"
-  CFG="$CFG_RDY" CKPTA="$CKPTA_DEF" HF="$HF_OUT" dist "$HERE/ov2_30b_export_ep8.py"
+  CFG="$CFG_RDY" CKPTA="$CKPTA_DEF" HF="$HF_OUT" dist "$EXPORT_WORKER"
   echo "==> [$PLAT] copy custom .py + tokenizer/processor aux into HF (save_hf_pretrained can't auto-copy from a local source)"
   for f in "$CFG_RDY"/*.py "$CFG_RDY"/tokenizer* "$CFG_RDY"/*token* "$CFG_RDY"/*preprocessor* "$CFG_RDY"/generation_config.json "$CFG_RDY"/vocab.json "$CFG_RDY"/merges.txt "$CFG_RDY"/chat_template.jinja "$CFG_RDY"/added_tokens.json; do
     [ -f "$f" ] && cp -n "$f" "$HF_OUT/" 2>/dev/null || true
