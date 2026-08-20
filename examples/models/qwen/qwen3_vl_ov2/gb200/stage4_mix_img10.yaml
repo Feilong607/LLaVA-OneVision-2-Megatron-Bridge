@@ -1,0 +1,157 @@
+# Stage-4 mix (GB200): stage-3 video mix + 10% single-image replay (47m_v3).
+# pandas 20x6300=126000 (56.70%) | shortmix 10x7000=70000 (31.50%) | timelens 1x4000 (1.80%)
+# | image 18x1235=22230 (10.00%) | total weight 222230.
+# Image share = 18w/(200000+18w); retune by changing 1235 only.
+# 1 pandas-epoch = 617482 samples (= 555714 x 222230/200000).
+__module__: megatron.energon
+__class__: Metadataset
+splits:
+  train:
+    datasets:
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part0/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part1/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part2/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part3/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part4/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part5/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part6/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part7/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part8/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part9/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part10/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part11/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part12/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part13/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part14/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part15/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part16/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part17/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part18/webdataset
+        subflavors: {augmentation: false}
+      - weight: 6300
+        path: /datasets/feilong-stage3-datasets/dataset/pandas70m_gt10min_packed_64k_fix_recap_with47m/pandas70m_part19/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part0/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part1/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part2/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part3/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part4/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part5/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part6/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part7/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part8/webdataset
+        subflavors: {augmentation: false}
+      - weight: 7000
+        path: /datasets/feilong-stage3-datasets/dataset/shortmix_3sets_packed_64k/part9/webdataset
+        subflavors: {augmentation: false}
+      - weight: 4000
+        path: /datasets/feilong-stage3-datasets/dataset/Timelens_temporal_grounding_packed_64k/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_00/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_01/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_02/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_03/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_04/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_05/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_06/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_07/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_08/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_09/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_10/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_11/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_12/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_13/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_14/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_15/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_16/webdataset
+        subflavors: {augmentation: false}
+      - weight: 1235
+        path: /datasets/llava/final_round/dataset_sft_image/final_sft_47m_v3_64k_shuffled_full/per_shard/shard_17/webdataset
+        subflavors: {augmentation: false}
