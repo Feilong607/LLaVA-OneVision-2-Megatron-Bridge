@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-# OV2-30B-A3B (Qwen3-30B-A3B MoE) STAGE-4 - GB200-only IN-CONTAINER launcher
+# OV2-30B-A3B (Qwen3-30B-A3B MoE) STAGE-3 - GB200-only IN-CONTAINER launcher
 # (4 GPU/node; TP4 + EP8 needs 8 nodes for DP8). Standalone sibling of
 # ax_ov2_30b_a3b_gb200_packed_64k.sh - neither script depends on the other.
 #
-# Stage-4 = midtrain recipe + stage-3 video mix with 10% 47m_v3 single-image replay
-# (stage4_mix_img10.yaml: pandas 56.7% / shortmix 31.5% / timelens 1.8% / image 10.0%),
+# Stage-3 = midtrain recipe + video mix (pandas/shortmix/timelens) with 10% 47m_v3 single-image replay
+# (stage3_mix_img10.yaml: pandas 56.7% / shortmix 31.5% / timelens 1.8% / image 10.0%),
 # hyperparams aligned to the AIAK qwen35-s4 script: Muon lr 2e-5 -> 1e-6 cosine,
 # warmup-frac 0.002, wd 0, matched-adamw-rms 0.2, adam_beta2 0.99.
 # Init: trained stage-2mix ckpt (weights-only; auto-resumes when SAVE already has ckpts).
@@ -58,9 +58,9 @@ OV2_LLM_HF_30B="${OV2_LLM_HF_30B:-/datasets/qwen-models-ea5jyi/Qwen3-30B-A3B-Ins
 OV2_HF_PROC_30B="${OV2_HF_PROC_30B:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"
 OV2_HF_PROC_30B_P16M33="${OV2_HF_PROC_30B_P16M33:-/datasets/llava-ov2-30b-a3b-m9lvdn/auto_model}"
 OV2_PRETRAIN_ROOT="${OV2_PRETRAIN_ROOT:-/datasets/llava/11May}"
-DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/stage4_mix_img10.yaml}"   # stage-3 video mix + 10% 47m_v3 image replay
+DATA_PATH="${DATA_PATH:-$REPO/examples/models/qwen/qwen3_vl_ov2/gb200/stage3_mix_img10.yaml}"   # video mix + 10% 47m_v3 image replay
 INIT_CKPT="${INIT_CKPT:-$_HOME/ckpts_video_sft/ov2_30b_a3b_stage2mix_v3_gbs32}"   # trained stage-2mix torch_dist ckpt (EP8); weights-only via pretrained_checkpoint
-SAVE="${SAVE:-$_HOME/ckpts_video_sft/ov2_30b_a3b_stage4_img10_gbs32}"
+SAVE="${SAVE:-$_HOME/ckpts_video_sft/ov2_30b_a3b_stage3_img10_gbs32}"
 OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # midtrain from a trained ckpt -> skip the stage_0 stitch
 export OV2_LLM_HF_30B OV2_PRETRAIN_ROOT OV2_SKIP_BASE_STITCH OV2_HF_PROC_30B OV2_HF_PROC_30B_P16M33
 export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before skipping the stitch
@@ -267,10 +267,10 @@ OVERRIDES="$OVERRIDES checkpoint.save_interval=$SAVE_EVERY train.train_iters=$IT
 OVERRIDES="$OVERRIDES model.tensor_model_parallel_size=$TP model.sequence_parallel=$SP $MOE_CAPACITY_ARGS"
 OVERRIDES="$OVERRIDES model.moe_router_dtype=${OV2_ROUTER_DTYPE:-fp32}"   # 128-expert router stability
 OVERRIDES="$OVERRIDES scheduler.lr_warmup_iters=$WARMUP_ITERS"
-OVERRIDES="$OVERRIDES optimizer.lr=${OV2_LR:-2e-5} optimizer.min_lr=${OV2_MIN_LR:-1e-6}"   # stage-4 (AIAK qwen35-s4): 2e-5 cosine -> 1e-6
+OVERRIDES="$OVERRIDES optimizer.lr=${OV2_LR:-2e-5} optimizer.min_lr=${OV2_MIN_LR:-1e-6}"   # AIAK qwen35-s4: 2e-5 cosine -> 1e-6
 # 192GB HBM: whole optimizer on-GPU, NO CPU offload (offload-zero NaN bug class cannot occur).
 OVERRIDES="$OVERRIDES optimizer.optimizer_cpu_offload=false optimizer.use_precision_aware_optimizer=false"
-# Stage-4 Muon knobs (only when OV2_MIDTRAIN_MUON=1), baked to the AIAK qwen35-s4 values below;
+# Stage-3 Muon knobs (only when OV2_MIDTRAIN_MUON=1), baked to the AIAK qwen35-s4 values below;
 # each knob individually overridable. wd must hit optimizer AND scheduler (scheduler clobbers it per-iter).
 if [[ "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
   [[ "${OV2_FSDP:-0}" == "1" ]] && { echo "[ov2-30b-gb200] FATAL: OV2_FSDP=1 is incompatible with Muon (forces use_distributed_optimizer=False)." >&2; exit 1; }
@@ -284,7 +284,7 @@ if [[ "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
     echo "    - or use AdamW instead:        OV2_MIDTRAIN_MUON=0 bash \$0" >&2
     exit 1
   fi
-  # Stage-4 Muon hyperparams (AIAK qwen35-s4), each env-overridable: matched-adamw-rms 0.2
+  # Stage-3 Muon hyperparams (AIAK qwen35-s4), each env-overridable: matched-adamw-rms 0.2
   # (scale_mode stays the recipe default 'spectral'), wd 0 (set on optimizer AND scheduler
   # start/end, else the scheduler clobbers it back per-iter), adam_beta2 0.99 for Muon's
   # 1-D-param AdamW. Without these the recipe's midtrain block would give 0.15 / 0.01 / 0.95.
@@ -294,7 +294,7 @@ if [[ "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
   OVERRIDES="$OVERRIDES optimizer.muon_extra_scale_factor=$OV2_MUON_EXTRA_SCALE"
   OVERRIDES="$OVERRIDES optimizer.weight_decay=$OV2_MUON_WD scheduler.start_weight_decay=$OV2_MUON_WD scheduler.end_weight_decay=$OV2_MUON_WD"
   OVERRIDES="$OVERRIDES optimizer.adam_beta2=${OV2_ADAM_BETA2:-0.99}"
-  echo "[ov2-30b-gb200] MUON ENABLED (stage-4): scale_mode=${OV2_MUON_SCALE_MODE:-spectral(recipe)} extra_scale=$OV2_MUON_EXTRA_SCALE wd=$OV2_MUON_WD beta2=${OV2_ADAM_BETA2:-0.99} -- watch iter-1->3 grad-norm/NaN." >&2
+  echo "[ov2-30b-gb200] MUON ENABLED (stage-3): scale_mode=${OV2_MUON_SCALE_MODE:-spectral(recipe)} extra_scale=$OV2_MUON_EXTRA_SCALE wd=$OV2_MUON_WD beta2=${OV2_ADAM_BETA2:-0.99} -- watch iter-1->3 grad-norm/NaN." >&2
   echo "[ov2-30b-gb200] MUON resume CAUTION: Muon cannot cross-optimizer-resume from an AdamW ckpt; use a fresh SAVE or a Muon-saved ckpt." >&2
 fi
 OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-2}"    # conservative WekaFS default; override with OV2_NUM_WORKERS after validation
@@ -318,7 +318,7 @@ fi
 mkdir -p "$SAVE"; cd "$REPO"
 cp -f "${BASH_SOURCE[0]}" "$DATA_PATH" "$SAVE/" 2>/dev/null || true   # archive launcher + data yaml with the run
 # NOTE: the old Muon resume-topology guard was removed -- distributed Muon supports DP-reshard now.
-echo "[ov2-30b-gb200] in-container STAGE-4 | repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-2e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY muon=$OV2_MIDTRAIN_MUON timing_level=$TIMING_LOG_LEVEL timing_every=$TIMING_PRINT_INTERVAL timing_option=$TIMING_LOG_OPTION node_rank=$NODE_RANK nnodes=$NNODES"
+echo "[ov2-30b-gb200] in-container STAGE-3 | repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-2e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF moe_capacity=$MOE_CAPACITY_FACTOR pad_to_capacity=$MOE_PAD_TO_CAPACITY muon=$OV2_MIDTRAIN_MUON timing_level=$TIMING_LOG_LEVEL timing_every=$TIMING_PRINT_INTERVAL timing_option=$TIMING_LOG_OPTION node_rank=$NODE_RANK nnodes=$NNODES"
 # shellcheck disable=SC2086
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
   --recipe "$RECIPE" --dataset vlm-energon --step_func ov2_step \
