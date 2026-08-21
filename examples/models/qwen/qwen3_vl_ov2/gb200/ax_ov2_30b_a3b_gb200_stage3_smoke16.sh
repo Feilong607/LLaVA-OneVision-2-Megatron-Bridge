@@ -41,4 +41,9 @@ export OV2_EPOCHS="${OV2_EPOCHS:-1}"
 export SAVE_EVERY="${SAVE_EVERY:-100000}"              # no interval saves; auto final save at 20
 export SAVE="${SAVE:-$HOME/ckpts_video_sft/_smoke_stage3_16gpu}"
 
-exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ax_ov2_30b_a3b_gb200_stage3.sh"
+# tee to WekaFS: gang teardown deletes pods (and their UI logs) on any failure;
+# the persisted per-hostname log is what post-mortems run on. pipefail keeps
+# the launcher's exit code as this script's exit code.
+mkdir -p "$HOME/train_logs"
+bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ax_ov2_30b_a3b_gb200_stage3.sh" 2>&1 \
+  | tee -a "$HOME/train_logs/smoke_s3_16gpu_$(hostname).log"
