@@ -18,7 +18,9 @@
 # =============================================================================
 set -euo pipefail
 export HOME="${HOME:-/home/ftan0055}"
-export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-16}"
+# This launcher is the psi=16 A/B lane. Do not inherit a stale psi=1 value
+# from a copied Run:ai workload, which would contaminate the comparison.
+export OV2_PARALLEL_SHARD_ITERS=16
 export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_30b_a3b_stage3_img10_gbs32_psi16}"
 mkdir -p "$HOME/train_logs"
 bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ax_ov2_30b_a3b_gb200_stage3.sh" 2>&1 \
