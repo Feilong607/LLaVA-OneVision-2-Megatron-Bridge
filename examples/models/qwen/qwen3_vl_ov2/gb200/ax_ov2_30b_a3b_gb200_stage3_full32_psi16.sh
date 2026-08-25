@@ -56,7 +56,10 @@ readonly _PSI16_BASE_LAUNCHER="$_PSI16_SCRIPT_DIR/ax_ov2_30b_a3b_gb200_stage3.sh
 readonly _PSI16_DATA_PATH="$_PSI16_SCRIPT_DIR/stage3_mix_img10.yaml"
 readonly _PSI16_INIT_ROOT="$HOME/ckpts_video_sft/ov2_30b_a3b_stage2mix_v3_gbs32"
 readonly _PSI1_SAVE="$HOME/ckpts_video_sft/ov2_30b_a3b_stage3_img10_gbs32"
-readonly _PSI16_SAVE="$HOME/ckpts_video_sft/ov2_30b_a3b_stage3_img10_gbs32_psi16_v2"
+# v2 is preserved as failure evidence (fd exhaustion at iter 488). The changed
+# runtime contract and git provenance require a fresh namespace: reusing v2
+# would either mix dataloader state or fail the immutable manifest guard below.
+readonly _PSI16_SAVE="$HOME/ckpts_video_sft/ov2_30b_a3b_stage3_img10_gbs32_psi16_v3"
 
 [[ -f "$_PSI16_BASE_LAUNCHER" ]] || _psi16_die "base Stage-3 launcher missing: $_PSI16_BASE_LAUNCHER"
 [[ -f "$_PSI16_DATA_PATH" ]] || _psi16_die "Stage-3 dataset YAML missing: $_PSI16_DATA_PATH"
@@ -122,7 +125,52 @@ if [[ "${OV2_PSI16_SKIP_CONTROL_ASSET_CHECK:-0}" != "1" ]]; then
     || _psi16_die "dataset YAML differs from the psi=1 archived YAML"
 fi
 
+# --- fd budget. psi=16 over the 49-dataset blend keeps up to 49x16=784 shard readers
+# open per dataloader worker (psi=1 needs 49). Measured on GB200: RLIMIT_NOFILE is
+# 1024 soft AND 1024 hard, so the ceiling CANNOT be raised in-container -- the raise
+# below is a no-op today and only helps if the pod spec is ever fixed. The 08-24 run
+# died at iter 488 with OSError [Errno 24] inside torch's tensor-IPC path
+# (queues.py:_feed -> reduce_storage -> DupFd) on the last pod; the other 28 ranks then
+# hit the NCCL watchdog and burned the full 300-minute timeout.
+#
+# The only in-container fix is to stop spending fds on tensor IPC: "file_system" moves
+# worker->main tensor transfers to /dev/shm files, which leaves ~784 shard fds + ~60
+# baseline against the 1024 wall. Margin is thin (~170), hence the fd high-water
+# monitor below. None of this is an A/B variable: an fd ceiling and an IPC transport
+# change no sample order, no numerics, no step math.
+_psi16_nofile_hard="$(ulimit -Hn)"
+if [[ "$_psi16_nofile_hard" == "unlimited" ]]; then
+  ulimit -Sn 1048576 2>/dev/null || true
+else
+  ulimit -Sn "$_psi16_nofile_hard" 2>/dev/null || true
+fi
+_psi16_nofile_soft="$(ulimit -Sn)"
+export OV2_MP_SHARING_STRATEGY="${OV2_MP_SHARING_STRATEGY:-file_system}"
+# POSIX-ish df parse (GNU --output= is not everywhere); pipefail would abort the
+# wrapper on a df failure, so swallow it -- an unreadable value only downgrades the
+# check to a warning below, it never silently passes a real shortage.
+_psi16_shm_free_gb="$(df -k /dev/shm 2>/dev/null | awk 'NR==2{print int($4/1048576)}' || true)"
+
+# Cost containment, also not an A/B variable: the base default is 300 minutes, which
+# turned a 3h43m failure into a 9h/32-GPU burn. Fail fast instead.
+export OV2_DIST_TIMEOUT_MIN="${OV2_DIST_TIMEOUT_MIN:-60}"
+
+# Keep this before PREFLIGHT_ONLY: the code-sync preflight must reject the exact
+# bad transport/limit combination before a 32-GPU workload is submitted.
+if [[ "$_psi16_nofile_soft" != "unlimited" ]] && (( _psi16_nofile_soft < 16384 )); then
+  [[ "$OV2_MP_SHARING_STRATEGY" == "file_system" ]] \
+    || _psi16_die "nofile soft=$_psi16_nofile_soft hard=$(ulimit -Hn) cannot host psi=16 with fd-based tensor IPC (this is exactly the 08-24 iter-488 death). Keep OV2_MP_SHARING_STRATEGY=file_system, or get the pod RLIMIT_NOFILE raised."
+  if [[ -n "$_psi16_shm_free_gb" ]]; then
+    (( _psi16_shm_free_gb >= 64 )) \
+      || _psi16_die "OV2_MP_SHARING_STRATEGY=file_system needs /dev/shm headroom; only ${_psi16_shm_free_gb}G free"
+  else
+    echo "[psi16-ab] WARN: could not read /dev/shm free space; file_system IPC needs it (measured 1.7T free on GB200 2026-08-25)." >&2
+  fi
+  echo "[psi16-ab] WARN: nofile capped at $_psi16_nofile_soft; psi=16 fits only because tensor IPC is on /dev/shm. Watch the [psi16-fd] high-water lines." >&2
+fi
+
 echo "[psi16-ab] PASS: parallel_shard_iters=$OV2_PARALLEL_SHARD_ITERS"
+echo "[psi16-ab] PASS: nofile soft=$_psi16_nofile_soft hard=$(ulimit -Hn) sharing=$OV2_MP_SHARING_STRATEGY shm_free=${_psi16_shm_free_gb:-?}G dist_timeout_min=$OV2_DIST_TIMEOUT_MIN"
 echo "[psi16-ab] PASS: init=$INIT_CKPT"
 echo "[psi16-ab] PASS: save=$SAVE (control=$_PSI1_SAVE)"
 echo "[psi16-ab] PASS: base_launcher_sha256=$(_psi16_sha256 "$_PSI16_BASE_LAUNCHER")"
@@ -134,12 +182,34 @@ if [[ "${OV2_PSI16_PREFLIGHT_ONLY:-0}" == "1" ]]; then
 fi
 
 mkdir -p "$SAVE" "$HOME/train_logs"
+_PSI16_LOG="$HOME/train_logs/stage3_psi16_v3_32_$(hostname).log"
+
+# fd high-water monitor: ~784 shard fds against a 1024 wall is a thin margin, and the
+# 08-24 failure took 3h43m to surface because the low-weight datasets of the blend open
+# their shards only once sampled. Print the worst offender every 5 min so a doomed run
+# is visible within the first ~50 iterations instead of at iter 488. Read-only, dies
+# with the pod.
+if [[ "${OV2_PSI16_FD_MONITOR:-1}" == "1" ]]; then
+  (
+    while sleep 300; do
+      _fd_max=0
+      for _fd_pid in $(pgrep -f run_recipe.py 2>/dev/null); do
+        _fd_n="$(ls "/proc/$_fd_pid/fd" 2>/dev/null | wc -l)"
+        (( _fd_n > _fd_max )) && _fd_max="$_fd_n"
+      done
+      (( _fd_max > 0 )) && echo "[psi16-fd] $(date -Is) max_open_fds=$_fd_max limit=$_psi16_nofile_soft" >>"$_PSI16_LOG"
+    done
+  ) &
+fi
+
 _psi16_manifest="$SAVE/psi16_ab_manifest.txt"
 _psi16_manifest_tmp="$_psi16_manifest.$(hostname).$$.tmp"
 _psi16_repo="$(git -C "$_PSI16_SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
 _psi16_git_head="$(git -C "${_psi16_repo:-$_PSI16_SCRIPT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
 {
   echo "parallel_shard_iters=$OV2_PARALLEL_SHARD_ITERS"
+  echo "mp_sharing_strategy=$OV2_MP_SHARING_STRATEGY"
+  echo "dist_timeout_min=$OV2_DIST_TIMEOUT_MIN"
   echo "init_ckpt=$INIT_CKPT"
   echo "save=$SAVE"
   echo "control_save=$_PSI1_SAVE"
@@ -159,4 +229,4 @@ fi
 rm -f "$_psi16_manifest_tmp"
 
 bash "$_PSI16_BASE_LAUNCHER" 2>&1 \
-  | tee -a "$HOME/train_logs/stage3_psi16_v2_32_$(hostname).log"
+  | tee -a "$_PSI16_LOG"

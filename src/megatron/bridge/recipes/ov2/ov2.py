@@ -215,6 +215,26 @@ class OV2EnergonProvider(EnergonProvider):
         from megatron.bridge.data.energon.base_energon_datamodule import EnergonMultiModalDataModule
 
         assert self.path, "OV2EnergonProvider.path must be set (CLI: dataset.path=<dir>)"
+
+        # ---- torch tensor-IPC sharing strategy (default: untouched) ----
+        # Linux default is "file_descriptor": every tensor a dataloader worker sends to the main
+        # process costs an fd (multiprocessing.queues._feed -> reduce_storage -> DupFd) held until
+        # the receiver maps it. That is fine at parallel_shard_iters=1 (~49 shard handles/worker on
+        # the 49-dataset stage-3 blend) but not at the upstream default 16: ~784 shard handles plus
+        # the IPC fds blow past the container's RLIMIT_NOFILE, which is 1024 soft AND hard on GB200
+        # (unraisable in-container). "file_system" moves the transfers to /dev/shm files and removes
+        # the IPC fds entirely. Must be set BEFORE any worker is forked -- here is that point.
+        # Unset => no change to any validated run; the psi16 A/B launcher opts in.
+        _mp_strategy = os.environ.get("OV2_MP_SHARING_STRATEGY", "")
+        if _mp_strategy:
+            import torch.multiprocessing as _torch_mp
+
+            _torch_mp.set_sharing_strategy(_mp_strategy)
+            logger.info(
+                "OV2EnergonProvider: torch.multiprocessing sharing_strategy=%s (parallel_shard_iters=%s)",
+                _torch_mp.get_sharing_strategy(),
+                os.environ.get("OV2_PARALLEL_SHARD_ITERS", "16"),
+            )
         if self.task_encoder is not None:
             self.task_encoder.seq_len = self.seq_length
             self.task_encoder.seq_length = self.seq_length
