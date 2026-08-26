@@ -16,8 +16,24 @@
 # =============================================================================
 set -euo pipefail
 
+# Preflight/FATAL lines must survive the pod. Run:ai deletes pods on gang
+# teardown and takes the LOGS tab with them, so anything that only reached
+# stdout is gone exactly when a post-mortem needs it -- the 08-25 psi16-v3
+# failure left its [psi16-fd] high-water lines (appended to the file) but lost
+# every [psi16-ab] line, including the nofile soft/hard reading that identifies
+# the fd ceiling. Same bug the videobench runner already fixed by moving its
+# identity line after the tee. _PSI16_LOG is defined below, before the first
+# call site; the guard keeps these usable if that ever stops being true.
+_psi16_emit() {
+  if [[ -n "${_PSI16_LOG:-}" ]]; then
+    echo "$*" | tee -a "$_PSI16_LOG"
+  else
+    echo "$*"
+  fi
+}
+
 _psi16_die() {
-  echo "[psi16-ab] FATAL: $*" >&2
+  _psi16_emit "[psi16-ab] FATAL: $*" >&2
   exit 1
 }
 
@@ -60,6 +76,13 @@ readonly _PSI1_SAVE="$HOME/ckpts_video_sft/ov2_30b_a3b_stage3_img10_gbs32"
 # runtime contract and git provenance require a fresh namespace: reusing v2
 # would either mix dataloader state or fail the immutable manifest guard below.
 readonly _PSI16_SAVE="$HOME/ckpts_video_sft/ov2_30b_a3b_stage3_img10_gbs32_psi16_v3"
+
+# Defined here, ahead of every _psi16_die/_psi16_emit call site, so preflight
+# output and early FATALs are persisted too. Only train_logs is created now --
+# "$SAVE" stays with the launch step below, because OV2_PSI16_PREFLIGHT_ONLY
+# promises no SAVE files are written.
+mkdir -p "$HOME/train_logs"
+readonly _PSI16_LOG="$HOME/train_logs/stage3_psi16_v3_32_$(hostname).log"
 
 [[ -f "$_PSI16_BASE_LAUNCHER" ]] || _psi16_die "base Stage-3 launcher missing: $_PSI16_BASE_LAUNCHER"
 [[ -f "$_PSI16_DATA_PATH" ]] || _psi16_die "Stage-3 dataset YAML missing: $_PSI16_DATA_PATH"
@@ -164,25 +187,26 @@ if [[ "$_psi16_nofile_soft" != "unlimited" ]] && (( _psi16_nofile_soft < 16384 )
     (( _psi16_shm_free_gb >= 64 )) \
       || _psi16_die "OV2_MP_SHARING_STRATEGY=file_system needs /dev/shm headroom; only ${_psi16_shm_free_gb}G free"
   else
-    echo "[psi16-ab] WARN: could not read /dev/shm free space; file_system IPC needs it (measured 1.7T free on GB200 2026-08-25)." >&2
+    _psi16_emit "[psi16-ab] WARN: could not read /dev/shm free space; file_system IPC needs it (measured 1.7T free on GB200 2026-08-25)." >&2
   fi
-  echo "[psi16-ab] WARN: nofile capped at $_psi16_nofile_soft; psi=16 fits only because tensor IPC is on /dev/shm. Watch the [psi16-fd] high-water lines." >&2
+  _psi16_emit "[psi16-ab] WARN: nofile capped at $_psi16_nofile_soft; psi=16 fits only because tensor IPC is on /dev/shm. Watch the [psi16-fd] high-water lines." >&2
 fi
 
-echo "[psi16-ab] PASS: parallel_shard_iters=$OV2_PARALLEL_SHARD_ITERS"
-echo "[psi16-ab] PASS: nofile soft=$_psi16_nofile_soft hard=$(ulimit -Hn) sharing=$OV2_MP_SHARING_STRATEGY shm_free=${_psi16_shm_free_gb:-?}G dist_timeout_min=$OV2_DIST_TIMEOUT_MIN"
-echo "[psi16-ab] PASS: init=$INIT_CKPT"
-echo "[psi16-ab] PASS: save=$SAVE (control=$_PSI1_SAVE)"
-echo "[psi16-ab] PASS: base_launcher_sha256=$(_psi16_sha256 "$_PSI16_BASE_LAUNCHER")"
-echo "[psi16-ab] PASS: dataset_sha256=$(_psi16_sha256 "$_PSI16_DATA_PATH")"
+# The nofile line is the one an admin needs to see for the RLIMIT_NOFILE case;
+# keep it persisted rather than stdout-only.
+_psi16_emit "[psi16-ab] PASS: parallel_shard_iters=$OV2_PARALLEL_SHARD_ITERS"
+_psi16_emit "[psi16-ab] PASS: nofile soft=$_psi16_nofile_soft hard=$(ulimit -Hn) sharing=$OV2_MP_SHARING_STRATEGY shm_free=${_psi16_shm_free_gb:-?}G dist_timeout_min=$OV2_DIST_TIMEOUT_MIN"
+_psi16_emit "[psi16-ab] PASS: init=$INIT_CKPT"
+_psi16_emit "[psi16-ab] PASS: save=$SAVE (control=$_PSI1_SAVE)"
+_psi16_emit "[psi16-ab] PASS: base_launcher_sha256=$(_psi16_sha256 "$_PSI16_BASE_LAUNCHER")"
+_psi16_emit "[psi16-ab] PASS: dataset_sha256=$(_psi16_sha256 "$_PSI16_DATA_PATH")"
 
 if [[ "${OV2_PSI16_PREFLIGHT_ONLY:-0}" == "1" ]]; then
-  echo "[psi16-ab] PREFLIGHT ONLY: no training process started and no SAVE files written"
+  _psi16_emit "[psi16-ab] PREFLIGHT ONLY: no training process started and no SAVE files written"
   exit 0
 fi
 
-mkdir -p "$SAVE" "$HOME/train_logs"
-_PSI16_LOG="$HOME/train_logs/stage3_psi16_v3_32_$(hostname).log"
+mkdir -p "$SAVE"
 
 # fd high-water monitor: ~784 shard fds against a 1024 wall is a thin margin, and the
 # 08-24 failure took 3h43m to surface because the low-weight datasets of the blend open
