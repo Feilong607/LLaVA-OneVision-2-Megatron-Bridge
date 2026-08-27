@@ -98,8 +98,10 @@ OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
 
 export OV2_RECOMPUTE_FULL OV2_RECOMPUTE_MOE MFU_PEAK_TFLOPS
 
-# ViT full activation recompute；不会冻结 ViT。
-export OV2_VISION_RECOMPUTE=1
+# ViT full activation recompute；不会冻结 ViT。Default unchanged (=1, the
+# validated path); overridable so the tower's recompute can be A/B-ed the same
+# way OV2_RECOMPUTE_MOE already can, once memory headroom allows.
+export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-1}"
 
 # 防止父 shell / Pod 遗留变量误冻结模型。
 export OV2_FREEZE_VISION=0

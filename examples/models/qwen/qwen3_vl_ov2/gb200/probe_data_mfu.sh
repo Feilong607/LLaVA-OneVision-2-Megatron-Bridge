@@ -67,7 +67,13 @@ probe_rlimit() {
 probe_logscan() {
   local log="${TRAIN_LOG:-}"
   if [[ -z "$log" ]]; then
-    log="$(ls -t "$HOME"/train_logs/stage3*.log 2>/dev/null | head -1 || true)"
+    # Iteration/timer lines print via print_rank_last, so only the LAST rank's
+    # pod log carries them — the newest file is usually master's, which has
+    # none (bitten 08-27). Pick the newest log that actually has them.
+    local _cand
+    for _cand in $(ls -t "$HOME"/train_logs/stage3*.log 2>/dev/null); do
+      if grep -q "elapsed time per iteration" "$_cand"; then log="$_cand"; break; fi
+    done
   fi
   if [[ -z "$log" || ! -r "$log" ]]; then
     echo "[probe:logscan] SKIP: no training log found (set TRAIN_LOG=...)"
