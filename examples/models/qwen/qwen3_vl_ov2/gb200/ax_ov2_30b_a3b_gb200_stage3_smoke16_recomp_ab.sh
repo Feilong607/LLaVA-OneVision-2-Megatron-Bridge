@@ -10,10 +10,10 @@
 # Arms (run sequentially by every pod, ~20 iters each):
 #   a = control: OV2_RECOMPUTE_MOE=1 (production behavior)
 #   b = OV2_RECOMPUTE_MOE=0
-# Both at TP=4 (production topology — NOT smoke16's TP=2). DP here is 4 vs the
-# production 8, which makes the optimizer shard per rank LARGER: if arm b fits
-# here, it fits in production with margin. Iteration time is ~2x production
-# (8 bins/rank vs 4) — only the A/B RATIO is meaningful, never the absolute.
+# Both at TP=4, which REQUIRES 8 pods / 32 GPUs (Workers=7): EP8 with ETP=TP=4
+# needs world%32==0 — the stage-3 launcher FATALs on DP%8 at 16 GPUs (first
+# submission died exactly there). At 8 pods this is the production topology
+# exactly, so peak-memory readings transfer 1:1; still judge by the A/B ratio.
 #
 # Output: ~/train_logs/smoke_s3_recomp_ab_result_<workload>.txt with p50 iter
 # time per arm, speedup %, per-pod peak memory, and an APPLY / DO-NOT-APPLY
@@ -118,7 +118,7 @@ if rc_b == "0" and b:
 else:
     lines.append(f"arm b (RECOMPUTE_MOE=0): rc={rc_b} FAILED (OOM likely) pod_peak_mib={peak_b}")
     lines.append("VERDICT: DO NOT APPLY — arm b did not survive at DP4; production DP8 is roomier but unproven")
-lines.append("note: absolute iter times are ~2x production (DP4 vs DP8); only the ratio transfers.")
+lines.append("note: 8 pods = production topology; still judge by the ratio, not absolutes.")
 lines.append("note: peaks are per-pod — check every pod: grep pod_peak ~/train_logs/smoke_s3_recomp_ab_*.log")
 tmp = result + ".tmp"
 with open(tmp, "w") as f:

@@ -105,8 +105,37 @@ def dist(name, xs):
     print(f"[probe:logscan] {name}: n={len(xs)} p50={p(0.5):.1f} p90={p(0.9):.1f} "
           f"max={xs_s[-1]:.1f} mean={st.mean(xs):.1f} CV={cv:.3f}")
 
+def deciles(name, xs):
+    if not xs:
+        return
+    s = sorted(xs)
+    q = lambda p: s[min(len(s) - 1, int(p * len(s)))]
+    print(f"[probe:logscan] {name} deciles: min={s[0]:.1f} p10={q(0.1):.1f} p25={q(0.25):.1f} "
+          f"p50={q(0.5):.1f} p75={q(0.75):.1f} p90={q(0.9):.1f} max={s[-1]:.1f}")
+
 dist("iter_ms", iters)
 dist("tflops_per_gpu", tflops)
+deciles("iter_ms", iters)
+deciles("tflops_per_gpu", tflops)
+# The fork counts FLOPs from ACTUAL tokens/patches (ov2_step accumulators), so
+# with near-constant iteration time the TFLOPs reading is a per-iteration token
+# meter. corr(tflops, iter_ms) near 0 proves time does not follow content
+# (fixed-shape padded execution); the fill line reads the padding waste off the
+# same numbers, using the best observed iteration as the "full" reference.
+n2 = min(len(iters), len(tflops))
+if n2 > 10:
+    mi2, mt2 = st.mean(iters[:n2]), st.mean(tflops[:n2])
+    cov2 = sum((iters[i] - mi2) * (tflops[i] - mt2) for i in range(n2))
+    di2 = sum((iters[i] - mi2) ** 2 for i in range(n2)) ** 0.5
+    dt2 = sum((tflops[i] - mt2) ** 2 for i in range(n2)) ** 0.5
+    if di2 and dt2:
+        print(f"[probe:logscan] corr(iter_ms, tflops) = {cov2/(di2*dt2):.3f} "
+              f"(near 0 => wall time is content-independent; tflops variance = bin-fill variance)")
+    ts = sorted(tflops[:n2])
+    best = st.mean(ts[-max(1, n2 // 100):])  # top 1% ~= fullest bins observed
+    q = lambda p: ts[min(len(ts) - 1, int(p * len(ts)))]
+    print(f"[probe:logscan] fill rate vs best-observed iters: p10={q(0.1)/best:.1%} "
+          f"p50={q(0.5)/best:.1%} p90={q(0.9)/best:.1%} (1 - fill = compute spent on padding)")
 bg = timer("batch-generator")
 fb = timer("forward-backward")
 dist("batch_generator_maxrank_ms", bg)
@@ -190,6 +219,82 @@ if rows:
     print(f"[probe:io] open+64KB ms: min={firsts[0]:.1f} p50={firsts[n//2]:.1f} max={firsts[-1]:.1f}")
     print("[probe:io] READ: p50 well above ~200MB/s and open p50 <50ms acquits sequential IO;")
     print("[probe:io]       a slow long-tail row here matches 'MFU dips when a rare dataset gets sampled'.")
+PYEOF
+}
+
+# ── bins: per-dataset bin composition => which datasets drive the fill swing ──
+# Iterations aggregate GBS=32 bins, yet iteration TFLOPs (= actual-token FLOPs
+# at constant wall time) swings ~1.65x — close to the full single-bin range, so
+# bins inside one iteration are highly same-source (energon streams shards
+# sequentially per worker). Ranking datasets by bin content therefore names the
+# MFU dips. Samples K bins per dataset straight out of the webdataset tars
+# (ps_*.json members) and reports a composition proxy: video frames + images +
+# caption text. Proxy, not exact tokens — ranking is what it is for.
+probe_bins() {
+  if [[ ! -r "$DATA_PATH" ]]; then
+    echo "[probe:bins] SKIP: blend yaml not readable: $DATA_PATH"
+    return 0
+  fi
+  echo "[probe:bins] blend=$DATA_PATH bins/dataset=${PROBE_BINS:-8}"
+  python3 - "$DATA_PATH" "${PROBE_BINS:-8}" <<'PYEOF'
+import glob
+import json
+import os
+import re
+import statistics as st
+import sys
+import tarfile
+
+yaml_path, k_bins = sys.argv[1], int(sys.argv[2])
+entries = re.findall(r"weight:\s*([\d.]+)\s*\n\s*path:\s*(\S+)", open(yaml_path).read())
+total_w = sum(float(w) for w, _ in entries) or 1.0
+rows = []
+for w, p in entries:
+    tars = sorted(glob.glob(os.path.join(p, "*.tar")))
+    name = "/".join(p.rstrip("/").split("/")[-2:])
+    if not tars:
+        print(f"[probe:bins] {name}: NO *.tar")
+        continue
+    stats = []
+    try:
+        with tarfile.open(tars[0], "r") as tf:
+            for m in tf:
+                if not m.name.endswith(".json"):
+                    continue
+                d = json.load(tf.extractfile(m))
+                imgs = d.get("images") or []
+                frames = sum(len(x) for x in imgs if isinstance(x, list))
+                n_smp = len(imgs)
+                chars = sum(len(str(x)) for x in (d.get("prompts") or [])) + \
+                        sum(len(str(x)) for x in (d.get("captions") or []))
+                stats.append((frames, n_smp, chars))
+                if len(stats) >= k_bins:
+                    break
+    except Exception as e:  # unreadable tar should not kill the sweep
+        print(f"[probe:bins] {name}: ERROR {e}")
+        continue
+    if not stats:
+        print(f"[probe:bins] {name}: no ps_*.json members found")
+        continue
+    med = lambda i: st.median(x[i] for x in stats)
+    lo = lambda i: min(x[i] for x in stats)
+    hi = lambda i: max(x[i] for x in stats)
+    proxy = med(0) + med(2) / 4.0  # frames dominate vision tokens; chars/4 ~ text tokens
+    rows.append((proxy, float(w) / total_w, name, med(0), lo(0), hi(0), med(1), med(2)))
+    print(f"[probe:bins] {name}: w={float(w)/total_w:.1%} frames p50={med(0):.0f} "
+          f"[{lo(0):.0f}-{hi(0):.0f}] samples/bin={med(1):.0f} cap_chars p50={med(2):.0f}")
+rows.sort()
+if rows:
+    print("[probe:bins] ---- fill-proxy ranking (lowest first = the MFU-dip candidates) ----")
+    for r in rows[:6]:
+        print(f"[probe:bins]   LOW  {r[2]}: proxy={r[0]:.0f} weight={r[1]:.1%}")
+    for r in rows[-3:]:
+        print(f"[probe:bins]   HIGH {r[2]}: proxy={r[0]:.0f} weight={r[1]:.1%}")
+    low_w = sum(r[1] for r in rows[: max(1, len(rows) // 3)])
+    print(f"[probe:bins] blend weight in the lowest third: {low_w:.1%} "
+          f"— expect roughly that share of iterations to sit on the low-MFU side")
+    print("[probe:bins] READ: proxy is composition (frames + chars/4), for ranking only; "
+          "exact tokens need the task encoder.")
 PYEOF
 }
 
@@ -327,9 +432,10 @@ case "$STAGE" in
   rlimit)  probe_rlimit ;;
   logscan) probe_logscan ;;
   io)      probe_io ;;
+  bins)    probe_bins ;;
   live)    probe_live ;;
   loader)  probe_loader ;;
   all)     probe_rlimit; probe_io; probe_logscan ;;
-  *) echo "[probe] FATAL: unknown stage '$STAGE' (rlimit|logscan|io|live|loader|all)" >&2; exit 1 ;;
+  *) echo "[probe] FATAL: unknown stage '$STAGE' (rlimit|logscan|io|bins|live|loader|all)" >&2; exit 1 ;;
 esac
 echo "[probe] done — persisted at $LOG"
