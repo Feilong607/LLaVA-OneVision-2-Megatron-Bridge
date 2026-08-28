@@ -104,6 +104,22 @@ export RECIPE="ov2_qwen35_35b_a3b_midtrain"
 export DATA_PATH="$_SM_YAML" SAVE="$SAVE_DIR" INIT_CKPT
 export OV2_DIST_TIMEOUT_MIN="${OV2_DIST_TIMEOUT_MIN:-60}"   # smoke fails fast, not 300min
 
+# Muon ON by default for this line (explicit decision): 30B midtrain+Muon+EP8 has run 11.5k+
+# iterations in production, so the base launcher's deadlock WARN is a hypothesis this smoke
+# tests cheaply — a real EP-backward deadlock hits the 60min dist timeout, not a silent hang.
+# Muon forces use_distributed_optimizer=False (layer-wise states instead of ZeRO-1): watch the
+# peak-memory line. muon_split_qkv=false is required for the trainable vision fused-QKV layout
+# (the base launcher only appends it for stage2; midtrain trains vision too).
+export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
+if [[ "$OV2_MIDTRAIN_MUON" == "1" ]]; then
+  export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_split_qkv=false"
+fi
+# Length-aligned batching (recipe's OV2_LENGTH_SORT_WINDOW, default here 16 = 4 steps' worth of
+# bins per rank): every rank emits its window longest-first, aligning per-step token totals
+# across DP/EP by shared ordering policy — the counter-measure to the measured EP per-layer
+# straggler (~20-30% idle on the 30B line). Set 0 to A/B against the unsorted path.
+export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"
+
 # Peak-memory sampler for this pod (dies with the script).
 ( _peak=0
   while sleep 5; do
@@ -112,7 +128,7 @@ export OV2_DIST_TIMEOUT_MIN="${OV2_DIST_TIMEOUT_MIN:-60}"   # smoke fails fast, 
   done ) &
 _mon=$!
 
-echo "[qwen35-smoke] launch: tp=$TP seq=$OV2_SEQ_LEN gbs=$OV2_MIDTRAIN_GBS accel=$ACCEL recompute_full=$OV2_RECOMPUTE_FULL init=$INIT_CKPT" | tee -a "$LOG"
+echo "[qwen35-smoke] launch: tp=$TP seq=$OV2_SEQ_LEN gbs=$OV2_MIDTRAIN_GBS accel=$ACCEL recompute_full=$OV2_RECOMPUTE_FULL muon=$OV2_MIDTRAIN_MUON sort_window=$OV2_LENGTH_SORT_WINDOW init=$INIT_CKPT" | tee -a "$LOG"
 set +e
 bash "$_SM_BASE" 2>&1 | tee -a "$LOG"
 _rc=${PIPESTATUS[0]}
@@ -122,14 +138,16 @@ _peak="$(cat "$LOG.peak" 2>/dev/null || echo '?')"
 echo "[qwen35-smoke] rc=$_rc pod_peak_mem_mib=$_peak" | tee -a "$LOG"
 
 # ── verdict: written by the pod whose log carries iteration lines ────────────
-python3 - "$LOG" "$RESULT" "$_rc" "$_peak" "$TP" "$OV2_SEQ_LEN" "$OV2_MIDTRAIN_GBS" "$_n_ds" <<'PYEOF'
+python3 - "$LOG" "$RESULT" "$_rc" "$_peak" "$TP" "$OV2_SEQ_LEN" "$OV2_MIDTRAIN_GBS" "$_n_ds" \
+          "$OV2_MIDTRAIN_MUON" "$OV2_LENGTH_SORT_WINDOW" <<'PYEOF'
 import os
 import re
 import statistics as st
 import sys
 
-log, result, rc, peak, tp, seq, gbs, n_ds = sys.argv[1:9]
+log, result, rc, peak, tp, seq, gbs, n_ds, muon, sortw = sys.argv[1:11]
 text = open(log, errors="replace").read()
+sort_on = "length-sorted batching ON" in text
 its = [float(x) for x in re.findall(r"elapsed time per iteration \(ms\): ([\d.]+)", text)][3:]
 tf = [float(x) for x in re.findall(r"TFLOP/s/GPU\)?: ([\d.]+)", text)][3:]
 fb = [(float(a), float(b)) for a, b in re.findall(r"forward-backward[ .]*:? *\(([\d.]+), ([\d.]+)\)", text)][3:]
@@ -138,7 +156,8 @@ nans = len(re.findall(r"skipping batch|found NaN|nan detected", text, re.I))
 if not its and rc == "0":
     sys.exit(0)  # healthy waiter pod (iteration lines print on the last rank only)
 
-lines = [f"qwen35 merged-stage 64k smoke — TP={tp} seq={seq} gbs={gbs} datasets={n_ds}"]
+lines = [f"qwen35 merged-stage 64k smoke — TP={tp} seq={seq} gbs={gbs} datasets={n_ds} "
+         f"muon={muon} sort_window={sortw} (engaged: {'yes' if sort_on else 'NO — check recipe log'})"]
 if its:
     s = sorted(its)
     q = lambda p: s[min(len(s) - 1, int(p * len(s)))]

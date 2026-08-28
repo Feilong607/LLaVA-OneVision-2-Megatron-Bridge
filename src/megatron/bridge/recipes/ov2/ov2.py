@@ -194,6 +194,57 @@ def _ov2_backbone_paths(backbone: str) -> dict[str, Any]:
     return dict(_OV2_BACKBONES[key])
 
 
+class _LengthSortedLoader:
+    """Window-sorted wrapper over an EnergonDataloader (OV2_LENGTH_SORT_WINDOW=N, default off).
+
+    Why: with mbs=1 THD packing every DP rank draws bins independently, and EP groups span DP
+    replicas, so each MoE layer's all-to-all waits for the heaviest bin in the group — the whole
+    cluster marches at max-token pace (measured on the 30B stage-3 line: fb ~constant while
+    per-rank tokens swing 2x; average rank idles ~20-30% inside fb). There is no cross-rank
+    batch coordination, but none is needed: if EVERY rank sorts its next N bins by length and
+    emits them longest-first, ranks become length-ALIGNED per step by shared ordering policy
+    alone — step k pairs each rank's k-th longest with the others' k-th longest, shrinking the
+    per-step max/mean spread to the spread of a single order statistic. Zero communication.
+
+    Costs and caveats: buffers N full batches in host RAM per rank (bins are 64k-token packs
+    with pixel tensors — keep N modest, 8-32); reorders the sample stream within each window
+    (training order differs from the unsorted validated path — that is the point); on
+    dataloader-state save/resume the up-to-N buffered-but-unyielded bins are skipped (save_state
+    delegates to the inner loader, whose cursor is already past them) — negligible against
+    multi-epoch streams. All ranks must use the same N (same env; asserted nowhere — the env is
+    global to the job).
+    """
+
+    def __init__(self, inner, window: int):
+        self._inner = inner
+        self._window = int(window)
+
+    @staticmethod
+    def _key(batch) -> int:
+        try:
+            tokens = batch.get("tokens", batch.get("input_ids"))
+            return int(tokens.shape[-1]) if tokens is not None else 0
+        except Exception:
+            return 0
+
+    def __iter__(self):
+        buf = []
+        for b in self._inner:
+            buf.append(b)
+            if len(buf) >= self._window:
+                buf.sort(key=self._key, reverse=True)
+                yield from buf
+                buf = []
+        buf.sort(key=self._key, reverse=True)  # finite-iterator tail (train stream is infinite)
+        yield from buf
+
+    def save_state(self):
+        return self._inner.save_state()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 # =============================================================================
 # Energon dataset provider (carries the OV2 task encoder)
 # =============================================================================
@@ -257,6 +308,12 @@ class OV2EnergonProvider(EnergonProvider):
             parallel_shard_iters=int(os.environ.get("OV2_PARALLEL_SHARD_ITERS", "16")),
         )
         train_loader = dataset.train_dataloader()
+        # Length-aligned batching across DP/EP (see _LengthSortedLoader). Default 0 = off, the
+        # validated unsorted path. Train loader only — val order does not matter.
+        _sort_win = int(os.environ.get("OV2_LENGTH_SORT_WINDOW", "0") or 0)
+        if _sort_win > 1:
+            logger.info("OV2EnergonProvider: length-sorted batching ON, window=%d", _sort_win)
+            train_loader = _LengthSortedLoader(train_loader, _sort_win)
         try:
             val_loader = dataset.val_dataloader()
         except Exception as e:
