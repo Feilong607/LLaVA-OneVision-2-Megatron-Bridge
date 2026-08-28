@@ -298,6 +298,47 @@ if rows:
 PYEOF
 }
 
+# ── settings: ground-truth runtime config of the RUNNING training ────────────
+# Code archaeology tells you what a launcher WOULD set; /proc tells you what
+# the live process actually got. Run inside a pod of the running training
+# (TERMINAL tab). Read-only. Dumps: the full hydra override list from the rank
+# process's cmdline, the OV2_*/parallelism env it inherited, its real
+# RLIMIT_NOFILE, and the dataloader worker census — everything needed to stop
+# guessing which vintage/lane the job is on.
+probe_settings() {
+  local pid
+  pid="$(pgrep -f run_recipe.py | head -1 || true)"
+  [[ -n "$pid" ]] || { echo "[probe:settings] SKIP: no run_recipe.py process on this pod"; return 0; }
+  echo "[probe:settings] rank pid=$pid ($(pgrep -fc run_recipe.py) rank processes on this pod)"
+  echo "[probe:settings] ---- cmdline (hydra overrides) ----"
+  tr '\0' '\n' </proc/"$pid"/cmdline | sed 's/^/[probe:settings]   /'
+  echo "[probe:settings] ---- env (OV2_* / parallelism / NCCL) ----"
+  tr '\0' '\n' </proc/"$pid"/environ \
+    | grep -E '^(OV2_|ACCEL=|TP=|NPROC=|SEQ|GBS|MIDTRAIN|SAVE|DATA_PATH=|INIT_CKPT=|NCCL_|CUDA_DEVICE|MASTER_|PET_NNODES|PET_NODE_RANK|TIMING|LOG_EVERY|MIXED_PRECISION)' \
+    | sort | sed 's/^/[probe:settings]   /'
+  echo "[probe:settings] ---- limits ----"
+  grep "Max open files" /proc/"$pid"/limits | sed 's/^/[probe:settings]   /'
+  echo "[probe:settings] ---- process census ----"
+  local kids=0 p
+  for p in $(pgrep -f run_recipe.py); do
+    for f in /proc/"$p"/task/*/children; do
+      kids=$(( kids + $(wc -w <"$f" 2>/dev/null || echo 0) ))
+    done
+  done
+  echo "[probe:settings]   run_recipe ranks=$(pgrep -fc run_recipe.py) total children=$kids (dataloader workers + inductor compile workers)"
+  # Resolved-config file, if the trainer archived one next to the checkpoints.
+  local save
+  save="$(tr '\0' '\n' </proc/"$pid"/cmdline | grep -m1 '^checkpoint.save=' | cut -d= -f2- || true)"
+  if [[ -n "$save" && -d "$save" ]]; then
+    echo "[probe:settings] ---- $save (top-level files) ----"
+    ls -lt "$save" 2>/dev/null | grep -vE '^total|iter_' | head -8 | sed 's/^/[probe:settings]   /'
+    local cfg
+    cfg="$(ls -t "$save"/*.yaml "$save"/run_config* 2>/dev/null | head -1 || true)"
+    [[ -n "$cfg" ]] && { echo "[probe:settings] ---- recompute/optimizer/dataloader keys from $(basename "$cfg") ----"; \
+      grep -nE "recompute|optimizer|muon|num_workers|shuffle|parallel_shard|use_distributed_optimizer" "$cfg" | head -20 | sed 's/^/[probe:settings]   /'; }
+  fi
+}
+
 # ── live: correlate GPU-util troughs with dataloader-worker state ────────────
 # Run INSIDE a pod of the running training (TERMINAL tab). Read-only: samples
 # nvidia-smi + /proc every 2s. Dataloader workers = child PIDs of the
@@ -429,13 +470,14 @@ PYEOF
 }
 
 case "$STAGE" in
-  rlimit)  probe_rlimit ;;
-  logscan) probe_logscan ;;
-  io)      probe_io ;;
-  bins)    probe_bins ;;
-  live)    probe_live ;;
-  loader)  probe_loader ;;
-  all)     probe_rlimit; probe_io; probe_logscan ;;
-  *) echo "[probe] FATAL: unknown stage '$STAGE' (rlimit|logscan|io|bins|live|loader|all)" >&2; exit 1 ;;
+  rlimit)   probe_rlimit ;;
+  logscan)  probe_logscan ;;
+  io)       probe_io ;;
+  bins)     probe_bins ;;
+  settings) probe_settings ;;
+  live)     probe_live ;;
+  loader)   probe_loader ;;
+  all)      probe_rlimit; probe_io; probe_logscan ;;
+  *) echo "[probe] FATAL: unknown stage '$STAGE' (rlimit|logscan|io|bins|settings|live|loader|all)" >&2; exit 1 ;;
 esac
 echo "[probe] done — persisted at $LOG"
