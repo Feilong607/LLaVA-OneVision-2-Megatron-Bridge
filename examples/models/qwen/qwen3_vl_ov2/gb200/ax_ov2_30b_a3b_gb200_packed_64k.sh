@@ -311,4 +311,4 @@ echo "[ov2-30b-gb200] in-container | repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$
 # shellcheck disable=SC2086
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
   --recipe "$RECIPE" --dataset vlm-energon --step_func ov2_step \
-  $OVERRIDES ${EXTRA_ARGS:-} 2>&1 | tee "$SAVE/train_node${NODE_RANK}.log"
+  $OVERRIDES ${EXTRA_ARGS:-} 2>&1 | tee -a "$SAVE/train_node${NODE_RANK}.log"

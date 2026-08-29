@@ -430,4 +430,4 @@ fi
 # shellcheck disable=SC2086  # $RDZV and $OVERRIDES must word-split into separate args
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" ${_numa_args[@]+"${_numa_args[@]}"} scripts/training/run_recipe.py \
   --recipe "$RECIPE" --dataset vlm-energon --step_func ov2_step \
-  $OVERRIDES ${EXTRA_ARGS:-} 2>&1 | tee "$SAVE/train_node${NODE_RANK}.log"
+  $OVERRIDES ${EXTRA_ARGS:-} 2>&1 | tee -a "$SAVE/train_node${NODE_RANK}.log"
