@@ -44,6 +44,12 @@ SAVE_DIR="$_SM_ROOT/$_SM_TAG"
 RESULT="$HOME/train_logs/smoke_qwen35_s15_result_${_SM_TAG}.txt"
 LOG="$HOME/train_logs/smoke_qwen35_s15_${_SM_TAG}_$(hostname).log"
 mkdir -p "$HOME/train_logs" "$SAVE_DIR"
+# Stale-state guard (the B16 lesson applies to training smokes too): a REUSED workload name
+# resurrects the previous run's verdict file, and the hold-for-verdict loop then short-circuits —
+# workers exit 0 instantly against a stale FAIL/PASS. Clear this tag's verdict + peak marker at
+# startup (all pods start minutes before any verdict write, so the rm cannot race a fresh one).
+# Prefer a fresh workload name anyway; this makes reuse safe rather than silently poisonous.
+rm -f "$RESULT" "$LOG.peak"
 
 # ── preflight: every asset the recipe will touch, checked before GPUs spin ───
 _die() { echo "[qwen35-s15-smoke] FATAL: $*" | tee -a "$LOG" >&2; exit 1; }
