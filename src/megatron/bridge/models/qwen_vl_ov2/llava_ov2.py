@@ -244,6 +244,28 @@ class LlavaOnevision2(MegatronModule):
         self.share_embeddings_and_output_weights = getattr(
             language_model, "share_embeddings_and_output_weights", False
         )
+        # MTP × sequence-parallel: in this build the embedding module returns FULL-length [s,b,h]
+        # (the masked_scatter fuse depends on that; 30B TP4 production runs on it). Stock mcore MTP
+        # instead expects the embedding it is handed to yield SP-SCATTERED output — _concat_embeddings
+        # concatenates with the (scattered) decoder hidden states and re-scatters after eh_proj. First
+        # TP2 s1.5 smoke died there: "Sizes of tensors must match ... Expected size 9008 but got size
+        # 4504". Wrap the INSTANCE forward with a shape-aware SP scatter so external callers (only the
+        # MTP block) get stock semantics, and keep the raw full-length path for the fuse via
+        # _ov2_raw_forward. Installed only for MTP models; the shape guard makes it a no-op if the
+        # underlying module ever starts scattering itself. 4B/30B (no MTP) are untouched.
+        if bool(getattr(language_model, "mtp_process", False)) and hasattr(language_model, "embedding"):
+            _emb = language_model.embedding
+            _raw_forward = _emb.forward
+            _lm_cfg = language_model.config
+
+            def _ov2_sp_embed_forward(input_ids, position_ids=None, **kw):
+                out = _raw_forward(input_ids=input_ids, position_ids=position_ids, **kw)
+                if getattr(_lm_cfg, "sequence_parallel", False) and out.shape[0] == input_ids.shape[-1]:
+                    out = tensor_parallel.scatter_to_sequence_parallel_region(out)
+                return out
+
+            _emb._ov2_raw_forward = _raw_forward
+            _emb.forward = _ov2_sp_embed_forward
 
     def shared_embedding_or_output_weight(self):
         return self.language_model.shared_embedding_or_output_weight()
@@ -359,8 +381,13 @@ class LlavaOnevision2(MegatronModule):
                 "Inspect the processor/grid (image_grid_thw vs inserted image tokens) on the failing rank."
             )
 
-        # 2) text embeddings + masked_scatter fuse
-        language_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
+        # 2) text embeddings + masked_scatter fuse — via the RAW (full-length) path when the MTP
+        # SP-scatter wrapper is installed (see __init__); the fuse needs [s_full, b, h].
+        _embed_raw = getattr(self.language_model.embedding, "_ov2_raw_forward", None)
+        if _embed_raw is not None:
+            language_embeddings = _embed_raw(input_ids=input_ids, position_ids=None)
+        else:
+            language_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
         if image_embeddings is None or self.image_token_id not in input_ids:
             combined = language_embeddings
         else:
