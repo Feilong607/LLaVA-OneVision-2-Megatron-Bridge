@@ -22,10 +22,11 @@
 # DISABLE_RECOMPUTE=1 speed lever is affordable).
 #
 # Topology (NPROC=4/pod; EP=8 fixed in the recipe): 32 GPU = 8 pods
-# (Workers=7): TP=1 -> DP=32 — the 30B same-stage production shape; TP>1 is a
-# long-sequence memory lever and is not needed at seq 10192. GBS=256 = the 30B
-# same-stage production value (and 256 % 32 == 0; the bare default 16 fails
-# the launcher's GBS%DP guard at this world size).
+# (Workers=7): TP=2 -> DP=16. Muon (required for AIAK parity) does not fit at
+# TP=1 on the 35B — measured ~188GB/192GB pod peak, OOM in the first triton
+# autotune — and TP=2 also gives the s4 line its first TP>1 validation on the
+# GDN hybrid. GBS=256 = the 30B same-stage production value (256 % 16 == 0;
+# the bare default 16 fails the launcher's GBS%DP guard at this world size).
 #
 # Workload form: Distributed/PyTorch, image feilong-nemo, gb200-nvl72-nodes,
 # Command bash (both sides), Args = this file's absolute path (both sides),
@@ -89,7 +90,11 @@ _first_ds="$(grep -m1 'path:' "$_SM_YAML" | awk '{print $2}')"
 [[ -d "$_first_ds" ]] || _die "seed85m shard dir not mounted: $_first_ds (from $_SM_YAML)"
 
 # ── scale + knobs (see header) ────────────────────────────────────────────────
-export TP="${TP:-1}"                                    # 32 GPU -> DP=32; seq 10192 needs no TP
+# TP=2 -> DP=16 (32 GPU). TP=1 does NOT fit Muon on the 35B: measured ~188GB/192GB pod peak,
+# OOM in the first triton autotune (see the Muon note below). TP=2 halves weights/grads/Muon
+# states (~105GB -> ~52GB static) and doubles as the first TP>1 validation on the GDN hybrid
+# (the s4 line plans TP4). GBS 256 % DP16 == 0; DP16 % EP8 == 0.
+export TP="${TP:-2}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-${GBS:-256}}"   # 30B same-stage production GBS
 export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( OV2_MIDTRAIN_GBS * 20 ))}"  # -> 20 iters
 export SAVE_EVERY="${SAVE_EVERY:-100000}"      # no interval saves; the end-of-run save lands in scratch
@@ -99,12 +104,12 @@ export RECIPE="ov2_qwen35_35b_a3b_midtrain"
 export SAVE="$SAVE_DIR" INIT_CKPT
 export OV2_DIST_TIMEOUT_MIN="${OV2_DIST_TIMEOUT_MIN:-60}"   # smoke fails fast, not 300min
 
-# Muon ON by default — mirrors the merged64k smoke's explicit decision: 30B
-# midtrain+Muon+EP8 has run 11.5k+ production iterations, so the base
-# launcher's 256-expert deadlock WARN is a hypothesis this smoke tests cheaply
-# (a real EP-backward deadlock hits the 60min dist timeout, not a silent
-# hang). muon_split_qkv=false is required for the trainable vision fused-QKV
-# layout. OV2_MIDTRAIN_MUON=0 for the recipe's validated AdamW auto-route.
+# Muon ON — the s1.5 line's required optimizer (AIAK parity; 30B midtrain+Muon+EP8 has 11.5k+
+# production iterations, and 30B stage3 runs TP4+Muon). Muon's layer-wise full states are why
+# the default TP above is 2, not 1: at TP=1 the measured pod peak hit ~188GB of 192GB and the
+# first fla/GDN triton autotune benchmark died with "Triton Error [CUDA]: out of memory"
+# (2026-08-30 smoke). muon_split_qkv=false is required for the trainable vision fused-QKV
+# layout. OV2_MIDTRAIN_MUON=0 falls back to the recipe's AdamW auto-route (memory A/B lever).
 export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
 if [[ "$OV2_MIDTRAIN_MUON" == "1" ]]; then
   export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_split_qkv=false"
@@ -188,4 +193,8 @@ while [[ ! -f "$RESULT" ]]; do
   sleep 10
 done
 [[ -f "$RESULT" ]] && { echo "[qwen35-s15-smoke] ---- $RESULT ----"; cat "$RESULT"; }
+# PyTorchJob takes the MASTER pod's exit code as the job verdict: the master exits with the
+# real launcher rc so a failed smoke shows Failed in the UI (a blanket exit 0 masked the OOM
+# run as Completed). Workers still exit 0 — they only hold for the verdict file.
+if [[ "$(hostname)" == *-master-* ]]; then exit "${_rc:-0}"; fi
 exit 0
