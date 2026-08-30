@@ -166,6 +166,60 @@ def _adapter_config_from(llm_cfg):
     return ac
 
 
+def _grid_rows_per_vision_run(input_ids, image_grid_thw, merge, image_token_id, vision_start_token_id):
+    """AIAK frame-chunked video grid -> Qwen3.5-native per-run grid rows for get_rope_index.
+
+    The OV2 encoder emits ONE collapsed grid row [F,H,W] per video (the tower's frame-windowed
+    temporal path needs it) but F per-frame ``<|vision_start|>..<|vision_end|>`` runs in the token
+    stream (text timestamps carry time). get_rope_index implements the Qwen3.5-native convention —
+    one grid row PER run, "llm_grid_t is always 1" — so feeding it the collapsed row makes it treat
+    the first per-frame run as the whole video: st overshoots by (F-1) frames and the next
+    ``.index(image_token_id, st)`` dies with "not in list" (first hit on the s1.5 smoke, all ranks).
+
+    Walk the vision runs in token order, split every grid row across the runs it covers, and emit
+    one ``[t_k, h, w]`` row per run with ``t_k = run_len / (h*w//merge^2)`` (t_k > 1 only when the
+    encoder folded duplicate frame indices into one run). Image rows (t==1) reproduce themselves
+    exactly, so image-only batches stay byte-identical. Raises ValueError with both sides of the
+    bookkeeping when runs and grid genuinely disagree (corrupt pack).
+    """
+    if image_grid_thw is None or image_grid_thw.numel() == 0:
+        return image_grid_thw
+    if bool((image_grid_thw[:, 0] <= 1).all()):
+        return image_grid_thw  # image-only: already one run per row — no-op on the validated path
+    msq = merge * merge
+    run_lens = []
+    for row in input_ids.tolist():
+        n, i = len(row), 0
+        while i < n:
+            if row[i] == vision_start_token_id:
+                j = i + 1
+                while j < n and row[j] == image_token_id:
+                    j += 1
+                run_lens.append(j - i - 1)
+                i = j
+            else:
+                i += 1
+    rows, r = [], 0
+    for g in image_grid_thw:
+        t, h, w = int(g[0]), int(g[1]), int(g[2])
+        per_t = (h * w) // msq  # merged tokens per single-frame chunk
+        budget = t * per_t
+        while budget > 0:
+            if r >= len(run_lens) or run_lens[r] % per_t != 0 or run_lens[r] > budget:
+                raise ValueError(
+                    f"OV2 mrope grid/run mismatch: grid row {g.tolist()} (budget {t}x{per_t}) vs "
+                    f"vision run lengths {run_lens} at run#{r} — encoder/packing inconsistency"
+                )
+            rows.append([run_lens[r] // per_t, h, w])
+            budget -= run_lens[r]
+            r += 1
+    if r != len(run_lens):
+        raise ValueError(
+            f"OV2 mrope grid/run mismatch: {len(run_lens)} vision runs but grid rows cover only {r}"
+        )
+    return torch.tensor(rows, dtype=image_grid_thw.dtype, device=image_grid_thw.device)
+
+
 class LlavaOnevision2(MegatronModule):
     """3-sibling OV2.1 multimodal model (language_model + vision_model + adapter).
 
@@ -382,11 +436,17 @@ class LlavaOnevision2(MegatronModule):
         if _is_mrope and input_ids is not None:
             from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import get_rope_index
             _merge = getattr(self.adapter, "spatial_merge_size", 3)
+            # Position-building view of the grid: collapsed [F,H,W] video rows -> one [t_k,h,w] row
+            # per vision run (Qwen3.5-native), see _grid_rows_per_vision_run. The tower and
+            # masked_scatter keep the original collapsed grid; image-only batches pass through.
+            _grid_pos = _grid_rows_per_vision_run(
+                input_ids, image_grid_thw, _merge, self.image_token_id, self.vision_start_token_id
+            )
             if packed_seq_params is None:
                 # BSHD (stage-1/2, non-packed). get_rope_index handles no-image (image_grid_thw=None) too.
                 _pos, _ = get_rope_index(
                     _merge, self.image_token_id, self.video_token_id, self.vision_start_token_id,
-                    input_ids, image_grid_thw=image_grid_thw, video_grid_thw=None, attention_mask=None,
+                    input_ids, image_grid_thw=_grid_pos, video_grid_thw=None, attention_mask=None,
                 )  # [3, b, s]
             else:
                 # Packed/THD (midtrain): OV2 packs N sub-samples into ONE row, but get_rope_index loops
@@ -403,7 +463,9 @@ class LlavaOnevision2(MegatronModule):
                         continue
                     _seg = input_ids[:, _a:_b]
                     _nimg = int((_seg[0] == self.vision_start_token_id).sum().item())
-                    _sg = image_grid_thw[_gi:_gi + _nimg] if (image_grid_thw is not None and _nimg > 0) else None
+                    # Slice the PER-RUN grid view: one row per vision run by construction, so the
+                    # count-of-vision_start slice stays aligned even for frame-chunked videos.
+                    _sg = _grid_pos[_gi:_gi + _nimg] if (_grid_pos is not None and _nimg > 0) else None
                     _gi += _nimg
                     _sp, _ = get_rope_index(
                         _merge, self.image_token_id, self.video_token_id, self.vision_start_token_id,
