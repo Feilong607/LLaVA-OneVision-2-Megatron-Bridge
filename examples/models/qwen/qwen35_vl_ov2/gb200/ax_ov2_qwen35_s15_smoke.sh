@@ -65,13 +65,19 @@ _pick() {  # _pick VAR file candidates...
   done
   _die "$_var not found ($_file missing in all of: $*). Stage the asset or set $_var explicitly."
 }
+# Candidate order: staged official copies first, then the on-cluster generated/assembled fallbacks
+# ($HOME/Qwen3.5-35B-A3B-text = extract_qwen35_text.py --weights output; $HOME/qwen35_p16m33_auto_model
+# = 30B p16m33 image-processor half + Qwen3.5 tokenizer half, verified image_pad=248056 / merge 3).
+# The bare VLM dir stays LAST for llm_hf: its config.json exists but routes AutoBridge to the VLM
+# architecture (the -text extract exists precisely to avoid that) — the WARN below fires on it.
 [[ -n "${OV2_LLM_HF_QWEN35:-}" ]] || _pick OV2_LLM_HF_QWEN35 config.json \
-  "$_SM_POOL/35b/Qwen3.5-35B-A3B-text" "$_SM_POOL/35b/Qwen3.5-35B-A3B" \
-  "/datasets/llava/11May/Qwen3.5-35B-A3B-text"
+  "$_SM_POOL/35b/Qwen3.5-35B-A3B-text" "$HOME/Qwen3.5-35B-A3B-text" \
+  "/datasets/llava/11May/Qwen3.5-35B-A3B-text" "$_SM_POOL/35b/Qwen3.5-35B-A3B"
 [[ -n "${OV2_HF_PROC_QWEN35_P16M33:-}" ]] || _pick OV2_HF_PROC_QWEN35_P16M33 preprocessor_config.json \
   "$_SM_POOL/35b/llava_onevision2_qwen35_35b_a3b_p16_m33/auto_model" \
   "$_SM_POOL/35b/auto_model" \
-  "/datasets/llava/11May/llava_onevision2/llava_onevision2_qwen35_35b_a3b_p16_m33/auto_model"
+  "/datasets/llava/11May/llava_onevision2/llava_onevision2_qwen35_35b_a3b_p16_m33/auto_model" \
+  "$HOME/qwen35_p16m33_auto_model"
 export OV2_LLM_HF_QWEN35 OV2_HF_PROC_QWEN35_P16M33
 [[ "$OV2_LLM_HF_QWEN35" == *"-text" ]] || echo "[qwen35-s15-smoke] WARN: llm_hf=$OV2_LLM_HF_QWEN35 is not a '-text' extract; if the build dies routing the VLM config, run tools/extract_qwen35_text.py --weights first." | tee -a "$LOG" >&2
 
