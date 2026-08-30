@@ -114,7 +114,11 @@ DP=$(( WORLD / TP ))
 (( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-qwen35] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (2 GB200 nodes + TP=1 -> DP=8)." >&2; exit 1; }
 
 # --- env ---
-export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${PYTHONPATH:+:$PYTHONPATH}"  # _verify_stubs FIRST (offline stubs)
+# Offline packages not pip-installed in the image (e.g. emerging_optimizers for distributed Muon):
+# auto-folded from "$_HOME/pylibs" or "$REPO/pylibs" (mirrors the 30B launchers); OV2_EXTRA_PYLIBS= also works.
+[[ -d "$_HOME/pylibs" ]] && OV2_EXTRA_PYLIBS="$_HOME/pylibs${OV2_EXTRA_PYLIBS:+:$OV2_EXTRA_PYLIBS}"
+[[ -d "$REPO/pylibs" ]] && OV2_EXTRA_PYLIBS="$REPO/pylibs${OV2_EXTRA_PYLIBS:+:$OV2_EXTRA_PYLIBS}"
+export PYTHONPATH="$REPO/_verify_stubs:$REPO/src:$REPO/3rdparty/Megatron-LM:$REPO/aiak_shim${OV2_EXTRA_PYLIBS:+:$OV2_EXTRA_PYLIBS}${PYTHONPATH:+:$PYTHONPATH}"  # _verify_stubs FIRST (offline stubs)
 # deep_ep's .so needs the pip nvidia-nvshmem lib (not CUDA's bundled one); prepend only if present.
 _nvshmem_lib="${OV2_NVSHMEM_LIB:-/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem/lib}"
 [[ -e "$_nvshmem_lib/libnvshmem_host.so.3" ]] && export LD_LIBRARY_PATH="$_nvshmem_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -219,6 +223,16 @@ mkdir -p "$SAVE"; cd "$REPO"
 # deadlocks EP backward on trainable 256-expert MoE.
 if [[ "$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
   echo "[ov2-qwen35] WARN: OV2_MIDTRAIN_MUON=1 -> midtrain will use Muon, which DEADLOCKS EP backward on trainable experts. 'unset OV2_MIDTRAIN_MUON' (auto-routes to AdamW)." >&2
+fi
+# Preflight (mirrors the 30B launchers): mcore's distributed Muon needs 'emerging_optimizers', which is
+# NOT in the base GB200 image. Without it the run dies DEEP -- after full NCCL init -- with a cryptic
+# per-rank ImportError. Probe here (PYTHONPATH incl. the pylibs fold-in is set above) and fail loud EARLY.
+if [[ ("$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1") || ("$RECIPE" == *stage2* && "$OV2_STAGE2_ADAMW" != "1") ]]; then
+  if ! python -c "import emerging_optimizers" >/dev/null 2>&1; then
+    echo "[ov2-qwen35] FATAL: this recipe/optimizer combo uses distributed Muon but 'emerging_optimizers' is not importable." >&2
+    echo "  Fix (pick one): stage the offline copy at \$HOME/pylibs or \$REPO/pylibs (auto-folded); or OV2_EXTRA_PYLIBS=/abs/path; or pip install emerging-optimizers; or force AdamW (midtrain: unset OV2_MIDTRAIN_MUON; stage2: OV2_STAGE2_ADAMW=1)." >&2
+    exit 1
+  fi
 fi
 echo "[ov2-qwen35-gb200] in-container | repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF mtp_scale=${OV2_MTP_LOSS_SCALE:-default} alloc=${PYTORCH_CUDA_ALLOC_CONF} offload=${OV2_OPT_OFFLOAD:-false} node_rank=$NODE_RANK nnodes=$NNODES"
 # shellcheck disable=SC2086
