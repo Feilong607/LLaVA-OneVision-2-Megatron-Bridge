@@ -535,7 +535,7 @@ class LlavaOnevision2(MegatronModule):
         # loss_mask threaded into the LLM so the MTP head masks its aux loss to the SAME supervised
         # tokens as the main loss (else process_mtp_loss defaults to all-ones -> trains MTP on
         # prompt/image-pad/pad; matters once MTP is live at midtrain). No-op in stage-1/2 (MTP zeroed).
-        return self.language_model(
+        out = self.language_model(
             input_ids=_ids,
             position_ids=_pos_arg,
             attention_mask=attention_mask,
@@ -544,6 +544,58 @@ class LlavaOnevision2(MegatronModule):
             loss_mask=loss_mask,
             packed_seq_params=packed_seq_params,
         )
+        # OV2_NAN_DUMP=<dir>: segment-level NaN probe (default unset = byte-identical no-op).
+        # When the returned per-token loss carries a NaN, localize it to the THD segment(s), print a
+        # per-segment fingerprint, and torch.save the WHOLE offending microbatch for offline replay
+        # (single-GPU / reference-impl analysis off-cluster). mcore's rerun_state_machine raises right
+        # after this in the step's loss_func, so the dump is the last word from the dying rank.
+        import os as _dbg_os
+
+        _dump_dir = _dbg_os.environ.get("OV2_NAN_DUMP")
+        if (
+            _dump_dir
+            and labels is not None
+            and torch.is_tensor(out)
+            and out.is_floating_point()
+            and not bool(torch.isfinite(out).all())
+        ):
+            _r = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+            _bad = ~torch.isfinite(out[0].float())
+            _cu = (
+                packed_seq_params.cu_seqlens_q.tolist()
+                if (packed_seq_params is not None and getattr(packed_seq_params, "cu_seqlens_q", None) is not None)
+                else [0, out.shape[-1]]
+            )
+            for _si, (_a, _b) in enumerate(zip(_cu[:-1], _cu[1:])):
+                _n_bad = int(_bad[_a:_b].sum())
+                if _n_bad == 0:
+                    continue
+                _seg_ids = input_ids[0, _a:_b]
+                print(
+                    f"[NANDUMP r{_r}] seg#{_si} range=({_a},{_b}) len={_b - _a} bad={_n_bad} "
+                    f"img_pad={int((_seg_ids == self.image_token_id).sum())} "
+                    f"vis_start={int((_seg_ids == self.vision_start_token_id).sum())} "
+                    f"supervised={int((loss_mask[0, _a:_b] > 0).sum()) if loss_mask is not None else -1}",
+                    flush=True,
+                )
+            _dbg_os.makedirs(_dump_dir, exist_ok=True)
+            _path = _dbg_os.path.join(_dump_dir, f"nan_bin_rank{_r}.pt")
+            torch.save(
+                {
+                    "input_ids": input_ids.cpu(),
+                    "labels": labels.cpu() if labels is not None else None,
+                    "loss_mask": loss_mask.cpu() if loss_mask is not None else None,
+                    "image_grid_thw": image_grid_thw.cpu() if torch.is_tensor(image_grid_thw) else image_grid_thw,
+                    "images": images.cpu() if torch.is_tensor(images) else images,
+                    "patch_positions": patch_positions.cpu() if torch.is_tensor(patch_positions) else patch_positions,
+                    "cu_seqlens_q": torch.tensor(_cu),
+                    "loss": out.detach().float().cpu(),
+                    "rank": _r,
+                },
+                _path,
+            )
+            print(f"[NANDUMP r{_r}] microbatch saved -> {_path}", flush=True)
+        return out
 
     def build_schedule_plan(
         self,
