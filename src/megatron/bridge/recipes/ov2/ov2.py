@@ -218,6 +218,7 @@ class _LengthSortedLoader:
     def __init__(self, inner, window: int):
         self._inner = inner
         self._window = int(window)
+        self._it = None
 
     @staticmethod
     def _key(batch) -> int:
@@ -227,7 +228,7 @@ class _LengthSortedLoader:
         except Exception:
             return 0
 
-    def __iter__(self):
+    def _gen(self):
         buf = []
         for b in self._inner:
             buf.append(b)
@@ -237,6 +238,18 @@ class _LengthSortedLoader:
                 buf = []
         buf.sort(key=self._key, reverse=True)  # finite-iterator tail (train stream is infinite)
         yield from buf
+
+    # Full ITERATOR protocol, not just iterable: mcore's RerunStateMachine calls next() directly
+    # on the loader, and next() resolves __next__ on the TYPE — the __getattr__ delegation below
+    # cannot satisfy it (first engaged run died with "'_LengthSortedLoader' object is not an
+    # iterator" at rerun_state_machine.__next__).
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._it is None:
+            self._it = self._gen()
+        return next(self._it)
 
     def save_state(self):
         return self._inner.save_state()
