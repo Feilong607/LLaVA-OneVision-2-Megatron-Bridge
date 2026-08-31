@@ -135,6 +135,11 @@ export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"
 _mon=$!
 
 echo "[qwen35-s15-smoke] launch: tp=$TP gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES accel=$ACCEL recompute_full=$OV2_RECOMPUTE_FULL muon=$OV2_MIDTRAIN_MUON sort_window=$OV2_LENGTH_SORT_WINDOW init=$INIT_CKPT" | tee -a "$LOG"
+# Which fla will the run execute? Print version+path into the persisted log — the NaN case turned
+# on exactly this question (image fla 0.4.2 vs the qwen35-fla image's isolated /opt/ov2-fla), and
+# the training logs otherwise never say. PYTHONPATH here matches what the base launcher composes
+# minus repo paths, which do not carry fla.
+python3 -c "import fla; print('[qwen35-s15-smoke] fla', getattr(fla,'__version__','?'), fla.__file__)" 2>&1 | tee -a "$LOG" || true
 set +e
 bash "$_SM_BASE" 2>&1 | tee -a "$LOG"
 _rc=${PIPESTATUS[0]}
