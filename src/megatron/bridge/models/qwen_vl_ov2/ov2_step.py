@@ -133,14 +133,32 @@ def forward_step(
         cu_padded = None
         if cu_last < seq_len:
             # Energon / SP padding can make the actual hidden sequence longer than the packed
-            # sample payload. FOLD the pad into the LAST real segment padded span (cu_padded last =
-            # seq_len); keep cu_unpadded = real boundaries. Same N segs, last seg actual<=padded, NO
-            # zero-length segment (a 0-actual THD seg -> flash-attn backward 0/0 -> NaN grad; only bites
-            # when the LLM trains). Pad tokens TE-masked + label-masked -> loss identical.
+            # sample payload. Label-mask the pad tail either way; the question is whether TE
+            # COMPUTES those query rows.
             if labels is not None:    labels[:, cu_last:] = -100
             if loss_mask is not None: loss_mask[:, cu_last:] = 0
-            cu_unpadded = cu
-            cu_padded = torch.cat([cu[:-1], cu.new_tensor([seq_len])])
+            if os.environ.get("OV2_PAD_ACTUAL_FOLD", "1") == "1":
+                # DEFAULT: fold the pad into the last segment's ACTUAL span, so TE computes those
+                # rows like any other query. Costs one padded query row of attention; the loss is
+                # untouched (labels -100 / loss_mask 0) and real tokens are unaffected (causal ->
+                # they never attend to a later pad).
+                # WHY THIS IS NOT COSMETIC (qwen3.5, measured 2026-09-01): the alternative below
+                # leaves the pad row OUT of the actual segment, so TE never writes its output ->
+                # the hidden state there is allocator garbage -> non-finite. An attention-only
+                # backbone (4B/30B) hides that: the garbage stays in its own, loss-masked position.
+                # A hybrid backbone does NOT: GatedDeltaNet's chunked scan processes 64 tokens as a
+                # BLOCK, so the chunk containing the poisoned pad row goes fully non-finite ->
+                # forward loss NaN across exactly (last_padded_seglen % 64) positions. Both s1.5
+                # dumps match that arithmetic exactly (3385%64=57, 1564%64=28), and the layer probe
+                # caught the birth: first non-finite output at a SelfAttention layer, one position,
+                # all 2048 hidden dims — the pad row.
+                cu_unpadded = torch.cat([cu[:-1], cu.new_tensor([seq_len])])
+            else:
+                # LEGACY (pre-2026-09-01): keep cu_unpadded at the real boundaries and let TE mask
+                # the pad rows via the padded twins. Attention-only backbones are fine; do NOT use
+                # this on the GDN hybrid (see above).
+                cu_unpadded = cu
+                cu_padded = torch.cat([cu[:-1], cu.new_tensor([seq_len])])
         else:
             cu_unpadded = cu
         cu_for_msl = cu_padded if cu_padded is not None else cu_unpadded
