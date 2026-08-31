@@ -235,6 +235,84 @@ def _install_layer_nan_probe(language_model) -> None:
     logger.info("[ov2] OV2_LAYER_NAN_PROBE: hooks installed on %d decoder layers", len(layers))
 
 
+def _install_gdn_kernel_dump(model) -> None:
+    """OV2_GDN_KERNEL_DUMP=<dir>: capture the GDN kernel's REAL inputs when its output goes bad.
+
+    Wraps each GatedDeltaNet instance's bound ``gated_delta_rule`` (mcore binds the fla kernel in
+    ``__init__``, so patching the module attribute afterwards would miss it). On the first
+    non-finite output per rank: print a fingerprint — NaN count, bad position range, per-segment
+    ``% 64`` tails, and the g/beta/q/k/v ranges (the decay regime is the number a synthetic repro
+    cannot guess) — then ``torch.save`` the exact kernel arguments for deterministic single-GPU
+    replay off-cluster. Default unset = no wrapping, so the 30B path never sees this.
+    """
+    import os as _os
+
+    dump_dir = _os.environ.get("OV2_GDN_KERNEL_DUMP")
+    if not dump_dir or getattr(model, "_ov2_gdn_dump_installed", False):
+        return
+    targets = [m for m in model.modules() if callable(getattr(m, "gated_delta_rule", None))]
+    if not targets:
+        logger.warning("[ov2] OV2_GDN_KERNEL_DUMP set but no module exposes gated_delta_rule")
+        return
+    max_saves = int(_os.environ.get("OV2_GDN_KERNEL_DUMP_MAX", "1"))
+    state = {"saved": 0}
+
+    def _wrap(orig, li):
+        def wrapped(q, k, v, **kw):
+            out = orig(q, k, v, **kw)
+            core = out[0] if isinstance(out, tuple) else out
+            if state["saved"] >= max_saves or not torch.is_tensor(core) or bool(torch.isfinite(core).all()):
+                return out
+            r = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+            bad = ~torch.isfinite(core.float())
+            pos = bad.reshape(bad.shape[0], bad.shape[1], -1).any(dim=-1)[0]
+            idx = pos.nonzero().flatten()
+            cu = kw.get("cu_seqlens")
+            cu_l = cu.tolist() if torch.is_tensor(cu) else None
+            tails = (
+                [(b - a) % 64 for a, b in zip(cu_l[:-1], cu_l[1:])] if cu_l else None
+            )
+            g, beta = kw.get("g"), kw.get("beta")
+
+            def _rng(t):
+                if not torch.is_tensor(t):
+                    return "n/a"
+                f = t.detach().float()
+                return f"[{f.min().item():.3e},{f.max().item():.3e}] finite={bool(torch.isfinite(f).all())}"
+
+            print(
+                f"[GDNDUMP r{r}] gdn#{li} bad_elems={int(bad.sum())} bad_pos={idx.numel()} "
+                f"first={int(idx[0]) if idx.numel() else -1} last={int(idx[-1]) if idx.numel() else -1} "
+                f"out_shape={tuple(core.shape)} cu={cu_l} tails%64={tails} "
+                f"g={_rng(g)} beta={_rng(beta)} q={_rng(q)} k={_rng(k)} v={_rng(v)}",
+                flush=True,
+            )
+            _os.makedirs(dump_dir, exist_ok=True)
+            path = _os.path.join(dump_dir, f"gdn_kernel_rank{r}_layer{li}.pt")
+            torch.save(
+                {
+                    "q": q.detach().cpu(), "k": k.detach().cpu(), "v": v.detach().cpu(),
+                    "g": g.detach().cpu() if torch.is_tensor(g) else g,
+                    "beta": beta.detach().cpu() if torch.is_tensor(beta) else beta,
+                    "cu_seqlens": cu.detach().cpu() if torch.is_tensor(cu) else cu,
+                    "kwargs": {kk: vv for kk, vv in kw.items() if not torch.is_tensor(vv)},
+                    "out": core.detach().float().cpu(),
+                    "layer": li, "rank": r,
+                },
+                path,
+            )
+            print(f"[GDNDUMP r{r}] kernel inputs saved -> {path}", flush=True)
+            state["saved"] += 1
+            return out
+
+        return wrapped
+
+    for li, mod in enumerate(targets):
+        mod.gated_delta_rule = _wrap(mod.gated_delta_rule, li)
+    model._ov2_gdn_dump_installed = True
+    logger.info("[ov2] OV2_GDN_KERNEL_DUMP: wrapped %d GatedDeltaNet kernels -> %s", len(targets), dump_dir)
+
+
 def _grid_rows_per_vision_run(input_ids, image_grid_thw, merge, image_token_id, vision_start_token_id):
     """AIAK frame-chunked video grid -> Qwen3.5-native per-run grid rows for get_rope_index.
 
@@ -597,6 +675,8 @@ class LlavaOnevision2(MegatronModule):
 
         if _probe_os.environ.get("OV2_LAYER_NAN_PROBE") == "1":
             _install_layer_nan_probe(self.language_model)
+        if _probe_os.environ.get("OV2_GDN_KERNEL_DUMP"):
+            _install_gdn_kernel_dump(self.language_model)
         _ids, _pos_arg, combined, packed_seq_params = self._preprocess_lm_inputs(
             images,
             image_grid_thw,
