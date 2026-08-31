@@ -166,6 +166,75 @@ def _adapter_config_from(llm_cfg):
     return ac
 
 
+def _install_layer_nan_probe(language_model) -> None:
+    """OV2_LAYER_NAN_PROBE=1: name the FIRST decoder layer whose output goes non-finite.
+
+    The qwen3.5 s1.5 forward-loss NaN sits in a contiguous tail of exactly
+    ``last_padded_segment_len % 64`` positions (twice, byte-identically, under fla 0.4.2 AND
+    0.5.0), yet a synthetic kernel call with the same multi-segment cu_seqlens — even with a
+    NaN-poisoned allocator — comes back clean. So the birthplace has to be pinned inside the
+    real model instead of guessed: hook every decoder layer, report the first one whose output
+    is non-finite together with its mixer class (GatedDeltaNet vs attention), the offending
+    position range, and whether its INPUT was already bad (i.e. is this layer the source or a
+    carrier). Reports once per rank, then stays quiet. Default unset = no hooks at all.
+    """
+    if getattr(language_model, "_ov2_nan_probe_installed", False):
+        return
+    layers = list(getattr(getattr(language_model, "decoder", None), "layers", []) or [])
+    if not layers:
+        return
+    state = {"done": False}
+
+    def _mixer_kind(mod) -> str:
+        names = [type(m).__name__ for m in mod.modules()]
+        for n in names:
+            if "GatedDelta" in n or "Mamba" in n:
+                return n
+        for n in names:
+            if "Attention" in n:
+                return n
+        return type(mod).__name__
+
+    def _bad_positions(t):
+        bad = ~torch.isfinite(t)
+        if t.dim() == 3:  # [s, b, h]
+            pos = bad.any(dim=-1).any(dim=-1)
+        else:
+            pos = bad.reshape(bad.shape[0], -1).any(dim=-1)
+        idx = pos.nonzero().flatten()
+        return int(bad.sum()), idx
+
+    def _make_hook(i, mod):
+        def hook(_m, args, out):
+            if state["done"]:
+                return
+            t = out[0] if isinstance(out, tuple) else out
+            if not torch.is_tensor(t) or not t.is_floating_point() or bool(torch.isfinite(t).all()):
+                return
+            n_bad, idx = _bad_positions(t)
+            inp = args[0] if args else None
+            in_bad = -1
+            if torch.is_tensor(inp) and inp.is_floating_point():
+                in_bad = int((~torch.isfinite(inp)).sum())
+            r = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+            print(
+                f"[LAYERNAN r{r}] FIRST non-finite output at decoder layer#{i} "
+                f"mixer={_mixer_kind(mod)} bad_elems={n_bad} bad_positions={idx.numel()} "
+                f"first={int(idx[0]) if idx.numel() else -1} last={int(idx[-1]) if idx.numel() else -1} "
+                f"shape={tuple(t.shape)} input_bad_elems={in_bad} "
+                f"(input_bad=0 => this layer is the SOURCE)",
+                flush=True,
+            )
+            state["done"] = True
+
+        return hook
+
+    for i, layer in enumerate(layers):
+        layer.register_forward_hook(_make_hook(i, layer))
+    language_model._ov2_nan_probe_installed = True
+    logger.info("[ov2] OV2_LAYER_NAN_PROBE: hooks installed on %d decoder layers", len(layers))
+
+
 def _grid_rows_per_vision_run(input_ids, image_grid_thw, merge, image_token_id, vision_start_token_id):
     """AIAK frame-chunked video grid -> Qwen3.5-native per-run grid rows for get_rope_index.
 
@@ -524,6 +593,10 @@ class LlavaOnevision2(MegatronModule):
         patch_positions=None,
         **kwargs,
     ) -> torch.Tensor:
+        import os as _probe_os
+
+        if _probe_os.environ.get("OV2_LAYER_NAN_PROBE") == "1":
+            _install_layer_nan_probe(self.language_model)
         _ids, _pos_arg, combined, packed_seq_params = self._preprocess_lm_inputs(
             images,
             image_grid_thw,
