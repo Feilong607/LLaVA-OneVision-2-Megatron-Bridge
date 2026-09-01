@@ -141,17 +141,22 @@ export OV2_PACK_FULL_CAUSAL="${OV2_PACK_FULL_CAUSAL:-0}"       # 0 = THD block-d
 export OV2_SEQ_LEN="$SEQ_LEN"
 export OV2_MIDTRAIN_GBS="$MIDTRAIN_GBS" OV2_MIDTRAIN_N_SAMPLES="$MIDTRAIN_N_SAMPLES"
 export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"  # energon default 16 chokes WekaFS
-# GDN/MTP build + NCCL does NOT tolerate expandable_segments:True (observed fault) -> max_split_size_mb.
-# garbage_collection_threshold:0.8 is the missing half of that substitution. With THD packing every
-# microbatch has a different shape, and blocks above max_split_size are never split, so the caching
-# allocator keeps cudaMalloc'ing new segments and RESERVED creeps up to the whole device — measured
-# four times as a per-pod peak of 188.4 of 192 GB, byte-identical at TP=1, TP=2 and TP=4, with both
-# Muon and AdamW. The device being full then surfaces as `NCCL WARN Cuda failure 2 'out of memory'`
-# (NCCL buffers are cudaMalloc'd outside the torch pool; one crash failed on a 136-byte calloc).
-# The threshold makes the allocator release cached blocks once reserved passes 80% of capacity, which
-# keeps that out-of-pool headroom. 30B avoids the whole problem with expandable_segments:True, which
-# this backbone cannot use.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256,garbage_collection_threshold:0.8}"
+# Allocator policy. GDN/MTP + NCCL cannot use expandable_segments:True (observed fault), which is
+# what 30B relies on; the substitute used here was max_split_size_mb:256, and MEASUREMENT SHOWS THAT
+# SUBSTITUTE WAS THE BUG. OV2_MEM_PROBE at forward #8 (TP2, GBS 256):
+#     allocated=26.7G  max_allocated=44.0G  reserved=113-151G
+# i.e. live tensors peak at 44 GB while the caching allocator holds 3.4x that. THD packing gives every
+# microbatch a different shape, and max_split_size_mb forbids splitting blocks above the limit, so a
+# new shape can never reuse a larger free block — the pool only grows. Five runs then reported a
+# per-pod peak of 188.4 of 189.5 GB (99.4% of the card), byte-identical at TP=1/2/4, with Muon and
+# AdamW, and with vision recompute on and off, dying as `NCCL WARN Cuda failure 2 'out of memory'`
+# (NCCL buffers are cudaMalloc'd OUTSIDE the torch pool; one crash failed on a 136-byte calloc).
+# So: drop max_split_size_mb (restore normal splitting) and keep a garbage-collection threshold, set
+# at 0.6 so the allocator starts releasing cached blocks around 111 GB instead of at the ceiling —
+# 0.8 was measured triggering at ~148 GB, which is where reserved was already hovering. Note ~37 GB
+# of the card is non-torch (CUDA context, NCCL buffers, cuBLAS/TE workspaces), so torch cannot be
+# allowed anywhere near the full card.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.6}"
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}" NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
 [[ -n "${NCCL_IB_HCA:-}" ]] && export NCCL_IB_HCA NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker}"
