@@ -75,7 +75,14 @@ _first_ds="$(grep -m1 'path:' "$_PD_YAML" | awk '{print $2}')"
 [[ -d "$_first_ds" ]] || _die "seed85m shard dir not mounted: $_first_ds"
 
 # ── production config (see header) ───────────────────────────────────────────
-export TP="${TP:-2}"                                             # Muon does not fit TP=1 on 35B
+# TP=4 -> DP=8 (== EP8). Measured 2026-09-01: TP=2 + Muon does NOT survive its FIRST optimizer
+# step on the 35B. Muon is layer-wise (use_distributed_optimizer=False), so its full states only
+# materialize at that step, taking the pod from ~119GB (forward-only, which is all the earlier
+# short smokes ever reached) to 188.4/192GB — then NCCL, whose buffers are cudaMalloc'd OUTSIDE
+# the torch pool, failed with `ncclUnhandledCudaError: Call to CUDA function failed` on the last
+# ranks. TP=4 halves weights/main-grads/Muon states again (~77GB -> ~39GB static) and is the
+# shape 30B stage-3 runs in production (TP4 + Muon, 11.5k+ iters).
+export TP="${TP:-4}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-256}"               # 30B same-stage production GBS
 export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"   # seed85m budget -> 31250 iters
 export SAVE_EVERY="${SAVE_EVERY:-2000}"
