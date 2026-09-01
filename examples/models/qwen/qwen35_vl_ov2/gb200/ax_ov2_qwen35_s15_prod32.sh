@@ -8,13 +8,15 @@
 # validated, with production budget/save policy:
 #
 #   TP=2 -> DP=16, EP=8 (recipe), GBS 256, seq 10192, ACCEL=0 (bf16+alltoall),
-#   recompute full, Muon (AIAK parity; muon_split_qkv=false for trainable vision),
-#   length-aligned batching window 16, INIT = staged stage-2 iter_0006000,
-#   8M samples -> 31250 iters, save every 2000, LR 1e-5 -> 1e-6 (recipe/launcher
-#   default for this stage; the 2e-5 line belongs to stage-3, not s1.5).
+#   SELECTIVE recompute (core_attn + moe) with the vision tower NOT recomputed,
+#   Muon (AIAK parity; muon_split_qkv=false for trainable vision), length-aligned
+#   batching window 16, INIT = staged stage-2 iter_0006000, 8M samples -> 31250
+#   iters, save every 2000, LR 1e-5 -> 1e-6 (recipe/launcher default for this
+#   stage; the 2e-5 line belongs to stage-3, not s1.5).
 #
-# TP=2 is not a preference: Muon's layer-wise full optimizer states do not fit at
-# TP=1 on the 35B (measured ~188GB/192GB, OOM in the first fla autotune).
+# Both TP and the recompute lane are MEASURED choices, not preferences — see the
+# numbers in the config block below. Baseline to beat: 108-120 s/iter at 567-687
+# tokens/s/GPU (TP=2, full recompute), against 30B stage-3's ~2700.
 #
 # Restart-safe: checkpoint.load == SAVE (the base launcher sets it), so a
 # re-submitted job resumes from the newest save in SAVE. Muon cannot resume from
@@ -75,19 +77,33 @@ _first_ds="$(grep -m1 'path:' "$_PD_YAML" | awk '{print $2}')"
 [[ -d "$_first_ds" ]] || _die "seed85m shard dir not mounted: $_first_ds"
 
 # ── production config (see header) ───────────────────────────────────────────
-# TP=4 -> DP=8 (== EP8). Measured 2026-09-01: TP=2 + Muon does NOT survive its FIRST optimizer
-# step on the 35B. Muon is layer-wise (use_distributed_optimizer=False), so its full states only
-# materialize at that step, taking the pod from ~119GB (forward-only, which is all the earlier
-# short smokes ever reached) to 188.4/192GB — then NCCL, whose buffers are cudaMalloc'd OUTSIDE
-# the torch pool, failed with `ncclUnhandledCudaError: Call to CUDA function failed` on the last
-# ranks. TP=4 halves weights/main-grads/Muon states again (~77GB -> ~39GB static) and is the
-# shape 30B stage-3 runs in production (TP4 + Muon, 11.5k+ iters).
-export TP="${TP:-4}"
+# TP=2 -> DP=16. MEASURED throughput at iteration 2-4 (GBS 256, seq 10192, Muon):
+#     TP=2  108-120 s/iter   567-687 tokens/s/GPU   live 26.7G / peak-live 44.3G / reserved 56G
+#     TP=1  176 s/iter       378 tokens/s/GPU       live 51.8G / peak-live 82.1G / reserved 99-102G
+# TP=1 is 1.6x SLOWER despite giving each rank half as many microbatches: it doubles model-state and
+# activation memory (no sequence parallel), and its ~100G reserved sits right on the allocator's
+# collection threshold, so cudaFree/cudaMalloc churn eats the win. TP=4 is unnecessary — the earlier
+# "TP=2 does not fit" conclusion came from the allocator fragmentation bug (see the base launcher's
+# PYTORCH_CUDA_ALLOC_CONF note), not from real memory pressure: live peaks at 44 GB of 189.5.
+export TP="${TP:-2}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-256}"               # 30B same-stage production GBS
 export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"   # seed85m budget -> 31250 iters
 export SAVE_EVERY="${SAVE_EVERY:-2000}"
 export ACCEL="${ACCEL:-0}"                                       # HybridEP/MXFP8 unvalidated on GDN+MTP
-export OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-1}"
+# Recompute: spend the headroom the allocator fix returned (peak-live 44 GB of 189.5, ~37 GB of the
+# card is non-torch) on throughput. full/uniform/1 recomputes EVERY layer — literally a second
+# forward pass; selective keeps that only for core_attn (memory-heavy, compute-light) plus the MoE
+# layer (the biggest activation consumer), which is the combination 30B stage-3 runs in production.
+# Vision recompute goes off too: the tower re-runs 63k patches through 24 layers for no memory reason
+# now. Fall back to OV2_VISION_RECOMPUTE=1 first if memory gets tight — it costs the most memory and
+# buys the least speed of the two.
+export OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+export OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
+export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-0}"
+# Keeping recompute off raises peak-live from 44 GB to roughly 90 GB, so the collection threshold has
+# to sit above that: 0.6 would trigger at ~111 GB and reintroduce the churn measured on the TP=1 run.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.8}"
+export OV2_MEM_PROBE="${OV2_MEM_PROBE:-8}"                       # allocated-vs-reserved telemetry (one line / 8 forwards)
 export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"    # EP straggler counter-measure
 export RECIPE="ov2_qwen35_35b_a3b_midtrain"
 export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_qwen35_s15_seed85m_muon}"
@@ -107,7 +123,7 @@ mkdir -p "$SAVE"
     [[ "$_m" =~ ^[0-9]+$ ]] && (( _m > _peak )) && { _peak=$_m; echo "$_peak" >"$LOG.peak"; }
   done ) &
 
-echo "[qwen35-s15-prod] tp=$TP gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES muon=$OV2_MIDTRAIN_MUON sort_window=$OV2_LENGTH_SORT_WINDOW accel=$ACCEL save_every=$SAVE_EVERY init=$INIT_CKPT save=$SAVE" | tee -a "$LOG"
+echo "[qwen35-s15-prod] tp=$TP gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES muon=$OV2_MIDTRAIN_MUON sort_window=$OV2_LENGTH_SORT_WINDOW accel=$ACCEL save_every=$SAVE_EVERY recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE alloc=$PYTORCH_CUDA_ALLOC_CONF mem_probe=$OV2_MEM_PROBE init=$INIT_CKPT save=$SAVE" | tee -a "$LOG"
 python3 -c "import fla; print('[qwen35-s15-prod] fla', getattr(fla,'__version__','?'), fla.__file__)" 2>&1 | tee -a "$LOG" || true
 echo "[qwen35-s15-prod] watch: grep -E 'iteration +[0-9]+/' \$HOME/train_logs/prod_qwen35_s15_*worker-6*.log | tail -5   (iteration lines print on the LAST rank's pod)" | tee -a "$LOG"
 
