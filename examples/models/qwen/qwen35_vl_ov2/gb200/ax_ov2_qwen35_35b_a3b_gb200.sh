@@ -142,7 +142,16 @@ export OV2_SEQ_LEN="$SEQ_LEN"
 export OV2_MIDTRAIN_GBS="$MIDTRAIN_GBS" OV2_MIDTRAIN_N_SAMPLES="$MIDTRAIN_N_SAMPLES"
 export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"  # energon default 16 chokes WekaFS
 # GDN/MTP build + NCCL does NOT tolerate expandable_segments:True (observed fault) -> max_split_size_mb.
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256}"
+# garbage_collection_threshold:0.8 is the missing half of that substitution. With THD packing every
+# microbatch has a different shape, and blocks above max_split_size are never split, so the caching
+# allocator keeps cudaMalloc'ing new segments and RESERVED creeps up to the whole device — measured
+# four times as a per-pod peak of 188.4 of 192 GB, byte-identical at TP=1, TP=2 and TP=4, with both
+# Muon and AdamW. The device being full then surfaces as `NCCL WARN Cuda failure 2 'out of memory'`
+# (NCCL buffers are cudaMalloc'd outside the torch pool; one crash failed on a 136-byte calloc).
+# The threshold makes the allocator release cached blocks once reserved passes 80% of capacity, which
+# keeps that out-of-pool headroom. 30B avoids the whole problem with expandable_segments:True, which
+# this backbone cannot use.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:256,garbage_collection_threshold:0.8}"
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}" NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
 [[ -n "${NCCL_IB_HCA:-}" ]] && export NCCL_IB_HCA NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
 export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker}"

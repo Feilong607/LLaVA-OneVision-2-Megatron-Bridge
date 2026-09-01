@@ -677,6 +677,24 @@ class LlavaOnevision2(MegatronModule):
             _install_layer_nan_probe(self.language_model)
         if _probe_os.environ.get("OV2_GDN_KERNEL_DUMP"):
             _install_gdn_kernel_dump(self.language_model)
+        # OV2_MEM_PROBE=N: every N forwards, print allocated vs reserved. Separates "live tensors
+        # too big" from "caching allocator crept up to fill the device" — the s1.5 line hit a
+        # per-pod peak of 188.4/192 GB byte-identically at TP=1/2/4 and with vision recompute both
+        # on and off, which only the latter explains. Host-side counters, no device sync.
+        _mp = int(_probe_os.environ.get("OV2_MEM_PROBE", "0") or 0)
+        if _mp > 0 and torch.cuda.is_available():
+            _n = getattr(self, "_ov2_mem_probe_n", 0) + 1
+            self._ov2_mem_probe_n = _n
+            if _n % _mp == 0:
+                _r = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+                _g = 1024**3
+                print(
+                    f"[MEMPROBE r{_r}] fwd#{_n} allocated={torch.cuda.memory_allocated() / _g:.1f}G "
+                    f"max_allocated={torch.cuda.max_memory_allocated() / _g:.1f}G "
+                    f"reserved={torch.cuda.memory_reserved() / _g:.1f}G "
+                    f"max_reserved={torch.cuda.max_memory_reserved() / _g:.1f}G",
+                    flush=True,
+                )
         _ids, _pos_arg, combined, packed_seq_params = self._preprocess_lm_inputs(
             images,
             image_grid_thw,
