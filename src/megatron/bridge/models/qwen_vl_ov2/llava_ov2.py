@@ -695,6 +695,19 @@ class LlavaOnevision2(MegatronModule):
                     f"max_reserved={torch.cuda.max_memory_reserved() / _g:.1f}G",
                     flush=True,
                 )
+        # OV2_PHASE_TIMER=N: every N forwards, split the FORWARD wall time into the multimodal prefix
+        # (vision tower + adapter + masked_scatter fuse + mrope) and the LLM, and report how many
+        # vision patches produced how many LLM tokens. At seq 10192 a 60-frame bin sends ~63k patches
+        # through a 24-layer TP=1-replicated tower to feed ~10k LLM tokens, so "the tower dominates"
+        # is a real possibility that per-phase mcore timers cannot see. cuda-event based; the sync
+        # only happens on the sampled forwards. Default unset = no events, no sync.
+        _pt = int(_probe_os.environ.get("OV2_PHASE_TIMER", "0") or 0)
+        _pt_n = getattr(self, "_ov2_phase_n", 0) + 1
+        self._ov2_phase_n = _pt_n
+        _pt_on = _pt > 0 and _pt_n % _pt == 0 and torch.cuda.is_available()
+        if _pt_on:
+            _ev = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
+            _ev[0].record()
         _ids, _pos_arg, combined, packed_seq_params = self._preprocess_lm_inputs(
             images,
             image_grid_thw,
@@ -703,6 +716,8 @@ class LlavaOnevision2(MegatronModule):
             packed_seq_params=packed_seq_params,
             patch_positions=patch_positions,
         )
+        if _pt_on:
+            _ev[1].record()
         # loss_mask threaded into the LLM so the MTP head masks its aux loss to the SAME supervised
         # tokens as the main loss (else process_mtp_loss defaults to all-ones -> trains MTP on
         # prompt/image-pad/pad; matters once MTP is live at midtrain). No-op in stage-1/2 (MTP zeroed).
@@ -715,6 +730,20 @@ class LlavaOnevision2(MegatronModule):
             loss_mask=loss_mask,
             packed_seq_params=packed_seq_params,
         )
+        if _pt_on:
+            _ev[2].record()
+            torch.cuda.synchronize()
+            _t_prefix = _ev[0].elapsed_time(_ev[1])
+            _t_llm = _ev[1].elapsed_time(_ev[2])
+            _r = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+            _npatch = int(image_grid_thw.prod(dim=-1).sum().item()) if torch.is_tensor(image_grid_thw) and image_grid_thw.numel() else 0
+            print(
+                f"[PHASETIMER r{_r}] fwd#{_pt_n} prefix(vision+adapter+fuse)={_t_prefix:.0f}ms "
+                f"llm={_t_llm:.0f}ms prefix_share={_t_prefix / max(_t_prefix + _t_llm, 1e-6):.0%} "
+                f"patches={_npatch} llm_tokens={input_ids.shape[1]} "
+                f"patches_per_token={_npatch / max(input_ids.shape[1], 1):.1f}",
+                flush=True,
+            )
         # OV2_NAN_DUMP=<dir>: segment-level NaN probe (default unset = byte-identical no-op).
         # When the returned per-token loss carries a NaN, localize it to the THD segment(s), print a
         # per-segment fingerprint, and torch.save the WHOLE offending microbatch for offline replay

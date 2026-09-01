@@ -96,10 +96,10 @@ _first_ds="$(grep -m1 'path:' "$_PD_YAML" | awk '{print $2}')"
 export TP="${TP:-2}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-256}"               # 30B same-stage production GBS
 export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"   # seed85m budget -> 31250 iters
-# SAVE_EVERY in ITERATIONS, but what matters is WALL-CLOCK between saves: every workload here is
-# preemptible, so the interval bounds how much work a preemption can destroy. 800 iters is ~15 h at
-# the 32-GPU rate (70 s/iter) and ~8 h at 64 GPUs (~37 s/iter); the old 2000 was 39 h at 32 GPUs.
-export SAVE_EVERY="${SAVE_EVERY:-800}"
+# SAVE_EVERY is in ITERATIONS; the wall-clock it maps to depends on the current rate (2000 iters is
+# ~39 h at the 32-GPU rate, ~20 h at 64 GPUs). Everything here is preemptible, so this interval
+# bounds how much work a preemption destroys — tighten it (e.g. 800) if preemptions become frequent.
+export SAVE_EVERY="${SAVE_EVERY:-2000}"
 export ACCEL="${ACCEL:-0}"                                       # HybridEP/MXFP8 unvalidated on GDN+MTP
 # Recompute: spend the headroom the allocator fix returned (peak-live 44 GB of 189.5, ~37 GB of the
 # card is non-torch) on throughput. full/uniform/1 recomputes EVERY layer — literally a second
