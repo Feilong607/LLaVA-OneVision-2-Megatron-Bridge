@@ -29,10 +29,18 @@
 #
 # Workload form: Distributed/PyTorch, image
 #   mv0004-pytorch-feilong-nemo-qwen35-fla@sha256:6f62b6a6...  (fla 0.5.0),
-# gb200-nvl72-nodes, Workers=7 (8 pods x 4 GPU), Command bash (both sides),
-# Args = this file's absolute path (both sides), env OV2_K8S_NAMESPACE=runai-mv0004
-# (both sides). Optional overrides: SAVE, INIT_CKPT, OV2_MIDTRAIN_N_SAMPLES, TP,
-# OV2_MIDTRAIN_MUON, OV2_LENGTH_SORT_WINDOW, SAVE_EVERY.
+# gb200-nvl72-nodes, Command bash (both sides), Args = this file's absolute path
+# (both sides), env OV2_K8S_NAMESPACE=runai-mv0004 (both sides).
+#   32 GPU: Workers=7  (8 pods)  -> TP2/DP16, 16 microbatches/rank
+#   64 GPU: Workers=15 (16 pods) -> TP2/DP32,  8 microbatches/rank   <- just change Workers
+# KEEP TP=2 when scaling out. Per-GPU compute is total/WORLD either way, but TP4 would halve DP and
+# thus DOUBLE both the sequential step count and the EP all-to-all count (40 MoE layers x
+# microbatches), and this config is overhead/comm-bound, not FLOP-bound. TP8 additionally splits a TP
+# group across pods (4 GPU/pod) so TP traffic leaves the node. Extra GPUs belong in DP, not TP.
+# 64 GPU = the ENTIRE project quota: stop the export workspace and any eval first, or the gang never
+# assembles (that mistake cost 13 h of idle GPUs on 2026-09-01).
+# Optional overrides: SAVE, INIT_CKPT, OV2_MIDTRAIN_N_SAMPLES, TP, OV2_MIDTRAIN_MUON,
+# OV2_LENGTH_SORT_WINDOW, SAVE_EVERY, OV2_KEEP_CKPTS.
 # =============================================================================
 set -euo pipefail
 
@@ -88,7 +96,10 @@ _first_ds="$(grep -m1 'path:' "$_PD_YAML" | awk '{print $2}')"
 export TP="${TP:-2}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-256}"               # 30B same-stage production GBS
 export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"   # seed85m budget -> 31250 iters
-export SAVE_EVERY="${SAVE_EVERY:-2000}"
+# SAVE_EVERY in ITERATIONS, but what matters is WALL-CLOCK between saves: every workload here is
+# preemptible, so the interval bounds how much work a preemption can destroy. 800 iters is ~15 h at
+# the 32-GPU rate (70 s/iter) and ~8 h at 64 GPUs (~37 s/iter); the old 2000 was 39 h at 32 GPUs.
+export SAVE_EVERY="${SAVE_EVERY:-800}"
 export ACCEL="${ACCEL:-0}"                                       # HybridEP/MXFP8 unvalidated on GDN+MTP
 # Recompute: spend the headroom the allocator fix returned (peak-live 44 GB of 189.5, ~37 GB of the
 # card is non-torch) on throughput. full/uniform/1 recomputes EVERY layer — literally a second
@@ -109,10 +120,17 @@ export RECIPE="ov2_qwen35_35b_a3b_midtrain"
 export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_qwen35_s15_seed85m_muon}"
 export INIT_CKPT
 export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
+# Bound the checkpoint directory. mcore's most_recent_k defaults to -1 = keep EVERY save; a 35B model
+# with non-distributed Muon states is hundreds of GB per save, and 31250/SAVE_EVERY of them would
+# fill the filesystem (and a full filesystem kills the job at the next save).
+# ⚠️ This DELETES older saves: export or copy any milestone you want to evaluate BEFORE it ages out
+# (the 30B line had to keep iter_16000 as its best-scoring checkpoint — a blind "keep latest 2" would
+# have destroyed it). OV2_KEEP_CKPTS raises the window.
+export EXTRA_ARGS="${EXTRA_ARGS:-} checkpoint.most_recent_k=${OV2_KEEP_CKPTS:-4}"
 if [[ "$OV2_MIDTRAIN_MUON" == "1" ]]; then
   # Required for the trainable vision fused-QKV layout (the base launcher only appends it for
   # stage2 recipes; midtrain trains vision too).
-  export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_split_qkv=false"
+  export EXTRA_ARGS="$EXTRA_ARGS optimizer.muon_split_qkv=false"
 fi
 mkdir -p "$SAVE"
 
