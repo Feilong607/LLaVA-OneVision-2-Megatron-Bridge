@@ -68,6 +68,14 @@ else                                    # bf16 baseline -- DEFAULT
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-2250}"
 fi
 DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-1}"
+# Vision-tower recompute — the 30B stage-3 launcher's validated default, missing here until
+# 2026-09-01. llava_ov2 disables recompute on the tower by default (it only covers the LLM), and
+# the tower + adapter are built TP=1 / sequence_parallel=False on EVERY rank, so their activations
+# (a 60-frame video is ~63k patches through 24 layers at hidden 1024 => tens of GB) are replicated
+# and do NOT shrink with TP. That is why the per-pod peak was 188.4/192 GB — byte-identical — at
+# TP=1, TP=2 AND TP=4, each run dying with NCCL 'Cuda failure out of memory' (NCCL buffers are
+# cudaMalloc'd outside the torch pool, so an exhausted device surfaces there first).
+export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-1}"
 export OV2_RECOMPUTE_FULL MFU_PEAK_TFLOPS
 export OV2_FLEX_BACKEND="$FLEX_BACKEND"
 
