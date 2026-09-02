@@ -222,7 +222,21 @@ class _LengthSortedLoader:
 
     @staticmethod
     def _key(batch) -> int:
+        """Per-bin cost proxy to sort on. OV2_LENGTH_SORT_KEY=tokens (default) | patches.
+
+        `tokens` is the original proxy and is right for the 30B line, whose 64k packs vary in fill.
+        It is close to USELESS on seed85m, where packs are offline-packed to a fixed 10192 target so
+        token length barely moves — while the real per-bin cost driver, the raw vision patch count,
+        swings by an order of magnitude (a 4-image bin vs a 60-frame bin at ~63k patches). Sorting on
+        a quantity that does not vary cannot align per-step cost across ranks, which is what this
+        wrapper exists to do. `patches` reads image_grid_thw, already present in the batch.
+        Default keeps the validated path byte-identical.
+        """
         try:
+            if os.environ.get("OV2_LENGTH_SORT_KEY", "tokens") == "patches":
+                grid = batch.get("image_grid_thw")
+                if grid is not None and getattr(grid, "numel", lambda: 0)():
+                    return int(grid.prod(dim=-1).sum().item())
             tokens = batch.get("tokens", batch.get("input_ids"))
             return int(tokens.shape[-1]) if tokens is not None else 0
         except Exception:

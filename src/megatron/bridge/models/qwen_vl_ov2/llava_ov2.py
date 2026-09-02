@@ -30,6 +30,7 @@ Must run against the repo's ``3rdparty/Megatron-LM`` mcore (the OV2 vision
 from __future__ import annotations
 
 import logging
+import os
 from copy import deepcopy
 from dataclasses import asdict
 from typing import Optional
@@ -40,6 +41,11 @@ from megatron.core import tensor_parallel, parallel_state
 from megatron.core.transformer.module import MegatronModule
 
 logger = logging.getLogger(__name__)
+
+# Forwards during which the image-feature/token collective check always runs, regardless of
+# OV2_FEAT_CHECK_EVERY. The mismatch it guards is a static processor/grid-vs-tower config error, so
+# it shows up in the first batches; sampling only starts after this warmup.
+_FEAT_CHECK_WARMUP = 64
 
 # OV2.1 p16m33 vision-tower constants (from lmms-lab/LLaVA-OneVision-2-4B-p16m33).
 OV2_PATCH_SIZE = 16
@@ -514,7 +520,20 @@ class LlavaOnevision2(MegatronModule):
         # Collective abort: EVERY rank participates -- including text-only ranks where images is None and
         # _feat_bad stays 0 -- so the all_reduce itself can never desync. MAX => if ANY rank saw a
         # mismatch, ALL ranks raise the same RuntimeError at this identical program point.
-        if dist.is_available() and dist.is_initialized():
+        # OV2_FEAT_CHECK_EVERY=N (default 1 = every microbatch, the validated behaviour): run the
+        # collective only on the first _FEAT_CHECK_WARMUP forwards and then every Nth. The barrier is
+        # a WORLD-wide all_reduce + blocking .item() on the HEALTHY path, so at 16 microbatches per
+        # iteration it (a) converts per-microbatch cross-rank skew from an average into a sum of
+        # maxima and (b) drains CPU run-ahead at every microbatch boundary, which is why all of the
+        # multimodal prefix's host work is fully exposed. The bug it guards — a processor/grid vs
+        # tower mismatch — is a static config error that fires on the first batches, not at iteration
+        # 5000, so sampling after a warmup keeps essentially all of its value. Cost of raising it:
+        # a genuine late mismatch aborts up to N-1 microbatches later than it would today.
+        _fc_every = int(os.environ.get("OV2_FEAT_CHECK_EVERY", "1") or 1)
+        _fc_n = getattr(self, "_ov2_feat_check_n", 0) + 1
+        self._ov2_feat_check_n = _fc_n
+        _fc_run = _fc_every <= 1 or _fc_n <= _FEAT_CHECK_WARMUP or _fc_n % _fc_every == 0
+        if _fc_run and dist.is_available() and dist.is_initialized():
             _flag = torch.tensor([_feat_bad], dtype=torch.int32, device=input_ids.device)
             dist.all_reduce(_flag, op=dist.ReduceOp.MAX)
             _feat_bad = int(_flag.item())

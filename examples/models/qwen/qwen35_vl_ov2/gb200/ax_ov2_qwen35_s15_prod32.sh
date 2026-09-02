@@ -115,6 +115,11 @@ export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-0}"
 # to sit above that: 0.6 would trigger at ~111 GB and reintroduce the churn measured on the TP=1 run.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.8}"
 export OV2_MEM_PROBE="${OV2_MEM_PROBE:-8}"                       # allocated-vs-reserved telemetry (one line / 8 forwards)
+# Throughput telemetry, on by default because it is the one measurement that separates "the vision
+# tower dominates" from "the LLM dominates", and it costs one cuda-event pair per 8 forwards. It also
+# prints patches_per_token, which is the number that decides whether this line is genuinely slower
+# than the 30B reference or merely processing far more patches per LLM token.
+export OV2_PHASE_TIMER="${OV2_PHASE_TIMER:-8}"
 export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"    # EP straggler counter-measure
 export RECIPE="ov2_qwen35_35b_a3b_midtrain"
 export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_qwen35_s15_seed85m_muon}"
