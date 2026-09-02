@@ -2,7 +2,7 @@
 # =============================================================================
 # Qwen3.5-35B-A3B stage-1.5 (seed85m mid-train @ seq 10192) smoke — 32 GPU.
 #
-# ~20-iteration bring-up smoke for the qwen3.5 s1.5 line: full-model SFT
+# 30-iteration smoke for the qwen3.5 s1.5 line (bring-up AND throughput A/B): full-model SFT
 # (midtrain recipe) on the seed85m_video20m_47m5p_packed pool at its offline
 # pack length 10192, initialized from the staged stage-2 checkpoint. Wraps the
 # base launcher with what the bare launcher lacks:
@@ -102,10 +102,25 @@ _first_ds="$(grep -m1 'path:' "$_SM_YAML" | awk '{print $2}')"
 # (the s4 line plans TP4). GBS 256 % DP16 == 0; DP16 % EP8 == 0.
 export TP="${TP:-2}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-${GBS:-256}}"   # 30B same-stage production GBS
-export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( OV2_MIDTRAIN_GBS * 20 ))}"  # -> 20 iters
+# 30 iterations: iteration 1 is JIT/autotune (~470 s measured) and the raw per-iteration time is
+# steady from ~iteration 5, so the verdict drops the first 5 and reports p50/p90 over the other 25.
+export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( OV2_MIDTRAIN_GBS * 30 ))}"  # -> 30 iters
 export SAVE_EVERY="${SAVE_EVERY:-100000}"      # no interval saves; the end-of-run save lands in scratch
 export ACCEL="${ACCEL:-0}"                     # bf16 + alltoall (HybridEP/MXFP8 unvalidated on GDN+MTP)
-export OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-1}"    # fit first; speed levers after the memory verdict
+# Recompute / allocator / telemetry MUST track ax_ov2_qwen35_s15_prod32.sh, or every A/B run here
+# is measured against a baseline production no longer uses. Production values as of 2026-09-02
+# (measured: 63-77 s/iter, 874-1082 tokens/s/GPU, peak-live 92.7 G, reserved 125-142 G):
+export OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
+export OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
+export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-0}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.8}"
+export OV2_MEM_PROBE="${OV2_MEM_PROBE:-8}"
+export OV2_PHASE_TIMER="${OV2_PHASE_TIMER:-8}"
+# A/B usage: submit ONE knob per job, everything else default, job name = the knob. Candidates:
+#   OV2_LENGTH_SORT_KEY=patches | OV2_FEAT_CHECK_EVERY=8 | OV2_RECOMPUTE_MOE=0 |
+#   OV2_MOE_PERMUTE_FUSION=1 | ACCEL=2 | OV2_MIDTRAIN_GBS=64 (diagnostic only)
+# The verdict file prints the knob set alongside p50 iter time / tokens/s / memory / phase split,
+# so two verdict files ARE the A/B table.
 export RECIPE="ov2_qwen35_35b_a3b_midtrain"
 export SAVE="$SAVE_DIR" INIT_CKPT
 export OV2_DIST_TIMEOUT_MIN="${OV2_DIST_TIMEOUT_MIN:-60}"   # smoke fails fast, not 300min
@@ -134,7 +149,8 @@ export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"
   done ) &
 _mon=$!
 
-echo "[qwen35-s15-smoke] launch: tp=$TP gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES accel=$ACCEL recompute_full=$OV2_RECOMPUTE_FULL muon=$OV2_MIDTRAIN_MUON sort_window=$OV2_LENGTH_SORT_WINDOW init=$INIT_CKPT" | tee -a "$LOG"
+_knobs="tp=$TP gbs=$OV2_MIDTRAIN_GBS accel=$ACCEL recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE alloc=$PYTORCH_CUDA_ALLOC_CONF sort_window=$OV2_LENGTH_SORT_WINDOW sort_key=${OV2_LENGTH_SORT_KEY:-tokens} feat_check_every=${OV2_FEAT_CHECK_EVERY:-1} permute_fusion=${OV2_MOE_PERMUTE_FUSION:-0} muon=$OV2_MIDTRAIN_MUON"
+echo "[qwen35-s15-smoke] launch: $_knobs n_samples=$OV2_MIDTRAIN_N_SAMPLES init=$INIT_CKPT" | tee -a "$LOG"
 # Which fla will the run execute? Print version+path into the persisted log — the NaN case turned
 # on exactly this question (image fla 0.4.2 vs the qwen35-fla image's isolated /opt/ov2-fla), and
 # the training logs otherwise never say. PYTHONPATH here matches what the base launcher composes
@@ -150,31 +166,43 @@ echo "[qwen35-s15-smoke] rc=$_rc pod_peak_mem_mib=$_peak" | tee -a "$LOG"
 
 # ── verdict: written by the pod whose log carries iteration lines ────────────
 python3 - "$LOG" "$RESULT" "$_rc" "$_peak" "$TP" "$OV2_MIDTRAIN_GBS" \
-          "$OV2_MIDTRAIN_MUON" "$OV2_LENGTH_SORT_WINDOW" <<'PYEOF'
+          "$OV2_MIDTRAIN_MUON" "$OV2_LENGTH_SORT_WINDOW" "$_knobs" <<'PYEOF'
 import os
 import re
 import statistics as st
 import sys
 
-log, result, rc, peak, tp, gbs, muon, sortw = sys.argv[1:9]
+log, result, rc, peak, tp, gbs, muon, sortw, knobs = sys.argv[1:10]
 text = open(log, errors="replace").read()
 sort_on = "length-sorted batching ON" in text
-its = [float(x) for x in re.findall(r"elapsed time per iteration \(ms\): ([\d.]+)", text)][3:]
-tf = [float(x) for x in re.findall(r"TFLOP/s/GPU\)?: ([\d.]+)", text)][3:]
-fb = [(float(a), float(b)) for a, b in re.findall(r"forward-backward[ .]*:? *\(([\d.]+), ([\d.]+)\)", text)][3:]
+WARM = 5  # iteration 1 is JIT/autotune; raw iter time is steady from ~5
+its = [float(x) for x in re.findall(r"elapsed time per iteration \(ms\): ([\d.]+)", text)][WARM:]
+tps = [float(x) for x in re.findall(r"tokens/s/GPU: ([\d.]+)", text)][WARM:]
+tf = [float(x) for x in re.findall(r"TFLOP/s/GPU\)?: ([\d.]+)", text)][WARM:]
+fb = [(float(a), float(b)) for a, b in re.findall(r"forward-backward[ .]*:? *\(([\d.]+), ([\d.]+)\)", text)][WARM:]
+mem = [(float(a), float(r)) for a, r in re.findall(r"max_allocated=([\d.]+)G reserved=([\d.]+)G", text)]
+ph = [(int(sh), float(ppt)) for sh, ppt in re.findall(r"prefix_share=(\d+)% .*?patches_per_token=([\d.]+)", text)]
 skips = sum(1 for ln in text.splitlines() if "exceed seq_length" in ln or "Skipping this pack" in ln)
 nans = len(re.findall(r"skipping batch|found NaN|nan detected", text, re.I))
 if not its and rc == "0":
     sys.exit(0)  # healthy waiter pod (iteration lines print on the last rank only)
 
-lines = [f"qwen35 s1.5 (seed85m@10192) smoke — TP={tp} gbs={gbs} muon={muon} "
-         f"sort_window={sortw} (engaged: {'yes' if sort_on else 'NO — check recipe log'})"]
+lines = [f"qwen35 s1.5 (seed85m@10192) smoke — {knobs} "
+         f"(sort engaged: {'yes' if sort_on else 'NO — check recipe log'})"]
 if its:
     s = sorted(its)
     q = lambda p: s[min(len(s) - 1, int(p * len(s)))]
-    lines.append(f"iters: n={len(its)} p50={q(0.5):.0f}ms p90={q(0.9):.0f}ms max={s[-1]:.0f}ms")
+    lines.append(f"iters (after dropping first {WARM}): n={len(its)} p50={q(0.5):.0f}ms p90={q(0.9):.0f}ms max={s[-1]:.0f}ms")
+if tps:
+    lines.append(f"tokens/s/GPU: p50={st.median(tps):.0f}  (baseline 2026-09-02 prod defaults ~1000; full-recompute ~620)")
 if tf:
-    lines.append(f"tflops/gpu: p50={st.median(tf):.1f}")
+    lines.append(f"tflops/gpu (reported; omits the vision tower): p50={st.median(tf):.1f}")
+if mem:
+    lines.append(f"torch memory: max_allocated={max(a for a, _ in mem):.1f}G max_reserved={max(r for _, r in mem):.1f}G "
+                 f"(card 189.5G, ~37G non-torch; reserved >150G = OOM territory)")
+if ph:
+    lines.append(f"phase split: prefix(vision+adapter) share p50={st.median(sh for sh, _ in ph):.0f}% "
+                 f"patches_per_llm_token p50={st.median(p for _, p in ph):.1f}")
 if fb:
     ratio = st.median(hi / lo for lo, hi in fb if lo > 0)
     lines.append(f"fb straggler spread (max/min across ranks) p50={ratio:.2f}")
