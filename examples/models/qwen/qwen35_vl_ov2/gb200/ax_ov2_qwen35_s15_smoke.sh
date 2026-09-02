@@ -105,7 +105,10 @@ export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-${GBS:-256}}"   # 30B same-stage pr
 # 30 iterations: iteration 1 is JIT/autotune (~470 s measured) and the raw per-iteration time is
 # steady from ~iteration 5, so the verdict drops the first 5 and reports p50/p90 over the other 25.
 export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( OV2_MIDTRAIN_GBS * 30 ))}"  # -> 30 iters
-export SAVE_EVERY="${SAVE_EVERY:-100000}"      # no interval saves; the end-of-run save lands in scratch
+# SAVE_EVERY=0 disables BOTH interval saves and the end-of-run save (train.py skips the final save
+# when save_interval == 0, and the interval check is truthiness-guarded, so no modulo-by-zero).
+# A 35B+Muon save is hundreds of GB and several minutes; a throughput smoke has no use for one.
+export SAVE_EVERY="${SAVE_EVERY:-0}"
 export ACCEL="${ACCEL:-0}"                     # bf16 + alltoall (HybridEP/MXFP8 unvalidated on GDN+MTP)
 # Recompute / allocator / telemetry MUST track ax_ov2_qwen35_s15_prod32.sh, or every A/B run here
 # is measured against a baseline production no longer uses. Production values as of 2026-09-02
