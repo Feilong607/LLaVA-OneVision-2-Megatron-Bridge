@@ -44,6 +44,21 @@
 # =============================================================================
 set -euo pipefail
 
+# Knobs may also arrive as positional KEY=VALUE args. The workload form's env section can be locked
+# by an admin policy (observed 2026-09-03: policy-injected AWS_* rows, "+ ENVIRONMENT VARIABLE"
+# rejected), while Args stays editable — so
+#     bash <this script> OV2_LENGTH_SORT_KEY=patches TP=2
+# is exactly equivalent to setting those in the environment. Exported here, BEFORE any default
+# below is read. Anything that is not NAME=value is a typo; fail loud rather than silently run the
+# default configuration under an experiment's job name.
+for _kv in "$@"; do
+  if [[ "$_kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]]; then
+    export "$_kv"
+  else
+    echo "FATAL: positional arg '$_kv' is not KEY=VALUE" >&2; exit 1
+  fi
+done
+
 _PD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _PD_BASE="$_PD_DIR/ax_ov2_qwen35_35b_a3b_gb200.sh"
 _PD_TAG="$(hostname | sed -E 's/-(master|worker)-[0-9]+$//')"
