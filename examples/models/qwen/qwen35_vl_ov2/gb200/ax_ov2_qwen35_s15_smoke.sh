@@ -22,11 +22,10 @@
 # DISABLE_RECOMPUTE=1 speed lever is affordable).
 #
 # Topology (NPROC=4/pod; EP=8 fixed in the recipe): 32 GPU = 8 pods
-# (Workers=7): TP=2 -> DP=16. Muon (required for AIAK parity) does not fit at
-# TP=1 on the 35B — measured ~188GB/192GB pod peak, OOM in the first triton
-# autotune — and TP=2 also gives the s4 line its first TP>1 validation on the
-# GDN hybrid. GBS=256 = the 30B same-stage production value (256 % 16 == 0;
-# the bare default 16 fails the launcher's GBS%DP guard at this world size).
+# (Workers=7): TP=2 -> DP=16. TP=2 is a MEASURED choice: TP=1 ran 1.6x slower
+# (176 vs 108-120 s/iter like-for-like). The early "Muon does not fit at TP=1,
+# 188 GB peak" reading was the allocator fragmentation bug, since fixed.
+# GBS=256 = the 30B same-stage production value (256 % 16 == 0).
 #
 # Workload form: Distributed/PyTorch, image feilong-nemo, gb200-nvl72-nodes,
 # Command bash (both sides), Args = this file's absolute path (both sides),
@@ -111,10 +110,9 @@ _first_ds="$(grep -m1 'path:' "$_SM_YAML" | awk '{print $2}')"
 [[ -d "$_first_ds" ]] || _die "seed85m shard dir not mounted: $_first_ds (from $_SM_YAML)"
 
 # ── scale + knobs (see header) ────────────────────────────────────────────────
-# TP=2 -> DP=16 (32 GPU). TP=1 does NOT fit Muon on the 35B: measured ~188GB/192GB pod peak,
-# OOM in the first triton autotune (see the Muon note below). TP=2 halves weights/grads/Muon
-# states (~105GB -> ~52GB static) and doubles as the first TP>1 validation on the GDN hybrid
-# (the s4 line plans TP4). GBS 256 % DP16 == 0; DP16 % EP8 == 0.
+# TP=2 -> DP=16 (32 GPU). Measured: TP=1 is 1.6x SLOWER (176 vs 108-120 s/iter like-for-like) —
+# it doubles model-state/activation memory without SP and parks reserved on the GC threshold. (The
+# earlier "TP=1 OOMs at 188 GB" was allocator fragmentation, not a fit limit.) GBS 256 % DP16 == 0.
 export TP="${TP:-2}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-${GBS:-256}}"   # 30B same-stage production GBS
 # 30 iterations: iteration 1 is JIT/autotune (~470 s measured) and the raw per-iteration time is
@@ -144,11 +142,9 @@ export SAVE="$SAVE_DIR" INIT_CKPT
 export OV2_DIST_TIMEOUT_MIN="${OV2_DIST_TIMEOUT_MIN:-60}"   # smoke fails fast, not 300min
 
 # Muon ON — the s1.5 line's required optimizer (AIAK parity; 30B midtrain+Muon+EP8 has 11.5k+
-# production iterations, and 30B stage3 runs TP4+Muon). Muon's layer-wise full states are why
-# the default TP above is 2, not 1: at TP=1 the measured pod peak hit ~188GB of 192GB and the
-# first fla/GDN triton autotune benchmark died with "Triton Error [CUDA]: out of memory"
-# (2026-08-30 smoke). muon_split_qkv=false is required for the trainable vision fused-QKV
-# layout. OV2_MIDTRAIN_MUON=0 falls back to the recipe's AdamW auto-route (memory A/B lever).
+# production iterations, 30B stage3 runs TP4+Muon, and qwen3.5 s1.5 has 800+ clean iterations).
+# muon_split_qkv=false is required for the trainable vision fused-QKV layout.
+# OV2_MIDTRAIN_MUON=0 falls back to the recipe's AdamW auto-route (memory A/B lever).
 export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
 if [[ "$OV2_MIDTRAIN_MUON" == "1" ]]; then
   export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_split_qkv=false"

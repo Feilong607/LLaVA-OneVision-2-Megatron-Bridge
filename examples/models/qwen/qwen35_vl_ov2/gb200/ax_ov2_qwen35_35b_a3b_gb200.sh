@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 # OV2 · Qwen3.5-35B-A3B (GatedDeltaNet hybrid + 256-expert MoE + MTP) + OneVision p16m33
-# GB200-only IN-CONTAINER launcher (4 GPU/node; EP8 = 2 nodes). Sibling of
+# GB200-only IN-CONTAINER launcher (4 GPU/node). Bring-up shape: 2 nodes = 8 GPU = one EP8 group.
+# Production shape: 32/64 GPU at TP=2 via ax_ov2_qwen35_s15_prod32.sh (measured). Sibling of
 # qwen3_vl_ov2/gb200/ax_ov2_30b_a3b_gb200.sh. Do NOT cross 3.5/30B recipes/ckpts/processors
 # (3.5 <|image_pad|>=248056 vs 30B 151655).
 #
@@ -15,15 +16,17 @@ REPO="${REPO:-$({ __d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; while [[ 
 bash "$REPO/3rdparty/apply_megatron_patch.sh"   # mcore submodule patches (apply_rotary_fn hook, HybridEP pad); idempotent
 
 RECIPE="${RECIPE:-ov2_qwen35_35b_a3b_midtrain}"   # other stages: ov2_qwen35_35b_a3b_stage2 / _stage1
-MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-16}"
+MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-256}"   # production value (matches 30B); the old default 16 failed GBS%DP at 32 GPU
 MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-8000000}"   # seed85m budget (matches 30B)
 ITERS="${ITERS:-$(( (MIDTRAIN_N_SAMPLES + MIDTRAIN_GBS - 1) / MIDTRAIN_GBS ))}"
 WARMUP_ITERS="${OV2_WARMUP_ITERS:-$(( ITERS * 2 / 1000 ))}"
-if [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
+# Floor the AUTO-derived warmup to 1; an explicit OV2_WARMUP_ITERS=0 is honored (matches the 30B launcher).
+if [ -z "${OV2_WARMUP_ITERS:-}" ] && [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITERS=1; fi
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
 
 NPROC="${NPROC:-4}"   # GB200 = 4 GPU/node
-TP="${TP:-1}"         # 2-node world=8 needs TP=1 so DP=8 satisfies EP=8
+TP="${TP:-1}"         # 1 = the 2-node/8-GPU bring-up MINIMUM (DP must reach EP=8), not a preference:
+                      # at 32 GPU TP=2 measured 1.6x FASTER than TP=1; the production wrapper sets 2.
 if [[ "$TP" -gt 1 ]]; then SP=true; else SP=false; fi
 # seed85m packed length. NB: packed with the Qwen2.5-VL tokenizer -> under 3.5 (248056) some packs
 # exceed seq_length and get SkipSample'd; check the dropped-pack rate before a long run.
@@ -51,8 +54,8 @@ OV2_SKIP_BASE_STITCH="${OV2_SKIP_BASE_STITCH:-1}"   # midtrain from stage-2 -> s
 export OV2_PRETRAIN_ROOT OV2_LLM_HF_QWEN35 OV2_HF_PROC_QWEN35_P16M33 OV2_MCORE_QWEN35_P16M33 OV2_SKIP_BASE_STITCH
 export OV2_INIT_CKPT="$INIT_CKPT"   # recipe guard verifies this exists before skipping the stitch
 
-# --- ACCEL. Recompute ON for every lane: the smaller 30B OOMs recompute-OFF at this seq on these
-# nodes; DISABLE_RECOMPUTE=1 once fit is proven. ---
+# --- ACCEL. Recompute stays ON for every lane here (the 30B stage-3 launcher records recompute-OFF
+# OOMing 192GB at this seq); the production wrapper narrows it to selective core_attn+moe, measured to fit. ---
 ACCEL="${ACCEL:-0}"
 if [[ "$ACCEL" == "1" ]]; then          # MXFP8 + alltoall
   MIXED_PRECISION="${MIXED_PRECISION:-bf16_with_mxfp8_mixed}"
@@ -68,13 +71,13 @@ else                                    # bf16 baseline -- DEFAULT
   MFU_PEAK_TFLOPS="${MFU_PEAK_TFLOPS:-2250}"
 fi
 DISABLE_RECOMPUTE="${DISABLE_RECOMPUTE:-0}"; OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-1}"
-# Vision-tower recompute — the 30B stage-3 launcher's validated default, missing here until
-# 2026-09-01. llava_ov2 disables recompute on the tower by default (it only covers the LLM), and
-# the tower + adapter are built TP=1 / sequence_parallel=False on EVERY rank, so their activations
-# (a 60-frame video is ~63k patches through 24 layers at hidden 1024 => tens of GB) are replicated
-# and do NOT shrink with TP. That is why the per-pod peak was 188.4/192 GB — byte-identical — at
-# TP=1, TP=2 AND TP=4, each run dying with NCCL 'Cuda failure out of memory' (NCCL buffers are
-# cudaMalloc'd outside the torch pool, so an exhausted device surfaces there first).
+# Conservative "fit-first" defaults for a BARE base-launcher run: full LLM recompute and vision-tower
+# recompute both ON (the tower + adapter are built TP=1 / sequence_parallel=False on every rank, so
+# their activations do not shrink with TP). Production (ax_ov2_qwen35_s15_prod32.sh) overrides to
+# selective core_attn+moe with the tower NOT recomputed — measured 63-77 s/iter at peak-live 92.7 G.
+# History: the byte-identical 188.4 GB per-pod peak seen at TP=1/2/4 was NOT the tower's activations
+# (turning vision recompute on left it unchanged) — it was the allocator fragmentation described at
+# PYTORCH_CUDA_ALLOC_CONF below.
 export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-1}"
 export OV2_RECOMPUTE_FULL MFU_PEAK_TFLOPS
 export OV2_FLEX_BACKEND="$FLEX_BACKEND"
@@ -101,7 +104,7 @@ else
 fi
 # k8s DNS: short pod-name MASTER_ADDR -> FQDN if it resolves (avoids rdzv gai timeout).
 if [[ "$NNODES" -gt 1 && -n "${MASTER_ADDR:-}" && "$MASTER_ADDR" != *.* && "$MASTER_ADDR" != "127.0.0.1" ]]; then
-  _ns="${POD_NAMESPACE:-${OV2_K8S_NAMESPACE:-runai-mv0004}}"
+  _ns="${POD_NAMESPACE:-${OV2_K8S_NAMESPACE:-$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo runai-mv0004)}}"
   _fqdn="${MASTER_ADDR}.${_ns}.svc.cluster.local"
   if getent hosts "$_fqdn" >/dev/null 2>&1; then
     echo "[ov2-qwen35-gb200] rdzv: MASTER_ADDR '$MASTER_ADDR' -> FQDN '$_fqdn'" >&2
@@ -119,7 +122,7 @@ WORLD=$(( NPROC * NNODES ))
 DP=$(( WORLD / TP ))
 (( MIDTRAIN_GBS % DP == 0 )) || { echo "[ov2-qwen35] FATAL: DP=$DP does not divide GBS=$MIDTRAIN_GBS; adjust TP/NNODES or OV2_MIDTRAIN_GBS." >&2; exit 1; }
 # EP=8 fixed in the recipe.
-(( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-qwen35] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (2 GB200 nodes + TP=1 -> DP=8)." >&2; exit 1; }
+(( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-qwen35] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (bring-up: 2 nodes x 4 GPU at TP=1 -> DP=8; production: 32 GPU at TP=2 -> DP=16)." >&2; exit 1; }
 
 # --- env ---
 # Offline packages not pip-installed in the image (e.g. emerging_optimizers for distributed Muon):
@@ -151,11 +154,11 @@ export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"  # energon defa
 # per-pod peak of 188.4 of 189.5 GB (99.4% of the card), byte-identical at TP=1/2/4, with Muon and
 # AdamW, and with vision recompute on and off, dying as `NCCL WARN Cuda failure 2 'out of memory'`
 # (NCCL buffers are cudaMalloc'd OUTSIDE the torch pool; one crash failed on a 136-byte calloc).
-# So: drop max_split_size_mb (restore normal splitting) and keep a garbage-collection threshold, set
-# at 0.6 so the allocator starts releasing cached blocks around 111 GB instead of at the ceiling —
-# 0.8 was measured triggering at ~148 GB, which is where reserved was already hovering. Note ~37 GB
-# of the card is non-torch (CUDA context, NCCL buffers, cuBLAS/TE workspaces), so torch cannot be
-# allowed anywhere near the full card.
+# So: drop max_split_size_mb (restore normal splitting) and keep a garbage-collection threshold. The
+# BASE default 0.6 (collect from ~111 GB) suits the full-recompute lane above (peak-live ~44 G). The
+# production wrapper runs selective recompute at peak-live 92.7 G and therefore sets 0.8 — 0.6 there
+# would sit on the working set and churn (measured on the TP=1 run). ~37 GB of the card is non-torch
+# (CUDA context, NCCL buffers, cuBLAS/TE workspaces), so torch must never approach the full card.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.6}"
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}" NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
 [[ -n "${NCCL_IB_HCA:-}" ]] && export NCCL_IB_HCA NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
@@ -182,25 +185,50 @@ if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   grep -q "_HYBRID_EP_PAD_INFO" "$_fa2a" 2>/dev/null || {
     echo "[ov2-qwen35] FATAL: HybridEP needs the fused_a2a.py THD-padding patch (marker _HYBRID_EP_PAD_INFO missing). Run: bash \"$REPO/3rdparty/apply_megatron_patch.sh\". Or use ACCEL=0/1." >&2
     exit 1; }
-  # EP ranks per NVLink domain: 8 on NVL72 (one domain). <8 forces the internode-RDMA path (OOM + slower).
-  _dom_ext="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-}"
-  export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-8}"
-  (( 8 % NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN == 0 )) || {
-    echo "ERROR: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN must divide EP=8." >&2; exit 1; }
-  [[ -n "$_dom_ext" && "$_dom_ext" != "8" ]] && \
-    echo "[ov2-qwen35] WARN: NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$_dom_ext set in the shell (default 8); 'unset' it unless ranks are genuinely split across NVLink domains." >&2
+  # NVLink domain: let DeepEP auto-detect (a stale fixed 8 can split a detected 32-rank NVL72 domain and
+  # force IB QPs). OV2_HYBRIDEP_NVLINK_DOMAIN_RANKS=<n> overrides; must divide TPxEP. Ported from the 30B
+  # stage-3 launcher, which learned this at 32 GPUs.
+  _hep_domain_override="${OV2_HYBRIDEP_NVLINK_DOMAIN_RANKS:-auto}"
+  if [[ "$_hep_domain_override" == "auto" ]]; then
+    [[ -n "${NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN:-}" ]] && \
+      echo "[ov2-qwen35] WARN: unsetting inherited NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN=$NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN; DeepEP will auto-detect." >&2
+    unset NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN
+  else
+    [[ "$_hep_domain_override" =~ ^[0-9]+$ ]] && (( _hep_domain_override > 0 )) || {
+      echo "[ov2-qwen35] FATAL: OV2_HYBRIDEP_NVLINK_DOMAIN_RANKS must be auto or a positive integer, got $_hep_domain_override" >&2; exit 1; }
+    _hep_group_ranks=$(( TP * 8 ))   # HybridEP communicates over TP x EP.
+    (( _hep_group_ranks % _hep_domain_override == 0 )) || {
+      echo "[ov2-qwen35] FATAL: NVLink domain override=$_hep_domain_override must divide TPxEP=$_hep_group_ranks." >&2; exit 1; }
+    export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="$_hep_domain_override"
+  fi
   export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"   # nvshmem CUDA-VMM broken on this platform
-  # JIT cap: %64 and identical across EP ranks; derive from SEQ_LEN (round up to 64).
-  _hep_cap=$(( (SEQ_LEN + 63) / 64 * 64 ))
-  export HYBRID_EP_MAX_TOKENS_PER_RANK="${HYBRID_EP_MAX_TOKENS_PER_RANK:-$_hep_cap}"
-  (( HYBRID_EP_MAX_TOKENS_PER_RANK >= _hep_cap )) || {
-    echo "[ov2-qwen35] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK < round64(SEQ_LEN)=$_hep_cap -> ranks pad to different targets -> allgather hang." >&2; exit 1; }
-  (( HYBRID_EP_MAX_TOKENS_PER_RANK % 64 == 0 )) || {
-    echo "[ov2-qwen35] FATAL: HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK must be a multiple of 64." >&2; exit 1; }
+  # Token cap is per RANK and HybridEP receives SP-LOCAL rows (MBS=1, CP=1): round64(ceil(SEQ_LEN/TP)) when
+  # SP is on. The former global-SEQ_LEN cap over-allocated 2x at TP=2 (harmless only at TP=1).
+  _hep_global_tokens="${OV2_HYBRIDEP_GLOBAL_TOKEN_CAP:-$SEQ_LEN}"
+  [[ "$_hep_global_tokens" =~ ^[0-9]+$ ]] && (( _hep_global_tokens > 0 )) || {
+    echo "[ov2-qwen35] FATAL: invalid global HybridEP token cap: $_hep_global_tokens" >&2; exit 1; }
+  _hep_token_shards=1; [[ "$SP" == "true" ]] && _hep_token_shards="$TP"
+  _hep_local_tokens=$(( (_hep_global_tokens + _hep_token_shards - 1) / _hep_token_shards ))
+  _hep_cap=$(( (_hep_local_tokens + 63) / 64 * 64 ))
+  if [[ -n "${HYBRID_EP_MAX_TOKENS_PER_RANK:-}" && "$HYBRID_EP_MAX_TOKENS_PER_RANK" != "$_hep_cap" ]]; then
+    echo "[ov2-qwen35] FATAL: stale HYBRID_EP_MAX_TOKENS_PER_RANK=$HYBRID_EP_MAX_TOKENS_PER_RANK; expected TP-local cap=$_hep_cap from global=$_hep_global_tokens TP=$TP SP=$SP" >&2; exit 1
+  fi
+  export HYBRID_EP_MAX_TOKENS_PER_RANK="$_hep_cap"
+  (( _hep_cap <= 21824 )) || { echo "[ov2-qwen35] FATAL: HybridEP local cap=$_hep_cap exceeds the inter-node safe limit 21824 (THD patch uses 64-token chunks); increase TP or use ACCEL=0." >&2; exit 1; }
+  echo "[ov2-qwen35] HybridEP token cap: global=$_hep_global_tokens TP=$TP SP=$SP local=$_hep_local_tokens cap64=$_hep_cap" >&2
+  # UNVALIDATED on the GDN+MTP backbone: run it through ax_ov2_qwen35_s15_smoke.sh with ACCEL=2 first.
+  # Candidate extras seen in upstream GB200 release tests (NOT set here until measured):
+  #   USE_MNNVL=1 NVSHMEM_IB_ENABLE_IBGDA=0 OV2_HYBRIDEP_NUM_SMS=32
   [[ -n "${OV2_HYBRIDEP_NUM_SMS:-}" ]] && { export OV2_HYBRIDEP_NUM_SMS; echo "[ov2-qwen35] WARN: OV2_HYBRIDEP_NUM_SMS=$OV2_HYBRIDEP_NUM_SMS set (steals SMs from expert GEMMs)." >&2; }
-  [[ -n "${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-}" ]] && { export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API; echo "[ov2-qwen35] WARN: NUM_OF_TOKENS_PER_CHUNK_COMBINE_API set (can mis-size combine buffers on the pinned deep_ep); 'unset' unless validated." >&2; }
+  [[ -n "${NUM_OF_TOKENS_PER_CHUNK_COMBINE_API:-}" ]] && { export NUM_OF_TOKENS_PER_CHUNK_COMBINE_API; echo "[ov2-qwen35] WARN: NUM_OF_TOKENS_PER_CHUNK_COMBINE_API set (can mis-size combine buffers)." >&2; }
 fi
-export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+# EP comm-overlap (OV2_EP_OVERLAP=1) requires CUDA_DEVICE_MAX_CONNECTIONS>=32; couple them so the lever
+# actually engages instead of silently no-op'ing (ported from the 30B launcher). Default path keeps 1.
+if [[ "${OV2_EP_OVERLAP:-0}" == "1" ]]; then
+  export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-32}"
+else
+  export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+fi
 
 # --- run_recipe.py overrides ---
 OVERRIDES="dataset.path=$DATA_PATH"
@@ -211,8 +239,9 @@ OVERRIDES="$OVERRIDES model.tensor_model_parallel_size=$TP model.sequence_parall
 OVERRIDES="$OVERRIDES model.moe_router_dtype=${OV2_ROUTER_DTYPE:-fp32}"   # 256-expert router stability
 OVERRIDES="$OVERRIDES scheduler.lr_warmup_iters=$WARMUP_ITERS"
 OVERRIDES="$OVERRIDES optimizer.lr=${OV2_LR:-1e-5} optimizer.min_lr=${OV2_MIN_LR:-1e-6}"
-# Stage-2 keeps distributed Muon; vision fused-QKV layout needs muon_split_qkv=false. midtrain = AdamW
-# (recipe auto-routes) so this is a no-op there. OV2_STAGE2_ADAMW=1 forces AdamW.
+# Stage-2 keeps distributed Muon; the trainable vision fused-QKV layout needs muon_split_qkv=false.
+# Production midtrain also runs Muon (OV2_MIDTRAIN_MUON=1; the wrappers append the same override
+# themselves). OV2_STAGE2_ADAMW=1 forces AdamW for stage-2.
 export OV2_STAGE2_ADAMW="${OV2_STAGE2_ADAMW:-0}"
 if [[ "$RECIPE" == *stage2* && "$OV2_STAGE2_ADAMW" != "1" ]]; then
   OVERRIDES="$OVERRIDES optimizer.muon_split_qkv=false"
@@ -225,7 +254,9 @@ else
 fi
 OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-8}"
 OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-300}"   # first-step JIT + ckpt load exceed 100
-# CE fusion OFF: TP=1 -> fused CE materializes full [seq, ~256k-vocab] fp32 logits (~10GB spike) + per-shape recompiles.
+# CE fusion OFF pending a TP=2 A/B (OV2_CE_FUSION=true; smoke ab-cefusion). The original reason was TP=1: an
+# unsharded [seq, 248k] fp32 logits spike (~10GB) plus per-shape recompiles. At TP=2 the vocab is sharded,
+# so the 30B launcher's own precondition for re-enabling it now holds here.
 OVERRIDES="$OVERRIDES model.cross_entropy_loss_fusion=${OV2_CE_FUSION:-false}"
 OVERRIDES="$OVERRIDES logger.tensorboard_dir=$SAVE/tensorboard"
 OVERRIDES="$OVERRIDES mixed_precision=$MIXED_PRECISION"
@@ -241,15 +272,16 @@ if [[ "${OV2_FSDP:-0}" == "1" ]]; then
 fi
 
 mkdir -p "$SAVE"; cd "$REPO"
-# The 30B launcher exports OV2_MIDTRAIN_MUON=1; a leftover export flips THIS midtrain to Muon, which
-# deadlocks EP backward on trainable 256-expert MoE.
-if [[ "$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1" ]]; then
-  echo "[ov2-qwen35] WARN: OV2_MIDTRAIN_MUON=1 -> midtrain will use Muon, which DEADLOCKS EP backward on trainable experts. 'unset OV2_MIDTRAIN_MUON' (auto-routes to AdamW)." >&2
-fi
+# Midtrain optimizer: distributed Muon is the s1.5 line's operator-required choice (AIAK parity) and has
+# run 800+ qwen3.5 iterations and 11.5k+ 30B stage-3 iterations cleanly; the former "DEADLOCKS EP backward"
+# WARN that fired on every production launch was never observed and is gone. Default 1 mirrors the 30B
+# launcher; the recipe's MoE auto-route to AdamW applies only when this is 0. Muon cannot resume from an AdamW SAVE.
+export OV2_MIDTRAIN_MUON="${OV2_MIDTRAIN_MUON:-1}"
 # Preflight (mirrors the 30B launchers): mcore's distributed Muon needs 'emerging_optimizers', which is
 # NOT in the base GB200 image. Without it the run dies DEEP -- after full NCCL init -- with a cryptic
 # per-rank ImportError. Probe here (PYTHONPATH incl. the pylibs fold-in is set above) and fail loud EARLY.
 if [[ ("$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1") || ("$RECIPE" == *stage2* && "$OV2_STAGE2_ADAMW" != "1") ]]; then
+  [[ "${OV2_FSDP:-0}" == "1" ]] && { echo "[ov2-qwen35] FATAL: OV2_FSDP=1 is incompatible with Muon (Muon forces use_distributed_optimizer=False; FSDP shards optimizer state). Unset one." >&2; exit 1; }
   if ! python -c "import emerging_optimizers" >/dev/null 2>&1; then
     echo "[ov2-qwen35] FATAL: this recipe/optimizer combo uses distributed Muon but 'emerging_optimizers' is not importable." >&2
     echo "  Fix (pick one): stage the offline copy at \$HOME/pylibs or \$REPO/pylibs (auto-folded); or OV2_EXTRA_PYLIBS=/abs/path; or pip install emerging-optimizers; or force AdamW (midtrain: unset OV2_MIDTRAIN_MUON; stage2: OV2_STAGE2_ADAMW=1)." >&2

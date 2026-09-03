@@ -100,9 +100,11 @@ _first_ds="$(grep -m1 'path:' "$_PD_YAML" | awk '{print $2}')"
 [[ -d "$_first_ds" ]] || _die "seed85m shard dir not mounted: $_first_ds"
 
 # ── production config (see header) ───────────────────────────────────────────
-# TP=2 -> DP=16. MEASURED throughput at iteration 2-4 (GBS 256, seq 10192, Muon):
+# TP=2 -> DP=16. MEASURED like-for-like at iteration 2-4 (GBS 256, seq 10192, Muon, FULL recompute):
 #     TP=2  108-120 s/iter   567-687 tokens/s/GPU   live 26.7G / peak-live 44.3G / reserved 56G
 #     TP=1  176 s/iter       378 tokens/s/GPU       live 51.8G / peak-live 82.1G / reserved 99-102G
+# Current production lane (TP=2, selective recompute, tower not recomputed): 63-77 s/iter,
+#     874-1082 tokens/s/GPU, live 30.7G / peak-live 92.7G / reserved 125-142G.
 # TP=1 is 1.6x SLOWER despite giving each rank half as many microbatches: it doubles model-state and
 # activation memory (no sequence parallel), and its ~100G reserved sits right on the allocator's
 # collection threshold, so cudaFree/cudaMalloc churn eats the win. TP=4 is unnecessary — the earlier
@@ -135,7 +137,9 @@ export OV2_MEM_PROBE="${OV2_MEM_PROBE:-8}"                       # allocated-vs-
 # prints patches_per_token, which is the number that decides whether this line is genuinely slower
 # than the 30B reference or merely processing far more patches per LLM token.
 export OV2_PHASE_TIMER="${OV2_PHASE_TIMER:-8}"
-export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"    # EP straggler counter-measure
+# Length-aligned batching, the EP-straggler counter-measure. NB the default key (tokens) barely varies on
+# fixed-length seed85m packs; OV2_LENGTH_SORT_KEY=patches is the pending A/B (smoke ab-sortkey).
+export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"
 export RECIPE="ov2_qwen35_35b_a3b_midtrain"
 export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_qwen35_s15_seed85m_muon}"
 export INIT_CKPT
