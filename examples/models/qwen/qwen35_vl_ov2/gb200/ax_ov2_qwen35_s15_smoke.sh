@@ -22,10 +22,12 @@
 # DISABLE_RECOMPUTE=1 speed lever is affordable).
 #
 # Topology (NPROC=4/pod; EP=8 fixed in the recipe): 32 GPU = 8 pods
-# (Workers=7): TP=2 -> DP=16. TP=2 is a MEASURED choice: TP=1 ran 1.6x slower
-# (176 vs 108-120 s/iter like-for-like). The early "Muon does not fit at TP=1,
-# 188 GB peak" reading was the allocator fragmentation bug, since fixed.
-# GBS=256 = the 30B same-stage production value (256 % 16 == 0).
+# (Workers=7): TP=2 -> DP=16. TP=2 is the INCUMBENT, not a measured winner: the
+# only TP=1 sample is one iteration-2 reading (176 s, run killed) against TP=2
+# iterations 2-4 (108-120 s) — none of it steady state, and TP=1's iteration 1
+# was FASTER (374 vs 469 s). Structurally TP=1 does half the replicated tower
+# work and half the a2a count per GPU; its cost is memory (2x per-rank state).
+# The ab-tp1 arms below settle it. GBS=256 = the 30B same-stage production value.
 #
 # Workload form: Distributed/PyTorch, image feilong-nemo, gb200-nvl72-nodes,
 # Command bash (both sides), Args = this file's absolute path (both sides),
@@ -110,14 +112,19 @@ _first_ds="$(grep -m1 'path:' "$_SM_YAML" | awk '{print $2}')"
 [[ -d "$_first_ds" ]] || _die "seed85m shard dir not mounted: $_first_ds (from $_SM_YAML)"
 
 # ── scale + knobs (see header) ────────────────────────────────────────────────
-# TP=2 -> DP=16 (32 GPU). Measured: TP=1 is 1.6x SLOWER (176 vs 108-120 s/iter like-for-like) —
-# it doubles model-state/activation memory without SP and parks reserved on the GC threshold. (The
-# earlier "TP=1 OOMs at 188 GB" was allocator fragmentation, not a fit limit.) GBS 256 % DP16 == 0.
+# TP=2 -> DP=16 (32 GPU). TP=1 vs TP=2 steady-state throughput is UNMEASURED (one iteration-2 sample
+# each way; see the ab-tp1 arms). TP=1 doubles per-rank model state (measured allocated 51.8 vs 26.7 GiB)
+# and runs SP off / ETP=1. The "GC-threshold churn" explanation once written here was wrong: the
+# threshold is inert without OV2_CUDA_MEM_FRACTION and 99-102 GiB was below it anyway. 256 % 16 == 0.
 export TP="${TP:-2}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-${GBS:-256}}"   # 30B same-stage production GBS
-# 30 iterations: iteration 1 is JIT/autotune (~470 s measured) and the raw per-iteration time is
-# steady from ~iteration 5, so the verdict drops the first 5 and reports p50/p90 over the other 25.
+# 30 iterations by default: iteration 1 is JIT/autotune (~470 s measured) and per-iteration time keeps
+# easing for a few tens of iterations (TB on the production lane: ~100 s at iter 2 -> ~65 s by iter
+# 30-50), so the verdict drops the first OV2_SMOKE_WARM (default 10) and reports p50/p90 over the rest,
+# plus a last-20 p50. For a decision between arms that may differ by <10% (e.g. TP=1 vs TP=2) give BOTH
+# arms OV2_MIDTRAIN_N_SAMPLES=15360 (60 iters) and read the last-20 p50.
 export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( OV2_MIDTRAIN_GBS * 30 ))}"  # -> 30 iters
+export OV2_SMOKE_WARM="${OV2_SMOKE_WARM:-10}"
 # SAVE_EVERY=0 disables BOTH interval saves and the end-of-run save (train.py skips the final save
 # when save_interval == 0, and the interval check is truthiness-guarded, so no modulo-by-zero).
 # A 35B+Muon save is hundreds of GB and several minutes; a throughput smoke has no use for one.
@@ -134,7 +141,14 @@ export OV2_MEM_PROBE="${OV2_MEM_PROBE:-8}"
 export OV2_PHASE_TIMER="${OV2_PHASE_TIMER:-8}"
 # A/B usage: submit ONE knob per job, everything else default, job name = the knob. Candidates:
 #   OV2_LENGTH_SORT_KEY=patches | OV2_FEAT_CHECK_EVERY=8 | OV2_RECOMPUTE_MOE=0 |
-#   OV2_MOE_PERMUTE_FUSION=1 | ACCEL=2 | OV2_MIDTRAIN_GBS=64 (diagnostic only)
+#   OV2_MOE_PERMUTE_FUSION=1 | ACCEL=2 | OV2_CE_FUSION=true | OV2_MIDTRAIN_GBS=64 (diagnostic only)
+# TP arms — run as PAIRS, 60 iters each, fresh job names:
+#   ab-tp1-full : TP=1 OV2_RECOMPUTE_FULL=1 OV2_VISION_RECOMPUTE=1 OV2_MIDTRAIN_N_SAMPLES=15360
+#   ab-tp2-full : TP=2 OV2_RECOMPUTE_FULL=1 OV2_VISION_RECOMPUTE=1 OV2_MIDTRAIN_N_SAMPLES=15360
+#   (both known to fit: the lane the withdrawn "1.6x" claim was made on, this time to steady state) then
+#   ab-tp1-sel  : TP=1 OV2_VISION_RECOMPUTE=1 OV2_MIDTRAIN_N_SAMPLES=15360   (selective; MARGINAL fit,
+#                 predicted reserved 137-177 GiB — abort if max_reserved > 150)
+#   ab-base-vis : TP=2 OV2_VISION_RECOMPUTE=1 OV2_MIDTRAIN_N_SAMPLES=15360
 # The verdict file prints the knob set alongside p50 iter time / tokens/s / memory / phase split,
 # so two verdict files ARE the A/B table.
 export RECIPE="ov2_qwen35_35b_a3b_midtrain"
@@ -189,7 +203,7 @@ import sys
 log, result, rc, peak, tp, gbs, muon, sortw, knobs = sys.argv[1:10]
 text = open(log, errors="replace").read()
 sort_on = "length-sorted batching ON" in text
-WARM = 5  # iteration 1 is JIT/autotune; raw iter time is steady from ~5
+WARM = int(os.environ.get("OV2_SMOKE_WARM", "10") or 10)  # iteration time keeps easing for tens of iters
 its = [float(x) for x in re.findall(r"elapsed time per iteration \(ms\): ([\d.]+)", text)][WARM:]
 tps = [float(x) for x in re.findall(r"tokens/s/GPU: ([\d.]+)", text)][WARM:]
 tf = [float(x) for x in re.findall(r"TFLOP/s/GPU\)?: ([\d.]+)", text)][WARM:]
@@ -207,6 +221,8 @@ if its:
     s = sorted(its)
     q = lambda p: s[min(len(s) - 1, int(p * len(s)))]
     lines.append(f"iters (after dropping first {WARM}): n={len(its)} p50={q(0.5):.0f}ms p90={q(0.9):.0f}ms max={s[-1]:.0f}ms")
+    if len(its) >= 20:
+        lines.append(f"iters last-20 p50={st.median(its[-20:]):.0f}ms  (use this for close A/B calls)")
 if tps:
     lines.append(f"tokens/s/GPU: p50={st.median(tps):.0f}  (baseline 2026-09-02 prod defaults ~1000; full-recompute ~620)")
 if tf:

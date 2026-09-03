@@ -692,6 +692,22 @@ class LlavaOnevision2(MegatronModule):
     ) -> torch.Tensor:
         import os as _probe_os
 
+        # OV2_CUDA_MEM_FRACTION=<0<f<=1>: cap torch's CUDA pool at f x device memory (once per process,
+        # on the first forward, when the device is already set). This is what makes
+        # PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:X actually do anything — PyTorch's
+        # allocator consults the threshold only after set_per_process_memory_fraction() has been called
+        # (CUDACachingAllocator gates garbage_collect_cached_blocks() on set_fraction), and nothing
+        # else in this stack calls it. Without this, the threshold in the launchers is inert; the
+        # measured reserved drop (151 -> 56 GiB) came entirely from removing max_split_size_mb. With it,
+        # torch also retries/frees before NCCL's out-of-pool buffers run dry. Default unset = no-op.
+        if not getattr(self, "_ov2_mem_fraction_done", False):
+            self._ov2_mem_fraction_done = True
+            _mf = _probe_os.environ.get("OV2_CUDA_MEM_FRACTION")
+            if _mf and torch.cuda.is_available():
+                _mfv = float(_mf)
+                assert 0.0 < _mfv <= 1.0, f"OV2_CUDA_MEM_FRACTION must be in (0,1], got {_mf}"
+                torch.cuda.set_per_process_memory_fraction(_mfv, torch.cuda.current_device())
+                logger.info("[ov2] torch CUDA pool capped at %.2f of device memory (GC threshold now armed)", _mfv)
         if _probe_os.environ.get("OV2_LAYER_NAN_PROBE") == "1":
             _install_layer_nan_probe(self.language_model)
         if _probe_os.environ.get("OV2_GDN_KERNEL_DUMP"):

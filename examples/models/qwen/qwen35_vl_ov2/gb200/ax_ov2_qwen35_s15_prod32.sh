@@ -33,10 +33,11 @@
 # (both sides), env OV2_K8S_NAMESPACE=runai-mv0004 (both sides).
 #   32 GPU: Workers=7  (8 pods)  -> TP2/DP16, 16 microbatches/rank
 #   64 GPU: Workers=15 (16 pods) -> TP2/DP32,  8 microbatches/rank   <- just change Workers
-# KEEP TP=2 when scaling out. Per-GPU compute is total/WORLD either way, but TP4 would halve DP and
-# thus DOUBLE both the sequential step count and the EP all-to-all count (40 MoE layers x
-# microbatches), and this config is overhead/comm-bound, not FLOP-bound. TP8 additionally splits a TP
-# group across pods (4 GPU/pod) so TP traffic leaves the node. Extra GPUs belong in DP, not TP.
+# KEEP TP=2 when scaling out (vs TP4/TP8). Per-GPU LLM compute is total/WORLD either way, but the vision
+# tower and adapter are REPLICATED per rank (built TP=1), so tower work per GPU scales with microbatches
+# per rank = GBS/DP: higher TP means MORE tower work per GPU, plus doubled step and EP a2a counts. TP8
+# additionally splits a TP group across pods (4 GPU/pod). Extra GPUs belong in DP, not TP. Whether TP=1
+# beats TP=2 at steady state is UNMEASURED (smoke arms ab-tp1-*); TP=2 is the incumbent.
 # 64 GPU = the ENTIRE project quota: stop the export workspace and any eval first, or the gang never
 # assembles (that mistake cost 13 h of idle GPUs on 2026-09-01).
 # Optional overrides: SAVE, INIT_CKPT, OV2_MIDTRAIN_N_SAMPLES, TP, OV2_MIDTRAIN_MUON,
@@ -100,14 +101,16 @@ _first_ds="$(grep -m1 'path:' "$_PD_YAML" | awk '{print $2}')"
 [[ -d "$_first_ds" ]] || _die "seed85m shard dir not mounted: $_first_ds"
 
 # ── production config (see header) ───────────────────────────────────────────
-# TP=2 -> DP=16. MEASURED like-for-like at iteration 2-4 (GBS 256, seq 10192, Muon, FULL recompute):
-#     TP=2  108-120 s/iter   567-687 tokens/s/GPU   live 26.7G / peak-live 44.3G / reserved 56G
-#     TP=1  176 s/iter       378 tokens/s/GPU       live 51.8G / peak-live 82.1G / reserved 99-102G
+# TP=2 -> DP=16. Early-iteration readings (GBS 256, seq 10192, Muon, FULL recompute) — NOT steady state
+# (iteration time keeps falling until ~iter 30-50; TP=1 was killed after iteration 2):
+#     TP=2  iter 2-4: 108-120 s/iter   live 26.7G / peak-live 44.3G / reserved 56G
+#     TP=1  iter 1: 374 s (vs TP=2 469), iter 2: 176 s   live 51.8G / peak-live 82.1G / reserved 99-102G
 # Current production lane (TP=2, selective recompute, tower not recomputed): 63-77 s/iter,
 #     874-1082 tokens/s/GPU, live 30.7G / peak-live 92.7G / reserved 125-142G.
-# TP=1 is 1.6x SLOWER despite giving each rank half as many microbatches: it doubles model-state and
-# activation memory (no sequence parallel), and its ~100G reserved sits right on the allocator's
-# collection threshold, so cudaFree/cudaMalloc churn eats the win. TP=4 is unnecessary — the earlier
+# The former "TP=1 is 1.6x slower ... GC-threshold churn" reading of those numbers is WITHDRAWN: one
+# iteration-2 sample is not a throughput measurement, the GC threshold was inert (never armed) and
+# 99-102 GiB sat below it anyway. TP=1 doubles per-rank model state and runs ETP=1/SP off; TP=2 runs
+# ETP=2 (experts tensor-sharded). Settle it with the ab-tp1 smoke pairs. TP=4 is unnecessary — the earlier
 # "TP=2 does not fit" conclusion came from the allocator fragmentation bug (see the base launcher's
 # PYTORCH_CUDA_ALLOC_CONF note), not from real memory pressure: live peaks at 44 GB of 189.5.
 export TP="${TP:-2}"
@@ -128,8 +131,9 @@ export ACCEL="${ACCEL:-0}"                                       # HybridEP/MXFP
 export OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
 export OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
 export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-0}"
-# Keeping recompute off raises peak-live from 44 GB to roughly 90 GB, so the collection threshold has
-# to sit above that: 0.6 would trigger at ~111 GB and reintroduce the churn measured on the TP=1 run.
+# garbage_collection_threshold is INERT unless OV2_CUDA_MEM_FRACTION arms it (see the base launcher's
+# allocator note); 0.8 is kept for parity. If armed, 0.8 x device = ~151 GiB is above the measured
+# 92.7 GiB peak-live of this lane.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.8}"
 export OV2_MEM_PROBE="${OV2_MEM_PROBE:-8}"                       # allocated-vs-reserved telemetry (one line / 8 forwards)
 # Throughput telemetry, on by default because it is the one measurement that separates "the vision

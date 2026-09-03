@@ -481,12 +481,16 @@ class LlavaOnevision2MoEProvider(LlavaOnevision2Provider):
         # stores experts PER-EXPERT (SequentialMLP keys), so load_ov2_mcore_checkpoint remaps
         # per-expert -> grouped at load time. We deliberately KEEP grouped GEMM here (no SequentialMLP
         # override) since build_llava_ov2 rebuilds the LLM from HF and would ignore the field anyway.
-        # expert_tensor_parallel_size > 1 is UNVALIDATED for OV2 (the verified MoE config is EP=8 /
-        # ETP=1 on one 8-GPU node). Warn loudly rather than fail, so it stays usable for experiments.
-        if (getattr(self, "expert_tensor_parallel_size", 1) or 1) > 1:
-            logger.warning(
-                "[ov2 MoE] expert_tensor_parallel_size=%s is UNVALIDATED for OV2; only EP=8/ETP=1 has "
-                "been smoke-tested. Verify gradients/outputs before trusting such runs.",
-                self.expert_tensor_parallel_size,
-            )
         super().finalize()
+        # expert_tensor_parallel_size: from_llm copies mcore's default None from the base provider (the
+        # class default above never survives construction), and mcore's deferred __post_init__ — run by
+        # super().finalize() just now — resolves None -> tensor_model_parallel_size. So ETP FOLLOWS TP:
+        # TP=1 -> ETP=1, TP=2 -> ETP=2 (experts tensor-sharded; the dispatcher adds an expt-TP
+        # all-gather/reduce-scatter around each a2a). The former "ETP>1 is UNVALIDATED" warning here was
+        # evaluated BEFORE finalize, saw None, and could never fire; meanwhile production s1.5 has run
+        # 800+ iterations at TP=2/ETP=2. Log the resolved value so the config dump is honest.
+        logger.info(
+            "[ov2 MoE] resolved expert_tensor_parallel_size=%s (follows tensor_model_parallel_size=%s; "
+            "TP=2/ETP=2 is the s1.5 production lane)",
+            getattr(self, "expert_tensor_parallel_size", None), getattr(self, "tensor_model_parallel_size", None),
+        )

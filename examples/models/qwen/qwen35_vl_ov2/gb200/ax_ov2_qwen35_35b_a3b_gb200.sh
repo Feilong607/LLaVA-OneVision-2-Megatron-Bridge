@@ -25,8 +25,8 @@ if [ -z "${OV2_WARMUP_ITERS:-}" ] && [ "$WARMUP_ITERS" -lt 1 ]; then WARMUP_ITER
 LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
 
 NPROC="${NPROC:-4}"   # GB200 = 4 GPU/node
-TP="${TP:-1}"         # 1 = the 2-node/8-GPU bring-up MINIMUM (DP must reach EP=8), not a preference:
-                      # at 32 GPU TP=2 measured 1.6x FASTER than TP=1; the production wrapper sets 2.
+TP="${TP:-1}"         # 1 = the 2-node/8-GPU bring-up MINIMUM (DP must reach EP=8). The production wrapper
+                      # sets 2; TP=1 vs TP=2 steady-state throughput is UNMEASURED (smoke ab-tp1 pending).
 if [[ "$TP" -gt 1 ]]; then SP=true; else SP=false; fi
 # seed85m packed length. NB: packed with the Qwen2.5-VL tokenizer -> under 3.5 (248056) some packs
 # exceed seq_length and get SkipSample'd; check the dropped-pack rate before a long run.
@@ -154,11 +154,13 @@ export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"  # energon defa
 # per-pod peak of 188.4 of 189.5 GB (99.4% of the card), byte-identical at TP=1/2/4, with Muon and
 # AdamW, and with vision recompute on and off, dying as `NCCL WARN Cuda failure 2 'out of memory'`
 # (NCCL buffers are cudaMalloc'd OUTSIDE the torch pool; one crash failed on a 136-byte calloc).
-# So: drop max_split_size_mb (restore normal splitting) and keep a garbage-collection threshold. The
-# BASE default 0.6 (collect from ~111 GB) suits the full-recompute lane above (peak-live ~44 G). The
-# production wrapper runs selective recompute at peak-live 92.7 G and therefore sets 0.8 — 0.6 there
-# would sit on the working set and churn (measured on the TP=1 run). ~37 GB of the card is non-torch
-# (CUDA context, NCCL buffers, cuBLAS/TE workspaces), so torch must never approach the full card.
+# So: drop max_split_size_mb (restore normal splitting). That alone took reserved from 113-151 to 56 GiB.
+# garbage_collection_threshold is kept for parity but is INERT in this stack: PyTorch's allocator only
+# consults it after torch.cuda.set_per_process_memory_fraction() has been called (garbage_collect_
+# cached_blocks() is gated on set_fraction), and nothing here calls it. To arm it set
+# OV2_CUDA_MEM_FRACTION (e.g. 0.8 -> ~151 GiB cap; wired in llava_ov2.forward), which also makes torch
+# free/retry before NCCL's out-of-pool buffers run dry. ~37 GB of the card is non-torch (CUDA context,
+# NCCL buffers, cuBLAS/TE workspaces), so torch must never approach the full card either way.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.6}"
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}" NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
 [[ -n "${NCCL_IB_HCA:-}" ]] && export NCCL_IB_HCA NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
