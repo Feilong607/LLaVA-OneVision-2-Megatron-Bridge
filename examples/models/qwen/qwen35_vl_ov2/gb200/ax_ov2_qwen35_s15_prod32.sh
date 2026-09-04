@@ -135,6 +135,12 @@ export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-0}"
 # allocator note); 0.8 is kept for parity. If armed, 0.8 x device = ~151 GiB is above the measured
 # 92.7 GiB peak-live of this lane.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.8}"
+# Cap torch's CUDA pool so the threshold above is actually consulted and NCCL keeps its ~37 GB out-of-pool
+# headroom. MEASURED need (2026-09-04, smoke ab-sortkey-a6, 30 iters, this lane): max_allocated 92.7 G but
+# max_reserved 165.7 G and a per-pod nvidia-smi peak of 187.5 of 189.5 GB — reserved creeps with the bin
+# sequence (production read 125-142 G at iteration 33), so an unbounded pool will eventually hand NCCL an
+# OOM. 0.8 x 189.5 = ~151 G; live peaks at ~93 G, so the cap costs nothing until fragmentation would have.
+export OV2_CUDA_MEM_FRACTION="${OV2_CUDA_MEM_FRACTION:-0.8}"
 export OV2_MEM_PROBE="${OV2_MEM_PROBE:-8}"                       # allocated-vs-reserved telemetry (one line / 8 forwards)
 # Throughput telemetry, on by default because it is the one measurement that separates "the vision
 # tower dominates" from "the LLM dominates", and it costs one cuda-event pair per 8 forwards. It also

@@ -137,6 +137,7 @@ export OV2_RECOMPUTE_FULL="${OV2_RECOMPUTE_FULL:-0}"
 export OV2_RECOMPUTE_MOE="${OV2_RECOMPUTE_MOE:-1}"
 export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.8}"
+export OV2_CUDA_MEM_FRACTION="${OV2_CUDA_MEM_FRACTION:-0.8}"   # arms the threshold; tracks prod (see prod32 note)
 export OV2_MEM_PROBE="${OV2_MEM_PROBE:-8}"
 export OV2_PHASE_TIMER="${OV2_PHASE_TIMER:-8}"
 # A/B usage: submit ONE knob per job, everything else default, job name = the knob. Candidates:
