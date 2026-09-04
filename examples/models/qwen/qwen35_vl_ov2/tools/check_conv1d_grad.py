@@ -61,10 +61,30 @@ def rel(a, b):
 
 
 def main():
-    import fla
+    # `import fla` runs fla/__init__.py, which imports fla.models -> transformers.AutoModel -> accelerate,
+    # and in this image that trips accelerate's circular import (the same noise the smoke's fla
+    # self-report hits). We only need the kernels: register a bare namespace package for `fla` at its
+    # real path so submodule imports work WITHOUT executing fla/__init__.py.
+    import importlib.util, sys, types
+    try:
+        import fla  # noqa: F401  (works when transformers/accelerate import order is benign)
+        fla_file = fla.__file__
+    except Exception as e:  # ImportError from the accelerate cycle
+        spec = importlib.util.find_spec("fla")
+        if spec is None or not spec.submodule_search_locations:
+            raise SystemExit(f"fla not installed: {e}")
+        pkg = types.ModuleType("fla"); pkg.__path__ = list(spec.submodule_search_locations)
+        pkg.__file__ = spec.origin; sys.modules["fla"] = pkg
+        fla_file = spec.origin
+        print(f"NOTE: `import fla` failed ({type(e).__name__}: {str(e)[:80]}...); loading kernels via namespace stub")
     from fla.modules.convolution import causal_conv1d
-
-    print(f"fla version={getattr(fla, '__version__', '?')} file={fla.__file__}")
+    ver = "?"
+    try:
+        from importlib.metadata import version as _v
+        ver = _v("flash-linear-attention")
+    except Exception:
+        pass
+    print(f"fla version={ver} file={fla_file}")
     torch.manual_seed(0)
     dev = "cuda"
     T, D, EXTRA, W, HD = 10192, 8192, 2048 + 16 + 16, 4, 128   # qkv width, gate+beta+alpha tail, conv width
