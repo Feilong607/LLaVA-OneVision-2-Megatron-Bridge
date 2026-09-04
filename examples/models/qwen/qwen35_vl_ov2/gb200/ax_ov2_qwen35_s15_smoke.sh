@@ -238,7 +238,7 @@ if tf:
     lines.append(f"tflops/gpu (reported; omits the vision tower): p50={st.median(tf):.1f}")
 if mem:
     lines.append(f"torch memory: max_allocated={max(a for a, _ in mem):.1f}G max_reserved={max(r for _, r in mem):.1f}G "
-                 f"(card 189.5G, ~37G non-torch; reserved >150G = OOM territory)")
+                 f"(card 184.0GiB, ~14G non-torch; OV2_CUDA_MEM_FRACTION 0.8 caps reserved at 147.2G)")
 if ph:
     lines.append(f"phase split: prefix(vision+adapter) share p50={st.median(sh for sh, _ in ph):.0f}% "
                  f"patches_per_llm_token p50={st.median(p for _, p in ph):.1f}")

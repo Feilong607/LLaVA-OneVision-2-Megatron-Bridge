@@ -163,8 +163,9 @@ export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"  # energon defa
 # garbage_collection_threshold is kept for parity but is INERT in this stack: PyTorch's allocator only
 # consults it after torch.cuda.set_per_process_memory_fraction() has been called (garbage_collect_
 # cached_blocks() is gated on set_fraction), and nothing here calls it. To arm it set
-# OV2_CUDA_MEM_FRACTION (e.g. 0.8 -> ~151 GiB cap; wired in llava_ov2.forward), which also makes torch
-# free/retry before NCCL's out-of-pool buffers run dry. ~37 GB of the card is non-torch (CUDA context,
+# OV2_CUDA_MEM_FRACTION (e.g. 0.8 -> 147.2 GiB cap on the 184.00 GiB device; wired in llava_ov2.forward), which also makes torch
+# free/retry before NCCL's out-of-pool buffers run dry. ~14 GiB of the card is non-torch (13.8 GiB measured
+# in-process 2026-09-04; the older ~37 GB figure compared a per-pod nvidia-smi peak with one rank's reserved) (CUDA context,
 # NCCL buffers, cuBLAS/TE workspaces), so torch must never approach the full card either way.
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-garbage_collection_threshold:0.6}"
 export NCCL_GRAPH_REGISTER="${NCCL_GRAPH_REGISTER:-0}" NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-1}"
