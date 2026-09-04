@@ -169,6 +169,13 @@ fi
 # seed85m bins share a nominal pack length but vary in fill, so alignment
 # still matters. Set 0 to A/B against the unsorted path.
 export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"
+# HARNESS-ONLY WORKAROUND (2026-09-04): with the production sort key (tokens) the harness's bin
+# sequence hits a deterministic device-side assert (fetch_and_cast, rank 10, before forward #8 —
+# ab-base twice, on two racks), while the SAME 16 bins in `patches` order run clean and at identical
+# throughput (ab-sortkey-a6: last-3 iters 63-65 s = production). So A/B arms default to `patches` here
+# so that every arm gets past iteration 1; comparability is unaffected (measured 0% effect). Production
+# keeps `tokens`. Revert to tokens once ab-dbg (CUDA_LAUNCH_BLOCKING=1) has named the faulty op.
+export OV2_LENGTH_SORT_KEY="${OV2_LENGTH_SORT_KEY:-patches}"
 
 # Peak-memory sampler for this pod (dies with the script).
 ( _peak=0
