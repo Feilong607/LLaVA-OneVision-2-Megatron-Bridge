@@ -185,7 +185,7 @@ export OV2_LENGTH_SORT_KEY="${OV2_LENGTH_SORT_KEY:-patches}"
   done ) &
 _mon=$!
 
-_knobs="tp=$TP gbs=$OV2_MIDTRAIN_GBS accel=$ACCEL recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE alloc=$PYTORCH_CUDA_ALLOC_CONF sort_window=$OV2_LENGTH_SORT_WINDOW sort_key=${OV2_LENGTH_SORT_KEY:-tokens} feat_check_every=${OV2_FEAT_CHECK_EVERY:-1} permute_fusion=${OV2_MOE_PERMUTE_FUSION:-0} muon=$OV2_MIDTRAIN_MUON"
+_knobs="tp=$TP gbs=$OV2_MIDTRAIN_GBS accel=$ACCEL recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE alloc=$PYTORCH_CUDA_ALLOC_CONF sort_window=${OV2_LENGTH_SORT_WINDOW:-auto(GBS/DP)} sort_key=${OV2_LENGTH_SORT_KEY:-tokens} feat_check_every=${OV2_FEAT_CHECK_EVERY:-1} permute_fusion=${OV2_MOE_PERMUTE_FUSION:-0} muon=$OV2_MIDTRAIN_MUON"
 echo "[qwen35-s15-smoke] launch: $_knobs n_samples=$OV2_MIDTRAIN_N_SAMPLES init=$INIT_CKPT" | tee -a "$LOG"
 # Which fla will the run execute? Print version+path into the persisted log — the NaN case turned
 # on exactly this question (image fla 0.4.2 vs the qwen35-fla image's isolated /opt/ov2-fla), and
@@ -202,7 +202,7 @@ echo "[qwen35-s15-smoke] rc=$_rc pod_peak_mem_mib=$_peak" | tee -a "$LOG"
 
 # ── verdict: written by the pod whose log carries iteration lines ────────────
 python3 - "$LOG" "$RESULT" "$_rc" "$_peak" "$TP" "$OV2_MIDTRAIN_GBS" \
-          "$OV2_MIDTRAIN_MUON" "$OV2_LENGTH_SORT_WINDOW" "$_knobs" <<'PYEOF'
+          "$OV2_MIDTRAIN_MUON" "${OV2_LENGTH_SORT_WINDOW:-auto}" "$_knobs" <<'PYEOF'
 import os
 import re
 import statistics as st

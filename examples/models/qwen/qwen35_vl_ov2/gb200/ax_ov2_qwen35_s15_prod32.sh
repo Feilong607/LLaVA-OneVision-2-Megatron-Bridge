@@ -175,7 +175,7 @@ mkdir -p "$SAVE"
     [[ "$_m" =~ ^[0-9]+$ ]] && (( _m > _peak )) && { _peak=$_m; echo "$_peak" >"$LOG.peak"; }
   done ) &
 
-echo "[qwen35-s15-prod] tp=$TP gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES muon=$OV2_MIDTRAIN_MUON sort_window=$OV2_LENGTH_SORT_WINDOW accel=$ACCEL save_every=$SAVE_EVERY recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE alloc=$PYTORCH_CUDA_ALLOC_CONF mem_probe=$OV2_MEM_PROBE init=$INIT_CKPT save=$SAVE" | tee -a "$LOG"
+echo "[qwen35-s15-prod] tp=$TP gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES muon=$OV2_MIDTRAIN_MUON sort_window=${OV2_LENGTH_SORT_WINDOW:-auto(GBS/DP)} accel=$ACCEL save_every=$SAVE_EVERY recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE alloc=$PYTORCH_CUDA_ALLOC_CONF mem_probe=$OV2_MEM_PROBE init=$INIT_CKPT save=$SAVE" | tee -a "$LOG"
 python3 -c "import fla; print('[qwen35-s15-prod] fla', getattr(fla,'__version__','?'), fla.__file__)" 2>&1 | tee -a "$LOG" || true
 echo "[qwen35-s15-prod] watch: grep -E 'iteration +[0-9]+/' \$HOME/train_logs/prod_qwen35_s15_*worker-6*.log | tail -5   (iteration lines print on the LAST rank's pod)" | tee -a "$LOG"
 
