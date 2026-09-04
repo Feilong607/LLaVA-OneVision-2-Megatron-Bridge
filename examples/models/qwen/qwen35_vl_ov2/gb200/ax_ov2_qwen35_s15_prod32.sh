@@ -40,6 +40,17 @@
 # beats TP=2 at steady state is UNMEASURED (smoke arms ab-tp1-*); TP=2 is the incumbent.
 # 64 GPU = the ENTIRE project quota: stop the export workspace and any eval first, or the gang never
 # assembles (that mistake cost 13 h of idle GPUs on 2026-09-01).
+# 64 GPU must sit in ONE NVL72 rack (use the rack node-affinity). MEASURED 2026-09-05 01:20, 16 pods split
+# 11+5 across racks a6+a7 (TP1, selective recompute, HybridEP): 55-59 s/iter with spikes to 86-118 s,
+# 577-630 tokens/s/GPU, vs 47.6 s/iter and 1386 tokens/s/GPU for the SAME config on 32 GPUs in one rack.
+# 64x600 < 32x1386: the cross-rack job moves fewer tokens than half the GPUs. Per-microbatch compute
+# (PHASETIMER llm 773 ms + prefix 230-450 ms) accounts for ~15-18 s of the 57 s; the rest is DP
+# all-reduce (Muon = non-distributed optimizer = full all-reduce), Muon all-gathers and the one EP group
+# (two adjacent pods) that straddles the racks, all over inter-rack IB instead of NVLink. If a rack has
+# fewer than 16 free nodes, run 32 GPUs (Workers=7) in one rack with SAVE_EVERY=500 and move up later.
+# Reusing a SAVE dir across a TP/DP change is a trap: checkpoint.load == SAVE auto-resumes and the
+# TP2/DP16 Muon + dataloader state crashes TP1/DP64 on its first step, then PyTorchJob restart-loops
+# (2026-09-05 00:xx, four failed launches in a row). New TP/DP => new SAVE.
 # Optional overrides: SAVE, INIT_CKPT, OV2_MIDTRAIN_N_SAMPLES, TP, OV2_MIDTRAIN_MUON,
 # OV2_LENGTH_SORT_WINDOW, SAVE_EVERY, OV2_KEEP_CKPTS.
 # =============================================================================
