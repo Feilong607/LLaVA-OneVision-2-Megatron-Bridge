@@ -168,7 +168,7 @@ fi
 # counter-measure to the measured EP per-layer straggler on the 30B line. The
 # seed85m bins share a nominal pack length but vary in fill, so alignment
 # still matters. Set 0 to A/B against the unsorted path.
-export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"
+# OV2_LENGTH_SORT_WINDOW: derived in the base launcher as GBS/DP (one iteration per rank). Override to A/B.
 # HARNESS-ONLY WORKAROUND (2026-09-04): with the production sort key (tokens) the harness's bin
 # sequence hits a deterministic device-side assert (fetch_and_cast, rank 10, before forward #8 —
 # ab-base twice, on two racks), while the SAME 16 bins in `patches` order run clean and at identical
@@ -229,6 +229,7 @@ if its:
     s = sorted(its)
     q = lambda p: s[min(len(s) - 1, int(p * len(s)))]
     lines.append(f"iters (after dropping first {WARM}): n={len(its)} p50={q(0.5):.0f}ms p90={q(0.9):.0f}ms max={s[-1]:.0f}ms")
+    lines.append(f"iters mean={st.mean(its):.0f}ms  (read the MEAN when iteration times alternate light/heavy)")
     if len(its) >= 20:
         lines.append(f"iters last-20 p50={st.median(its[-20:]):.0f}ms  (use this for close A/B calls)")
 if tps:

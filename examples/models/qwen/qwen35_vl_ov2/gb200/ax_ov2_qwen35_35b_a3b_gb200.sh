@@ -123,6 +123,11 @@ DP=$(( WORLD / TP ))
 (( MIDTRAIN_GBS % DP == 0 )) || { echo "[ov2-qwen35] FATAL: DP=$DP does not divide GBS=$MIDTRAIN_GBS; adjust TP/NNODES or OV2_MIDTRAIN_GBS." >&2; exit 1; }
 # EP=8 fixed in the recipe.
 (( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-qwen35] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (bring-up: 2 nodes x 4 GPU at TP=1 -> DP=8; production: 32 GPU at TP=2 -> DP=16)." >&2; exit 1; }
+# Length-aligned batching window = ONE iteration's worth of bins per rank (GBS/DP), so the sorter aligns
+# per-microbatch cost across ranks WITHOUT manufacturing alternating light/heavy iterations. Measured
+# 2026-09-04 (ab-tp1-hep: TP=1 -> 8 mb/rank under the old fixed window 16 = two iterations): iteration
+# times alternated 33 s / 64-90 s. Wrappers no longer hardcode 16; 0 disables sorting (recipe default).
+export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-$(( MIDTRAIN_GBS / DP ))}"
 
 # --- env ---
 # Offline packages not pip-installed in the image (e.g. emerging_optimizers for distributed Muon):

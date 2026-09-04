@@ -147,9 +147,9 @@ export OV2_MEM_PROBE="${OV2_MEM_PROBE:-8}"                       # allocated-vs-
 # prints patches_per_token, which is the number that decides whether this line is genuinely slower
 # than the 30B reference or merely processing far more patches per LLM token.
 export OV2_PHASE_TIMER="${OV2_PHASE_TIMER:-8}"
-# Length-aligned batching, the EP-straggler counter-measure. NB the default key (tokens) barely varies on
-# fixed-length seed85m packs; OV2_LENGTH_SORT_KEY=patches is the pending A/B (smoke ab-sortkey).
-export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"
+# Length-aligned batching window: derived in the base launcher as GBS/DP (= one iteration per rank; 16 at
+# TP=2, 8 at TP=1). A fixed 16 at TP=1 spanned two iterations and made them alternate light/heavy
+# (ab-tp1-hep, 2026-09-04). OV2_LENGTH_SORT_KEY=patches measured 0% vs tokens (ab-sortkey-a6).
 export RECIPE="ov2_qwen35_35b_a3b_midtrain"
 export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_qwen35_s15_seed85m_muon}"
 export INIT_CKPT
