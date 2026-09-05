@@ -118,13 +118,14 @@ _first_ds="$(grep -m1 'path:' "$_SM_YAML" | awk '{print $2}')"
 # threshold is inert without OV2_CUDA_MEM_FRACTION and 99-102 GiB was below it anyway. 256 % 16 == 0.
 export TP="${TP:-2}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-${GBS:-256}}"   # 30B same-stage production GBS
-# 30 iterations by default: iteration 1 is JIT/autotune (~470 s measured) and per-iteration time keeps
-# easing for a few tens of iterations (TB on the production lane: ~100 s at iter 2 -> ~65 s by iter
-# 30-50), so the verdict drops the first OV2_SMOKE_WARM (default 10) and reports p50/p90 over the rest,
-# plus a last-20 p50. For a decision between arms that may differ by <10% (e.g. TP=1 vs TP=2) give BOTH
-# arms OV2_MIDTRAIN_N_SAMPLES=15360 (60 iters) and read the last-20 p50.
-export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( OV2_MIDTRAIN_GBS * 30 ))}"  # -> 30 iters
-export OV2_SMOKE_WARM="${OV2_SMOKE_WARM:-10}"
+# 100 iterations by default, first 60 dropped. MEASURED on the 32-GPU production run (TP1, selective
+# recompute, one rack, 2026-09-05): iterations 1-60 averaged ~49 s, iterations 61-162 averaged 30.4 s.
+# The old 30-iteration default read that ~49 s warm-up transient as the result (sel smoke: mean 47.6 s)
+# and understated steady state by ~1.6x. Iteration times are also bimodal (fast bins ~27 s, heavy bins
+# 43-74 s), so read the MEAN over the retained iterations, not a p50 or a run of consecutive iterations.
+# A 100-iteration smoke is ~75 min at 32 GPUs. OV2_MIDTRAIN_N_SAMPLES / OV2_SMOKE_WARM override both.
+export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( OV2_MIDTRAIN_GBS * 100 ))}"  # -> 100 iters
+export OV2_SMOKE_WARM="${OV2_SMOKE_WARM:-60}"
 # SAVE_EVERY=0 disables BOTH interval saves and the end-of-run save (train.py skips the final save
 # when save_interval == 0, and the interval check is truthiness-guarded, so no modulo-by-zero).
 # A 35B+Muon save is hundreds of GB and several minutes; a throughput smoke has no use for one.
@@ -211,7 +212,7 @@ import sys
 log, result, rc, peak, tp, gbs, muon, sortw, knobs = sys.argv[1:10]
 text = open(log, errors="replace").read()
 sort_on = "length-sorted batching ON" in text
-WARM = int(os.environ.get("OV2_SMOKE_WARM", "10") or 10)  # iteration time keeps easing for tens of iters
+WARM = int(os.environ.get("OV2_SMOKE_WARM", "60") or 60)  # iterations 1-60 are a warm-up transient (~49 s vs 30 s steady, measured 2026-09-05)
 its = [float(x) for x in re.findall(r"elapsed time per iteration \(ms\): ([\d.]+)", text)][WARM:]
 tps = [float(x) for x in re.findall(r"tokens/s/GPU: ([\d.]+)", text)][WARM:]
 tf = [float(x) for x in re.findall(r"TFLOP/s/GPU\)?: ([\d.]+)", text)][WARM:]
