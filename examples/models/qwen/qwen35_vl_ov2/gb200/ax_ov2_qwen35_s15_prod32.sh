@@ -43,7 +43,9 @@
 # 64 GPU must sit in ONE NVL72 rack (use the rack node-affinity). MEASURED 2026-09-05 01:20, 16 pods split
 # 11+5 across racks a6+a7 (TP1, selective recompute, HybridEP): 55-59 s/iter with spikes to 86-118 s,
 # 577-630 tokens/s/GPU, vs 47.6 s/iter and 1386 tokens/s/GPU for the SAME config on 32 GPUs in one rack.
-# 64x600 < 32x1386: the cross-rack job moves fewer tokens than half the GPUs. Per-microbatch compute
+# Iteration times are BIMODAL (fast mode 27-28 s, heavy bins 43-74 s at 32 GPUs in one rack, 2026-09-05),
+# so compare MEANS over 60+ iterations, never a run of consecutive iterations. In-rack all-grads-sync is
+# 77 ms and batch-generator 70 ms: DP communication and data loading are not where the time goes. Per-microbatch compute
 # (PHASETIMER llm 773 ms + prefix 230-450 ms) accounts for ~15-18 s of the 57 s; the rest is DP
 # all-reduce (Muon = non-distributed optimizer = full all-reduce), Muon all-gathers and the one EP group
 # (two adjacent pods) that straddles the racks, all over inter-rack IB instead of NVLink. If a rack has
