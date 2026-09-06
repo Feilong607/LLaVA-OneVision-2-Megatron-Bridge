@@ -33,6 +33,8 @@
 # (both sides), env OV2_K8S_NAMESPACE=runai-mv0004 (both sides).
 #   32 GPU: Workers=7  (8 pods)  -> TP2/DP16, 16 microbatches/rank
 #   64 GPU: Workers=15 (16 pods) -> TP2/DP32,  8 microbatches/rank   <- just change Workers
+#   48 GPU: Workers=11 (12 pods) -> TP1/DP48 needs GBS 240 or 288 (256 % 48 != 0): use ax_ov2_qwen35_s15_prod48.sh,
+#           which starts a fresh TP1 midtrain and resumes only its own 48-GPU SAVE.
 # KEEP TP=2 when scaling out (vs TP4/TP8). Per-GPU LLM compute is total/WORLD either way, but the vision
 # tower and adapter are REPLICATED per rank (built TP=1), so tower work per GPU scales with microbatches
 # per rank = GBS/DP: higher TP means MORE tower work per GPU, plus doubled step and EP a2a counts. TP8
@@ -190,7 +192,10 @@ mkdir -p "$SAVE"
 
 echo "[qwen35-s15-prod] tp=$TP gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES muon=$OV2_MIDTRAIN_MUON sort_window=${OV2_LENGTH_SORT_WINDOW:-auto(GBS/DP)} accel=$ACCEL save_every=$SAVE_EVERY recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE alloc=$PYTORCH_CUDA_ALLOC_CONF mem_probe=$OV2_MEM_PROBE init=$INIT_CKPT save=$SAVE" | tee -a "$LOG"
 python3 -c "import fla; print('[qwen35-s15-prod] fla', getattr(fla,'__version__','?'), fla.__file__)" 2>&1 | tee -a "$LOG" || true
-echo "[qwen35-s15-prod] watch: grep -E 'iteration +[0-9]+/' \$HOME/train_logs/prod_qwen35_s15_*worker-6*.log | tail -5   (iteration lines print on the LAST rank's pod)" | tee -a "$LOG"
+# Iteration lines print on the LAST rank's pod = worker-<pods-2> (worker-6 at 8 pods, worker-10 at 12, worker-14 at 16).
+# The job tag is in the glob so it cannot match an older job's log.
+_PD_LAST_WORKER=$(( ${PET_NNODES:-8} - 2 ))
+echo "[qwen35-s15-prod] watch: grep -E 'iteration +[0-9]+/' \$HOME/train_logs/prod_qwen35_s15_${_PD_TAG}_*worker-${_PD_LAST_WORKER}.log | tail -5   (iteration lines print on the LAST rank's pod)" | tee -a "$LOG"
 
 set +e
 bash "$_PD_BASE" 2>&1 | tee -a "$LOG"
