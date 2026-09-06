@@ -131,7 +131,12 @@ def test_real_tensorboard_events(tmp_path: Path, caplog: pytest.LogCaptureFixtur
             Event(
                 wall_time=1000 + step,
                 step=step,
-                summary=Summary(value=[Summary.Value(tag="iteration-time", simple_value=value)]),
+                summary=Summary(
+                    value=[
+                        Summary.Value(tag="iteration-time", simple_value=value),
+                        Summary.Value(tag="all-grads-sync-time", simple_value=value / 100),
+                    ]
+                ),
             )
         )
     writer.close()  # type: ignore[no-untyped-call]
@@ -141,4 +146,5 @@ def test_real_tensorboard_events(tmp_path: Path, caplog: pytest.LogCaptureFixtur
         assert "重复step" in caplog.text and "mean=" not in caplog.text
     else:
         assert "mean=50" in caplog.text and "mean=20" in caplog.text
+        assert "all-grads-sync-time" in caplog.text and "mean=0.5" in caplog.text
     assert "mean=999" not in caplog.text

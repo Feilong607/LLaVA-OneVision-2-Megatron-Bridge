@@ -216,7 +216,7 @@ def _tensorboard(path: Path, event_steps: set[int], first: int, last: int) -> No
             tag
             for tag in tags.get("scalars", [])
             if re.search(
-                r"loss|grad.norm|iteration.time|forward.backward|batch.generator|optimizer|all.?gather|all.?to.?all",
+                r"loss|grad.norm|all.grads.sync|iteration.time|forward.backward|batch.generator|optimizer|all.?gather|all.?to.?all",
                 tag,
                 re.I,
             )
