@@ -57,15 +57,17 @@ class PodLog:
     stream_warnings: int = 0
     last_timeout_line: int = 0
     malformed_steps: int = 0
+    segment_start: int = 0
     steps: list[Step] = field(default_factory=list)
     events: list[tuple[int, str]] = field(default_factory=list)
 
-    def reset_segment(self) -> None:
+    def reset_segment(self, line: int = 0) -> None:
         """Discard previous-attempt timing without discarding lifetime event counts."""
         self.steps.clear()
         self.current_timeouts = 0
         self.last_timeout_line = 0
         self.malformed_steps = 0
+        self.segment_start = line
 
 
 @dataclass
@@ -108,7 +110,7 @@ def _read_pod(path: Path, pod: str) -> PodLog:
             if wrapper or container:
                 if wrapper or not pending_wrapper:
                     result.starts += 1
-                    result.reset_segment()
+                    result.reset_segment(line_number)
                 pending_wrapper = wrapper
                 if container:
                     nodes = re.search(r"\bnnodes=(\d+)\b", line)
@@ -144,7 +146,7 @@ def _read_pod(path: Path, pod: str) -> PodLog:
                 continue
             if result.steps and step.number <= result.steps[-1].number:
                 result.regressions += 1
-                result.reset_segment()
+                result.reset_segment(line_number)
             result.steps.append(step)
     return result
 

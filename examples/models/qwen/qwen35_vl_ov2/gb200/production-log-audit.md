@@ -66,3 +66,68 @@ Compare 32/48-GPU runs with samples/s because their global batch sizes can diffe
 Variable image/video content and checkpoint I/O can cause slow steps. Attribution
 to HybridEP or stream synchronization requires controlled runs with the same
 data/checkpoint/configuration or a profiler; this tool does not claim causality.
+# HybridEP timeout investigation
+
+For a fresh TP1 Qwen3.5 production run, the additional read-only report can use
+the existing PHASETIMER lines and TensorBoard event files:
+
+```bash
+python3 examples/models/qwen/qwen35_vl_ov2/gb200/diagnose_hybridep.py --job YOUR_EXACT_JOB
+```
+
+It finds `SAVE/tensorboard` from that job's wrapper log. Override only a different
+location with `--tensorboard-dir PATH`. Run in a container with TensorBoard
+installed; missing TensorBoard leaves the log report available. `--runtime`
+also reads the diagnostic container's module search paths and `/opt/DeepEP`
+source without importing DeepEP or torch. Use it in an actual training pod:
+a code-sync container can have a different image. No GPU work is launched.
+
+## What the pinned version establishes
+
+DeepEP `34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72` defaults to
+`enable_custom_allgather=True`. Its
+[allgather kernel](https://github.com/deepseek-ai/DeepEP/blob/34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72/csrc/hybrid_ep/extension/allgather.cu#L73)
+waits for `expected = iter_id * rank_num`. After 40 billion `clock64` cycles it
+prints TIMEOUT and **breaks out of the wait**. It does not abort or prove that
+the routing map is complete. Continued iteration progress is therefore not a
+correctness check. The counter gap counts outstanding completion signals,
+not missing GPU devices or missing tokens.
+
+[Upstream PR #682](https://github.com/deepseek-ai/DeepEP/pull/682) changes the
+Python default to False, increases the custom kernel threshold tenfold, and
+replaces the unsafe break with a trap. At the pinned version, explicitly passing
+`enable_custom_allgather=False` already selects NCCL `all_gather_into_tensor`
+for the routing map while retaining HybridEP token dispatch/combine. This is a
+candidate fix, not a measured throughput improvement; this diagnostic does not
+change the running job or the dispatcher. Do not merely hide the warning.
+
+## Attribution limits
+
+The report combines repeated lines by candidate EP group and expected counter,
+assuming contiguous EP8 groups across pairs of four-GPU pods. It conditionally
+maps the counter to an iteration using **40 decoder MoEs + 1 MTP MoE, one forward
+and one selective MoE recompute = 82 allgathers per microbatch**. It requires
+complete first-launch logs starting at iteration 1, TP1, ACCEL2, and selective
+MoE recompute. Even then, extra evaluation forwards, buffer resets or unrecorded
+process restarts invalidate the mapping. Treat it as a hypothesis to cross-check
+against the raw log and, ultimately, a CUDA/NVTX trace.
+
+Only PHASETIMER rows from the **same forward number and EP group** are joined.
+No sample means no phase attribution. The current production sampler records
+one of five microbatches; a fifth-microbatch timing cannot explain the second.
+Prefix excludes the preceding microbatch's vision backward; LLM includes waits.
+
+The report compares original, unsmoothed TensorBoard scalar values and log step
+times at candidate timeout steps with other steps in the same window. It keeps
+TensorBoard run directories separate and rejects duplicate steps per scalar.
+It reports non-finite values; absence of NaN does not establish routing accuracy.
+Tensor-format summaries are reported as undecoded, not silently treated as empty.
+The default comparison excludes the first 50 completed log records and uses at
+most 500 subsequent records. Sparse scalar logging can miss individual events.
+
+**Differences between these groups are correlations, not causal slowdown.**
+Different image/video sizes, backward work, JIT, checkpoints and rank arrival
+times can explain a long iteration. A busy-wait threshold is not avoidable
+wall time, and concurrent rank/SM waits cannot be summed. Measure recoverable
+throughput with matched data, initialization/checkpoint, topology, GBS and
+recompute settings, isolated outputs, and a sufficiently long steady-state A/B.
