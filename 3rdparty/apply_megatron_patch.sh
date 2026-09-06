@@ -76,3 +76,8 @@ _apply_one "$HERE/megatron_lm_ov2_ep_overlap.patch" "$M/megatron/core/pipeline_p
   "OV2_EP_OVERLAP=1 will hit mcore's 'only GPTModel is supported' assert until it applies."
 _apply_one "$HERE/megatron_lm_ov2_hybridep_pad.patch" "$M/megatron/core/transformer/moe/fused_a2a.py"     "_HYBRID_EP_PAD_INFO"  "hybridep-pad" 0 \
   "ACCEL=2/3 (HybridEP) will crash (cudaErrorIllegalAddress in dispatch_with_permute) on THD-packed batches until it applies; ACCEL=0/1 alltoall unaffected."
+
+# Opt-in routing-map allgather selection. Unset preserves the installed DeepEP default.
+_apply_one "$HERE/megatron_lm_ov2_hybridep_allgather.patch" "$M/megatron/core/transformer/moe/fused_a2a.py" \
+  "OV2_HYBRIDEP_CUSTOM_ALLGATHER" "hybridep-allgather" 0 \
+  "The allgather ablation requires this patch; existing production defaults are unchanged."

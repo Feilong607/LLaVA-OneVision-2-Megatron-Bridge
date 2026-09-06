@@ -203,5 +203,5 @@ _rc=${PIPESTATUS[0]}
 set -e
 echo "[qwen35-s15-prod] rc=$_rc pod_peak_mem_mib=$(cat "$LOG.peak" 2>/dev/null || echo '?')" | tee -a "$LOG"
 # PyTorchJob reads the MASTER pod's exit code as the job verdict.
-if [[ "$(hostname)" == *-master-* ]]; then exit "$_rc"; fi
+if [[ "${OV2_PROPAGATE_WORKER_RC:-0}" == 1 || "$(hostname)" == *-master-* ]]; then exit "$_rc"; fi
 exit 0

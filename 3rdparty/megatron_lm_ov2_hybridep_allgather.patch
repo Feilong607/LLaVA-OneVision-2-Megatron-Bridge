@@ -1,0 +1,32 @@
+--- a/megatron/core/transformer/moe/fused_a2a.py
++++ b/megatron/core/transformer/moe/fused_a2a.py
+@@ -390,6 +390,14 @@
+         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
+     if num_sms_preprocessing_api is not None:
+         kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
++    # OV2_HYBRIDEP_CUSTOM_ALLGATHER: unset keeps the installed DeepEP default.
++    import os
++    import logging
++    custom_allgather = os.environ.get("OV2_HYBRIDEP_CUSTOM_ALLGATHER")
++    if custom_allgather is not None:
++        if custom_allgather not in ("0", "1"):
++            raise ValueError("OV2_HYBRIDEP_CUSTOM_ALLGATHER must be 0 or 1")
++        kwargs["enable_custom_allgather"] = custom_allgather == "1"
+     _hybrid_ep_buffer = HybridEPBuffer(
+         group=group,
+         hidden_dim=hidden_dim,
+@@ -398,6 +406,14 @@
+         use_fp8=fp8_dispatch,
+         **kwargs,
+     )
++    if custom_allgather is not None:
++        domains = getattr(_hybrid_ep_buffer, "num_of_nodes", None)
++        if os.environ.get("OV2_HYBRIDEP_REQUIRE_NVLINK") == "1" and domains != 1:
++            raise RuntimeError("Allgather ablation needs each EP group inside one NVLink domain")
++        logging.getLogger(__name__).warning(
++            "[OV2-HYBRID-AG] rank=%s custom=%s domains=%s",
++            torch.distributed.get_rank(), custom_allgather, domains,
++        )
+ 
+ 
+ def reset_hybrid_ep_buffer():

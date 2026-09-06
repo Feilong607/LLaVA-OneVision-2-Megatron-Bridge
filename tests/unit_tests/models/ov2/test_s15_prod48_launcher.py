@@ -233,3 +233,14 @@ def test_288_batch_and_explicit_zero_warmup(launch):
     rc, output = run("OV2_MIDTRAIN_GBS=288", "OV2_WARMUP_ITERS=0")
     assert rc == 0, output
     assert "mb_per_rank=6" in output and "iters=27778 warmup=0" in output
+
+
+@pytest.mark.parametrize("propagate,expected_rc", [("0", 0), ("1", 7)])
+def test_ablation_can_propagate_worker_failure_without_changing_default(launch, propagate, expected_rc):
+    run, tmp_path, _ = launch
+    (tmp_path / "bin/hostname").write_text("#!/usr/bin/env bash\necho prod48-worker-0\n")
+    base = tmp_path / "qwen/qwen35_vl_ov2/gb200/ax_ov2_qwen35_35b_a3b_gb200.sh"
+    with base.open("a") as stream:
+        stream.write("exit 7\n")
+    rc, output = run(OV2_PREFLIGHT_ONLY="0", OV2_PROPAGATE_WORKER_RC=propagate)
+    assert rc == expected_rc, output

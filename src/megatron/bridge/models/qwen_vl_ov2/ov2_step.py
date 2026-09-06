@@ -33,6 +33,10 @@ def _cuda(x):
 def get_batch(data_iterator: Iterable):
     """Pull one batch from the (energon) iterator and move tensors to CUDA. No label shift."""
     batch = next(data_iterator)
+    if os.environ.get("OV2_AB_INPUT_DIR"):
+        from megatron.bridge.models.qwen_vl_ov2.ablation_inputs import record_batch
+
+        record_batch(batch)
     tokens = _cuda(batch.get("tokens", batch.get("input_ids")))
     labels = _cuda(batch.get("labels"))
     loss_mask = _cuda(batch.get("loss_mask"))
