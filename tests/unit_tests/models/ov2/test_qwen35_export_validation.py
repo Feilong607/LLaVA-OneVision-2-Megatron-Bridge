@@ -249,3 +249,90 @@ def test_actual_shards_must_match_index(tmp_path, damage):
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": index}))
     with pytest.raises((ValueError, OSError)):
         validator.tensor_inventory(tmp_path)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("wrapper_depth", [0, 1, 2])
+@pytest.mark.parametrize("damage", [None, "zero_centered_gamma", "post_layernorm_eps"])
+def test_export_norm_guard_handles_precision_wrappers(wrapper_depth, damage):
+    """Run the worker's actual guard with the real Float16Module class on CPU.
+
+    Extract source to avoid import-time CUDA/distributed initialization. Only the
+    MegatronModule base initialization is replaced; Float16Module's constructor
+    and Bridge's unwrap_model implementation are the repository implementations.
+    """
+    import __future__
+
+    import ast
+    from functools import partial
+    from types import SimpleNamespace
+
+    def load_node(path, name, namespace):
+        tree = ast.parse(path.read_text())
+        node = next(node for node in tree.body if getattr(node, "name", None) == name)
+        exec(
+            compile(
+                ast.Module(body=[node], type_ignores=[]), str(path), "exec", flags=__future__.annotations.compiler_flag
+            ),
+            namespace,
+        )
+        return namespace[name]
+
+    class CPUBase(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+
+    wrapper = load_node(
+        ROOT / "3rdparty/Megatron-LM/megatron/core/transformer/module.py",
+        "Float16Module",
+        {"MegatronModule": CPUBase, "torch": torch},
+    )
+    unwrap = load_node(ROOT / "src/megatron/bridge/models/conversion/utils.py", "unwrap_model", {})
+    inner = torch.nn.Module()
+    inner.vision_model = SimpleNamespace(
+        config=SimpleNamespace(layernorm_zero_centered_gamma=True, layernorm_epsilon=1e-5),
+        pre_layernorm=SimpleNamespace(eps=1e-4),
+        decoder=SimpleNamespace(final_layernorm=torch.nn.LayerNorm(4)),
+    )
+    inner.adapter = SimpleNamespace(config=SimpleNamespace(layernorm_zero_centered_gamma=True, layernorm_epsilon=1e-6))
+    wrapped = inner
+    precision = SimpleNamespace(fp16=False, bf16=True, virtual_pipeline_model_parallel_size=None)
+    for _ in range(wrapper_depth):
+        wrapped = wrapper(precision, wrapped)
+    model = [wrapped]
+    cfg = SimpleNamespace(
+        zero_centered_gamma=True,
+        merger_zero_centered_gamma=True,
+        layer_norm_type="layer_norm",
+        layer_norm_eps=1e-5,
+        pre_layernorm_eps=1e-4,
+        merger_layernorm_eps=1e-6,
+        use_post_layernorm=True,
+        use_head=False,
+        post_layernorm_eps=1e-5,
+    )
+    if damage == "zero_centered_gamma":
+        cfg.zero_centered_gamma = False
+    elif damage == "post_layernorm_eps":
+        cfg.post_layernorm_eps = 1e-6
+    namespace = {
+        "model": model,
+        "_export_config": SimpleNamespace(
+            text_config=SimpleNamespace(model_type="qwen3_5_moe_text"), vision_config=cfg
+        ),
+        "unwrap_model": partial(unwrap, module_instances=(wrapper,)),
+    }
+    worker = ROOT / "examples/models/qwen/qwen3_vl_ov2/gb200/ov2_30b_export_ep8.py"
+    tree = ast.parse(worker.read_text())
+    guard = next(node for node in tree.body if isinstance(node, ast.If) and "qwen3_5" in ast.unparse(node.test))
+    code = compile(ast.Module(body=[guard], type_ignores=[]), str(worker), "exec")
+    if damage:
+        with pytest.raises(ValueError, match="norm.*mismatch|LayerNorm.*mismatch"):
+            exec(code, namespace)
+    else:
+        exec(code, namespace)
+        assert namespace["_vision"] is inner.vision_model
+        assert namespace["_adapter"] is inner.adapter
+    assert namespace["model"] is model
+    assert model[0] is wrapped  # Save still receives the original precision wrapper.

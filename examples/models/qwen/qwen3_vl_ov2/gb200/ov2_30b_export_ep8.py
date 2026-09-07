@@ -68,6 +68,7 @@ def _req(name):
 
 
 from megatron.bridge import AutoBridge
+from megatron.bridge.models.conversion.utils import unwrap_model
 
 
 CFG = _req("CFG")  # HF config dir (dispatch-ready p16m33 auto_model; convert.sh's ensure_dispatch_cfg)
@@ -99,8 +100,11 @@ _export_config = bridge.hf_pretrained  # from_auto_config returns a config-only 
 if str(_export_config.text_config.model_type).startswith("qwen3_5"):
     # The Qwen3.5 vision final LN is a separate trained operation, not the
     # adapter LN or the optional HF vision pooling head. Check before exporting.
-    _vision = model[0].vision_model
-    _adapter = model[0].adapter
+    # wrap_with_ddp=False still retains the Float16Module precision wrapper.
+    # Unwrap only for inspection; keep the original model list for Bridge export.
+    _inspection_model = unwrap_model(model[0])
+    _vision = _inspection_model.vision_model
+    _adapter = _inspection_model.adapter
     _vcfg = _export_config.vision_config
     _norm_contract = {
         "zero_centered_gamma": _vision.config.layernorm_zero_centered_gamma,
