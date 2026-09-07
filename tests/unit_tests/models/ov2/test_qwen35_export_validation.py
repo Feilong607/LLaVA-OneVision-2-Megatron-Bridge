@@ -1,5 +1,6 @@
 """CPU tests of actual HF meta-model shape validation and safetensors shards."""
 
+import argparse
 import importlib.util
 import json
 import shutil
@@ -81,6 +82,63 @@ def test_real_meta_model_all_inference_tensors(skeleton):
     result = validator.check_shapes(inventory, shapes, require_mtp=False)
     assert result["inference_tensors_checked"] == len(shapes)
     assert result["numerical_parity_verified"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("legacy_architectures", [None, ["LlavaOnevision2ForConditionalGeneration"]])
+def test_builder_replaces_lossy_base_config_and_preserves_dispatch(skeleton, legacy_architectures):
+    """A valid JSON architecture must survive AutoConfig and config synthesis, not only text dispatch."""
+    from transformers import AutoConfig
+
+    spec = importlib.util.spec_from_file_location("q35_skeleton_builder", CONVERT / "build_qwen35_hf_skeleton.py")
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    config_path = skeleton / "config.json"
+    config = json.loads(config_path.read_text())
+    text = skeleton / "text"
+    text.mkdir()
+    (text / "config.json").write_text(json.dumps(config["text_config"]))
+    # Tokenizer contents are outside this config-dispatch regression.
+    (text / "tokenizer.json").write_text("{}")
+    config["architectures"] = legacy_architectures
+    config_path.write_text(json.dumps(config))
+    # Representative legacy constructor: correct Qwen3.5 text type, but loses HF dispatch metadata.
+    config_file = skeleton / "configuration_llava_onevision2_moe.py"
+    original = config_file.read_text()
+    config_file.write_text(
+        original.replace(
+            "super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)",
+            "kwargs.pop('architectures', None)\n        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)",
+        )
+    )
+    before = AutoConfig.from_pretrained(skeleton, trust_remote_code=True, local_files_only=True)
+    assert before.text_config.model_type == "qwen3_5_moe_text"
+    assert before.architectures is None  # The old text-only selftest would pass this broken config.
+    with pytest.raises(SystemExit):
+        builder.selftest(str(skeleton), 248056, 3, False)
+    proc = skeleton / "processor"
+    proc.mkdir()
+    (proc / "preprocessor_config.json").write_text("{}")
+    out = skeleton / "built"
+    args = argparse.Namespace(
+        text_dir=str(text),
+        base_skeleton=str(skeleton),
+        proc_dir=str(proc),
+        tokenizer_dir=None,
+        out=str(out),
+        patch_size=16,
+        merge_size=3,
+    )
+    builder.build(args)
+    loaded = AutoConfig.from_pretrained(out, trust_remote_code=True, local_files_only=True)
+    assert loaded.architectures == ["LlavaOnevision2ForConditionalGeneration"]
+    assert loaded.text_config.to_dict() == before.text_config.to_dict()
+    assert loaded.image_token_id == 248056
+    assert loaded.tie_word_embeddings is False
+    synthesized = type(loaded)(**loaded.to_dict())
+    assert synthesized.architectures == loaded.architectures
+    assert synthesized.text_config.model_type == "qwen3_5_moe_text"
+    builder.selftest(str(out), 248056, 3, False)
 
 
 @pytest.mark.parametrize("damage", ["missing", "shape", "legacy_expert", "mtp"])

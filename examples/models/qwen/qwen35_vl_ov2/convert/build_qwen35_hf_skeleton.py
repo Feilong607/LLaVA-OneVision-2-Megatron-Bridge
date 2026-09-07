@@ -33,9 +33,9 @@ What it produces (CPU only, seconds, no weights):
                                     use_patch_position_encoding false), Qwen3.5 multimodal token ids read from
                                     the tokenizer (image_pad 248056 / video_pad 248057 / vision_start 248053 /
                                     vision_end 248054), tie_word_embeddings false.
-  <out>/configuration_*.py          the base skeleton's, REPLACED by hf_skeleton_fixes/configuration_... only if
-                                    it fails the dispatch self-test (text_config must deserialize as a real
-                                    Qwen3_5MoeTextConfig; a hardcoded Qwen3MoeConfig silently coerces it).
+  <out>/configuration_*.py          the golden composite configuration class: preserves top-level architectures
+                                    and deserializes text_config as a real Qwen3_5MoeTextConfig. The base
+                                    skeleton supplies vision geometry, not the Qwen3.5 dispatch implementation.
   <out>/modeling_*.py               the golden hf_skeleton_fixes modeling (M-RoPE aware).
   <out>/chat_template.jinja         the golden OV2 template (Qwen2/3-VL style, 'You are a helpful assistant.',
                                     NO <think>): the Qwen3.5-native template would prepend '<think>\\n' to every
@@ -227,6 +227,8 @@ def build(args: argparse.Namespace) -> str:
     )
     cfg["model_type"] = "llava_onevision2_moe"
     cfg["architectures"] = ["LlavaOnevision2ForConditionalGeneration"]
+    cfg["auto_map"] = dict(cfg["auto_map"])
+    cfg["auto_map"]["AutoConfig"] = "configuration_llava_onevision2_moe.LlavaOnevision2MoeConfig"
     cfg["text_config"] = text_config
     cfg["vision_config"] = vision_config
     cfg.update(tok_ids)
@@ -241,9 +243,11 @@ def build(args: argparse.Namespace) -> str:
         f"ids={tok_ids} tie=false"
     )
 
-    # ---- remote-code files: base configuration/modeling first, golden modeling + template over them ----
+    # ---- Use the known composite class; legacy base classes can discard architectures even
+    # when their text_config dispatch works. JSON-only checks cannot detect that failure. ----
     for py in glob.glob(os.path.join(base, "*.py")):
         _copy(py, out)
+    _copy(os.path.join(GOLDEN_DIR, CONFIGURATION), out)
     _copy(os.path.join(GOLDEN_DIR, MODELING), out)
     _copy(os.path.join(GOLDEN_DIR, CHAT_TEMPLATE), out)
     for stale in ("chat_template.json",):
@@ -320,17 +324,23 @@ def selftest(out: str, expect_image_token: int, merge_size: int, install_fallbac
         name = type(tc).__name__
         mt = getattr(tc, "model_type", None)
         layer_types = getattr(tc, "layer_types", None)
-        ok = str(mt).startswith("qwen3_5") and name.startswith("Qwen3_5") and bool(layer_types)
+        architectures = getattr(cfg, "architectures", None)
+        ok = (
+            str(mt).startswith("qwen3_5")
+            and name.startswith("Qwen3_5")
+            and bool(layer_types)
+            and architectures == ["LlavaOnevision2ForConditionalGeneration"]
+        )
         return (
             ok,
-            f"text_config -> {name} model_type={mt} layer_types={'ok' if layer_types else 'MISSING'}; image_token_id={getattr(cfg, 'image_token_id', None)} tie={getattr(cfg, 'tie_word_embeddings', None)}",
+            f"text_config -> {name} model_type={mt} layer_types={'ok' if layer_types else 'MISSING'}; architectures={architectures}; image_token_id={getattr(cfg, 'image_token_id', None)} tie={getattr(cfg, 'tie_word_embeddings', None)}",
         )
 
     ok, desc = _check()
     _log(f"dispatch self-test (skeleton's own configuration class): {'PASS' if ok else 'FAIL'} -- {desc}")
     if not ok:
         install_fallback or _die(
-            "the skeleton's configuration class coerces text_config away from qwen3_5_moe_text; rerun without --no-fallback"
+            "the configuration class loses Qwen3.5 text dispatch or composite architectures; rerun without --no-fallback"
         )
         shutil.copy2(os.path.join(GOLDEN_DIR, CONFIGURATION), os.path.join(out, CONFIGURATION))
         # transformers caches remote modules under HF_HOME/modules; a fresh import needs a fresh cache key,
@@ -340,6 +350,7 @@ def selftest(out: str, expect_image_token: int, merge_size: int, install_fallbac
 
         code = (
             "from transformers import AutoConfig;import sys;c=AutoConfig.from_pretrained(sys.argv[1],trust_remote_code=True);"
+            "assert c.architectures==['LlavaOnevision2ForConditionalGeneration'], c.architectures;"
             "t=c.text_config;print(type(t).__name__, t.model_type, bool(getattr(t,'layer_types',None)))"
         )
         res = subprocess.run([sys.executable, "-c", code, out], capture_output=True, text=True)
