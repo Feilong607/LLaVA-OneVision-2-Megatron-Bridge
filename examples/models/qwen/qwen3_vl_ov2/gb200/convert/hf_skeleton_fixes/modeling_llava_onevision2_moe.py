@@ -1,11 +1,10 @@
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import LayerNorm
-
 from transformers import AutoModel
 from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
@@ -269,6 +268,20 @@ class OneVisionEncoderEmbeddings(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class LlavaOnevision2ZeroCenteredLayerNorm(nn.LayerNorm):
+    """Preserve raw Megatron gamma weights while using their effective value, 1 + gamma."""
+
+    def forward(self, hidden_states):
+        result = F.layer_norm(
+            hidden_states.float(),
+            self.normalized_shape,
+            self.weight.float() + 1,
+            self.bias.float() if self.bias is not None else None,
+            self.eps,
+        )
+        return result.to(hidden_states.dtype)
+
+
 class LlavaOnevision2VisionPatchMerger(nn.Module):
     """
     Patch merger that merges spatial_merge_size x spatial_merge_size patches into one.
@@ -283,13 +296,15 @@ class LlavaOnevision2VisionPatchMerger(nn.Module):
         context_dim: int,
         spatial_merge_size: int = 2,
         layer_norm_eps: float = 1e-05,
+        zero_centered_gamma: bool = False,
         use_patch_position_encoding: bool = False,
         patch_position_encoding_type: str = "absolute",
         max_position_embeddings: int = 8192,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
-        self.ln_q = LayerNorm(context_dim, eps=layer_norm_eps)
+        norm_cls = LlavaOnevision2ZeroCenteredLayerNorm if zero_centered_gamma else LayerNorm
+        self.ln_q = norm_cls(context_dim, eps=layer_norm_eps)
         self.mlp = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.GELU(),
@@ -349,11 +364,15 @@ def rotate_half(x):
     return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
 
 
-def get_norm_layer(config):
+def get_norm_layer(config, eps=None):
+    eps = config.layer_norm_eps if eps is None else eps
     if config.layer_norm_type == "rms_norm":
-        return nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        return nn.RMSNorm(config.hidden_size, eps=eps)
     else:
-        return nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        norm_cls = (
+            LlavaOnevision2ZeroCenteredLayerNorm if getattr(config, "zero_centered_gamma", False) else nn.LayerNorm
+        )
+        return norm_cls(config.hidden_size, eps=eps)
 
 
 def apply_rotary_pos_emb(q, k, freqs):
@@ -467,8 +486,7 @@ def convert_rope_to_block_layout_by_positions(
 
         # Check if all samples share the same (h, w) — common for video frames
         all_same_hw = (
-            torch.all(grid_thw[:, 1] == grid_thw[0, 1]).item()
-            and torch.all(grid_thw[:, 2] == grid_thw[0, 2]).item()
+            torch.all(grid_thw[:, 1] == grid_thw[0, 1]).item() and torch.all(grid_thw[:, 2] == grid_thw[0, 2]).item()
         )
         if all_same_hw:
             total_t = grid_thw[:, 0].sum().item()
@@ -484,8 +502,8 @@ def convert_rope_to_block_layout_by_positions(
             h = grid_thw[i, 1].item()
             w = grid_thw[i, 2].item()
             n = int(t * h * w)
-            result[offset:offset + n] = convert_rope_to_block_layout(
-                freqs[offset:offset + n], t=t, h=h, w=w, spatial_merge_size=sms
+            result[offset : offset + n] = convert_rope_to_block_layout(
+                freqs[offset : offset + n], t=t, h=h, w=w, spatial_merge_size=sms
             )
             offset += n
         return result
@@ -926,22 +944,25 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
 
         # Vision components
         self.embeddings = OneVisionEncoderEmbeddings(config)
-        self.layernorm_pre = get_norm_layer(config)
+        self.layernorm_pre = get_norm_layer(config, eps=getattr(config, "pre_layernorm_eps", None))
         self.encoder = OneVisionEncoderEncoder(config)
         self.video_rope = VisionRotaryEmbedding(config)
 
-        if config.use_head:
-            self.layernorm_post = get_norm_layer(config)
-            self.head = Siglip2MultiheadAttentionPoolingHead(config)
+        if config.use_head or getattr(config, "use_post_layernorm", False):
+            self.layernorm_post = get_norm_layer(config, eps=getattr(config, "post_layernorm_eps", None))
         else:
             self.layernorm_post = None
+        if config.use_head:
+            self.head = Siglip2MultiheadAttentionPoolingHead(config)
+        else:
             self.head = None
 
         self.merger = LlavaOnevision2VisionPatchMerger(
             dim=config.out_hidden_size,
             context_dim=config.hidden_size,
             spatial_merge_size=config.spatial_merge_size,
-            layer_norm_eps=config.layer_norm_eps,
+            layer_norm_eps=getattr(config, "merger_layernorm_eps", None) or config.layer_norm_eps,
+            zero_centered_gamma=getattr(config, "merger_zero_centered_gamma", False),
             use_patch_position_encoding=getattr(config, "use_patch_position_encoding", False),
             patch_position_encoding_type=getattr(config, "patch_position_encoding_type", "absolute"),
             max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
@@ -1439,12 +1460,20 @@ def _ov2_get_rope_index(
                 else:
                     ed_video = len(input_tokens) + 1
                 if ed_image < ed_video:
-                    t, h, w = image_grid_thw[image_index][0], image_grid_thw[image_index][1], image_grid_thw[image_index][2]
+                    t, h, w = (
+                        image_grid_thw[image_index][0],
+                        image_grid_thw[image_index][1],
+                        image_grid_thw[image_index][2],
+                    )
                     image_index += 1
                     remain_images -= 1
                     ed = ed_image
                 else:
-                    t, h, w = video_grid_thw[video_index][0], video_grid_thw[video_index][1], video_grid_thw[video_index][2]
+                    t, h, w = (
+                        video_grid_thw[video_index][0],
+                        video_grid_thw[video_index][1],
+                        video_grid_thw[video_index][2],
+                    )
                     video_index += 1
                     remain_videos -= 1
                     ed = ed_video
@@ -1873,9 +1902,7 @@ def load_balancing_loss_func(
 
     if isinstance(gate_logits, tuple):
         compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat(
-            [layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0
-        )
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
 
     routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
 
@@ -1915,9 +1942,9 @@ def load_balancing_loss_func(
         )
 
         # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(
-            routing_weights * router_per_expert_attention_mask, dim=0
-        ) / torch.sum(router_per_expert_attention_mask, dim=0)
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
 
     overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
     return overall_loss * num_experts

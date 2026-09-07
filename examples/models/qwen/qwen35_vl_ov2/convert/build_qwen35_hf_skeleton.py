@@ -199,6 +199,19 @@ def build(args: argparse.Namespace) -> str:
         f"projects 1024*merge^2 -> text hidden, so this skeleton cannot host the Qwen3.5 weights"
     )
     vision_config["use_patch_position_encoding"] = False
+    # Existing Qwen3.5 OV2 checkpoints inherit non-None mtp_num_layers into the
+    # vision TransformerBlock, which applies its final LN despite post_process=False.
+    # Preserve that trained operation independently of the unused vision pooling head.
+    vision_config["use_post_layernorm"] = True
+    vision_config["post_layernorm_eps"] = 1e-5  # get_vision_config().layernorm_epsilon
+    vision_config["layer_norm_type"] = "layer_norm"
+    vision_config["layer_norm_eps"] = 1e-5
+    vision_config["pre_layernorm_eps"] = 1e-4  # OneVisionEncoderModel.pre_layernorm
+    vision_config["merger_layernorm_eps"] = text_config.get("rms_norm_eps", 1e-6)
+    # Both vision and adapter deepcopy the Qwen3.5 LLM's zero-centered gamma flag.
+    # Keep raw checkpoint weights; the HF norm applies (1 + gamma) at runtime.
+    vision_config["zero_centered_gamma"] = True
+    vision_config["merger_zero_centered_gamma"] = True
     vision_config.setdefault("temporal_patch_size", 1)
 
     # ---- multimodal token ids from the Qwen3.5 tokenizer ----

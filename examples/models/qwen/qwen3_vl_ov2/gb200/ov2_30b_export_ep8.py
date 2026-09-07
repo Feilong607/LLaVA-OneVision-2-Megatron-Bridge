@@ -11,6 +11,7 @@ stall: 'before init' with no following 'after init' == the process group is wait
 (wrong world size / missing peer node); no _diag line at all == torchrun's own agent is still at rendezvous
 (the peer node never launched) and the worker never started.
 """
+
 import os
 import sys
 from datetime import timedelta
@@ -94,6 +95,45 @@ model = bridge.load_megatron_model(
     wrap_with_ddp=False,
 )
 # load_megatron_model returns a list (PP/vp stages); save_hf_pretrained expects the list
+_export_config = bridge.hf_pretrained  # from_auto_config returns a config-only bridge
+if str(_export_config.text_config.model_type).startswith("qwen3_5"):
+    # The Qwen3.5 vision final LN is a separate trained operation, not the
+    # adapter LN or the optional HF vision pooling head. Check before exporting.
+    _vision = model[0].vision_model
+    _adapter = model[0].adapter
+    _vcfg = _export_config.vision_config
+    _norm_contract = {
+        "zero_centered_gamma": _vision.config.layernorm_zero_centered_gamma,
+        "merger_zero_centered_gamma": _adapter.config.layernorm_zero_centered_gamma,
+        "layer_norm_type": "layer_norm",
+        "layer_norm_eps": _vision.config.layernorm_epsilon,
+        "pre_layernorm_eps": _vision.pre_layernorm.eps,
+        "merger_layernorm_eps": _adapter.config.layernorm_epsilon,
+    }
+    for _field, _actual in _norm_contract.items():
+        if getattr(_vcfg, _field, None) != _actual:
+            raise ValueError(
+                f"Vision/adapter norm mismatch for {_field}: HF={getattr(_vcfg, _field, None)}, model={_actual}. "
+                "Rebuild the Qwen3.5 HF skeleton before retrying."
+            )
+    _actual_post_ln = _vision.decoder.final_layernorm is not None
+    _hf_post_ln = bool(
+        getattr(_export_config.vision_config, "use_post_layernorm", False)
+        or getattr(_export_config.vision_config, "use_head", False)
+    )
+    if _actual_post_ln != _hf_post_ln:
+        raise ValueError(
+            f"Vision final LayerNorm mismatch: checkpoint model={_actual_post_ln}, HF config={_hf_post_ln}. "
+            "Rebuild the Qwen3.5 HF skeleton with the current builder before retrying."
+        )
+    if _actual_post_ln:
+        _hf_eps = getattr(_export_config.vision_config, "post_layernorm_eps", None)
+        if _hf_eps is None:
+            _hf_eps = _export_config.vision_config.layer_norm_eps
+        if _hf_eps != _vision.config.layernorm_epsilon:
+            raise ValueError(
+                f"Vision final LayerNorm epsilon mismatch: {_hf_eps} != {_vision.config.layernorm_epsilon}"
+            )
 log("save_hf_pretrained -> " + HF)
 bridge.save_hf_pretrained(model, HF)
 dist.barrier()

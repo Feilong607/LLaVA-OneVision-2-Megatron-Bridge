@@ -59,6 +59,12 @@ class LlavaOnevision2VisionConfig(PretrainedConfig):
         attention_dropout=0.0,
         rope_theta=10000.0,
         use_head=False,
+        use_post_layernorm=False,
+        post_layernorm_eps=None,
+        pre_layernorm_eps=None,
+        merger_layernorm_eps=None,
+        zero_centered_gamma=False,
+        merger_zero_centered_gamma=False,
         use_patch_position_encoding=False,
         temporal_patch_size=1,
         **kwargs,
@@ -79,6 +85,12 @@ class LlavaOnevision2VisionConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.rope_theta = rope_theta
         self.use_head = use_head
+        self.use_post_layernorm = use_post_layernorm
+        self.post_layernorm_eps = post_layernorm_eps
+        self.pre_layernorm_eps = pre_layernorm_eps
+        self.merger_layernorm_eps = merger_layernorm_eps
+        self.zero_centered_gamma = zero_centered_gamma
+        self.merger_zero_centered_gamma = merger_zero_centered_gamma
         self.use_patch_position_encoding = use_patch_position_encoding
         self.temporal_patch_size = temporal_patch_size
 

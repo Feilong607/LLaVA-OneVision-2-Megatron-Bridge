@@ -135,10 +135,89 @@ def test_builder_replaces_lossy_base_config_and_preserves_dispatch(skeleton, leg
     assert loaded.text_config.to_dict() == before.text_config.to_dict()
     assert loaded.image_token_id == 248056
     assert loaded.tie_word_embeddings is False
+    assert loaded.vision_config.use_post_layernorm is True
+    assert loaded.vision_config.post_layernorm_eps == 1e-5
+    assert loaded.vision_config.pre_layernorm_eps == 1e-4
+    assert loaded.vision_config.layer_norm_eps == 1e-5
+    assert loaded.vision_config.merger_layernorm_eps == loaded.text_config.rms_norm_eps
+    assert loaded.vision_config.zero_centered_gamma is True
+    assert loaded.vision_config.merger_zero_centered_gamma is True
     synthesized = type(loaded)(**loaded.to_dict())
     assert synthesized.architectures == loaded.architectures
     assert synthesized.text_config.model_type == "qwen3_5_moe_text"
     builder.selftest(str(out), 248056, 3, False)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("zero_centered", [False, True])
+def test_trained_vision_final_norm_is_exported_and_applied_before_merger(skeleton, zero_centered):
+    """Exercise actual HF vision forward around the final norm using fixed encoder features."""
+    from transformers import AutoConfig
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    from transformers.modeling_outputs import BaseModelOutput
+
+    config_path = skeleton / "config.json"
+    config = json.loads(config_path.read_text())
+    baseline_shapes = validator.expected_shapes(skeleton)
+    assert not any("layernorm_post" in key for key in baseline_shapes)
+    config["vision_config"].update(
+        use_post_layernorm=True,
+        post_layernorm_eps=1e-5,
+        pre_layernorm_eps=1e-4,
+        layer_norm_eps=1e-5,
+        merger_layernorm_eps=1e-6,
+        zero_centered_gamma=zero_centered,
+        merger_zero_centered_gamma=zero_centered,
+    )
+    config_path.write_text(json.dumps(config))
+    expected = validator.expected_shapes(skeleton)
+    assert set(expected) - set(baseline_shapes) == {
+        "model.visual.layernorm_post.weight",
+        "model.visual.layernorm_post.bias",
+    }
+    cfg = AutoConfig.from_pretrained(skeleton, trust_remote_code=True, local_files_only=True)
+    cls = get_class_from_dynamic_module(
+        "modeling_llava_onevision2_moe.LlavaOnevision2VisionPretrainedModel", str(skeleton), local_files_only=True
+    )
+    model = cls(cfg.vision_config).eval()
+    assert model.head is None
+    assert model.layernorm_post.eps == 1e-5
+    assert model.layernorm_pre.eps == 1e-4
+    assert model.merger.ln_q.eps == 1e-6
+    features = torch.randn(1, 9, 32) * 0.01 + 0.2
+
+    class FixedEncoder(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return BaseModelOutput(last_hidden_state=features, hidden_states=(features, features), attentions=None)
+
+    encoder_norms = [model.encoder.layers[0].layer_norm1, model.encoder.layers[0].layer_norm2]
+    model.encoder = FixedEncoder()
+    with torch.no_grad():
+        model.layernorm_post.weight.fill_(1.7)
+        model.layernorm_post.bias.fill_(0.3)
+    captured = []
+    handle = model.merger.register_forward_pre_hook(lambda module, args: captured.append(args[0].detach().clone()))
+    positions = torch.tensor([[0, h, w] for h in range(3) for w in range(3)])
+    with torch.no_grad():
+        model(torch.randn(9, 3, 16, 16), grid_thw=torch.tensor([[1, 3, 3]]), patch_positions=positions)
+    handle.remove()
+    reference = torch.nn.functional.layer_norm(
+        features, (32,), model.layernorm_post.weight + int(zero_centered), model.layernorm_post.bias, 1e-5
+    )
+    torch.testing.assert_close(captured[0], reference, rtol=0, atol=0)
+    assert not torch.equal(captured[0], features)
+    for norm in (model.layernorm_pre, *encoder_norms, model.merger.ln_q):
+        with torch.no_grad():
+            norm.weight.fill_(0.25)
+            norm.bias.fill_(0.1)
+        expected_norm = torch.nn.functional.layer_norm(
+            features, (32,), norm.weight + int(zero_centered), norm.bias, norm.eps
+        )
+        torch.testing.assert_close(norm(features), expected_norm, rtol=0, atol=0)
+    # The strict output validator must now reject an export missing either trained norm tensor.
+    inventory = {key: shape for key, shape in expected.items() if "layernorm_post" not in key}
+    with pytest.raises(ValueError):
+        validator.check_shapes(inventory, expected, require_mtp=False)
 
 
 @pytest.mark.parametrize("damage", ["missing", "shape", "legacy_expert", "mtp"])

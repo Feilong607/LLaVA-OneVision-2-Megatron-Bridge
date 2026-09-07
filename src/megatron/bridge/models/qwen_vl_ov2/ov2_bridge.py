@@ -38,24 +38,20 @@ Backbones. The inner LLM is selected by ``text_config.model_type``:
     model_type/architectures in the temp text dir so HF->mcore (roundtrip) builds the real hybrid.
 
 ⚠️ DRAFT — needs HF<->mcore round-trip verification (skill acceptance bar) before production use.
-   Two architectural subtleties to confirm against the AIAK base ckpt during verification:
-   (1) HF `model.visual.layernorm_post` (applied after the encoder, before the merger): the mcore
-       vision tower is built post_process=False (NO decoder.final_layernorm). Confirm whether
-       layernorm_post folds into adapter.layernorm or is genuinely dropped. Currently UNMAPPED here.
-   (2) merger.ln_q vs layernorm_post: HF has two norms after the encoder; mcore adapter has one
-       (adapter.layernorm). The ln_q->adapter.layernorm mapping below assumes ln_q is the surviving one.
+   Qwen3.5's inherited non-None mtp_num_layers makes mcore create/apply the vision decoder's final
+   LayerNorm even with post_process=False. Preserve that trained layer separately from merger.ln_q;
+   the HF vision config must enable use_post_layernorm without enabling the unused pooling head.
 """
 
 import os
 
 import torch
+
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.bridge.models.conversion.param_mapping import (
     AutoMapping,
     ConcatenatedQKVMapping,
-    FusedExpertMapping,
-    FusedGatedExpertMapping,
     GatedMLPMapping,
     QKVMapping,
     ReplicatedMapping,
@@ -162,9 +158,8 @@ class LlavaOnevision2MoEBridge(MegatronModelBridge):
         # composite; recover the full composite (text_config + vision_config) from the source path.
         if not hasattr(hf_config, "vision_config"):
             from transformers import AutoConfig
-            hf_config = AutoConfig.from_pretrained(
-                hf_pretrained.model_name_or_path, trust_remote_code=True
-            )
+
+            hf_config = AutoConfig.from_pretrained(hf_pretrained.model_name_or_path, trust_remote_code=True)
         text_config = hf_config.text_config
         vision_config = hf_config.vision_config
         is_qwen35 = _is_qwen35_text(text_config)
@@ -209,7 +204,9 @@ class LlavaOnevision2MoEBridge(MegatronModelBridge):
             provider.moe_aux_loss_coeff = 1e-3
             provider.moe_router_pre_softmax = False
             provider.moe_token_dispatcher_type = "alltoall"
-        provider.head_dim = getattr(text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads)
+        provider.head_dim = getattr(
+            text_config, "head_dim", text_config.hidden_size // text_config.num_attention_heads
+        )
 
         # --- OV2 vision-tower geometry (drives build_llava_ov2 in provide()) ---
         provider.vision_patch_size = getattr(vision_config, "patch_size", 16)
@@ -236,7 +233,9 @@ class LlavaOnevision2MoEBridge(MegatronModelBridge):
         # to a temp HF dir so that build dispatches to the qwen3_moe bridge and builds the CORRECT
         # (e.g. 48L/128-expert) LLM. No weights needed (load_weights=False structure build). ---
         try:
-            import json as _json, tempfile
+            import json as _json
+            import tempfile
+
             _td = tempfile.mkdtemp(prefix="ov2_text_llm_")
             _raw = text_config.to_dict()
             _raw.pop("auto_map", None)  # CRITICAL: strip auto_map so build_llava_ov2's
@@ -372,7 +371,9 @@ class LlavaOnevision2MoEBridge(MegatronModelBridge):
         mapping_list = []
         if is_moe:
             mapping_list.extend(
-                Qwen35MoEBridge._get_moe_lm_mappings(hf_prefix="model.language_model.", megatron_prefix="language_model.")
+                Qwen35MoEBridge._get_moe_lm_mappings(
+                    hf_prefix="model.language_model.", megatron_prefix="language_model."
+                )
             )
             _mtp_layers = int(getattr(text_config, "mtp_num_hidden_layers", 0) or 0)
             if _mtp_layers > 0 and os.environ.get("OV2_EXPORT_MTP", "1") == "1":
@@ -381,8 +382,19 @@ class LlavaOnevision2MoEBridge(MegatronModelBridge):
                 )
         else:
             mapping_list.extend(
-                Qwen35Bridge._get_dense_lm_mappings(hf_prefix="model.language_model.", megatron_prefix="language_model.")
+                Qwen35Bridge._get_dense_lm_mappings(
+                    hf_prefix="model.language_model.", megatron_prefix="language_model."
+                )
             )
-        mapping_list.extend(AutoMapping(megatron_param=m, hf_param=h) for m, h in _OV2_VISION_ADAPTER_PARAM_MAPPINGS.items())
+        mapping_list.extend(
+            AutoMapping(megatron_param=m, hf_param=h) for m, h in _OV2_VISION_ADAPTER_PARAM_MAPPINGS.items()
+        )
+        for suffix in ("weight", "bias"):
+            mapping_list.append(
+                AutoMapping(
+                    megatron_param=f"vision_model.decoder.final_layernorm.{suffix}",
+                    hf_param=f"model.visual.layernorm_post.{suffix}",
+                )
+            )
         mapping_list.extend(_ov2_vision_adapter_special_mappings())
         return MegatronMappingRegistry(*mapping_list)
