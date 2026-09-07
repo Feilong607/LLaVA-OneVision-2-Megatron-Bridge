@@ -203,6 +203,76 @@ if patch and merge:
             json.dump(j, open(p2, "w"), indent=2)
             print("==> fixup: %s (patch,merge,temporal) %s -> %s" % (name, before, (patch, merge, tps)))
 FIXJSON
+  # (d) Qwen3.5 backbone (text_config.model_type qwen3_5*): assets/contract the 30B path never needed. Everything
+  #     below is gated on that model_type, so qwen3_moe / qwen3 exports are byte-identical to before.
+  local _tmt
+  _tmt="$(python3 -c "import json;c=json.load(open('$D/config.json'));print((c.get('text_config') or {}).get('model_type',''))" 2>/dev/null || echo "")"
+  if [[ "$_tmt" == qwen3_5* ]]; then
+    echo "==> fixup: Qwen3.5 backbone ($_tmt) -- OV2 prompt template + composite-config contract"
+    # Golden template ALWAYS: the Qwen3.5-native template prepends '<think>\n' to every assistant turn (or an
+    # empty think block with enable_thinking=false) and omits the 'You are a helpful assistant.' system line;
+    # the OV2 energon encoder trained with neither. <think>/</think> are NON-special Qwen3.5 tokens, so they
+    # would also survive skip_special_tokens decoding into the scored answers.
+    cp -f "$HERE/hf_skeleton_fixes/chat_template.jinja" "$D/chat_template.jinja"
+    rm -f "$D/chat_template.json"
+    python3 - "$D" "$HERE/hf_skeleton_fixes/configuration_llava_onevision2_moe.py" <<'FIXQ35'
+import importlib.util, json, os, shutil, subprocess, sys
+d, vendored_cfg = sys.argv[1], sys.argv[2]
+def load(n):
+    p = os.path.join(d, n); return (json.load(open(p)) if os.path.isfile(p) else None), p
+def dump(o, p): json.dump(o, open(p, "w"), indent=2)
+def die(m): print("FATAL: fixup(qwen3_5): " + m, file=sys.stderr); sys.exit(1)
+tok, _ = load("tokenizer.json")
+tok or die("tokenizer.json missing -- the export must ship the Qwen3.5 tokenizer (CFG skeleton -> build_qwen35_hf_skeleton.py)")
+ids = {t["content"]: int(t["id"]) for t in tok.get("added_tokens", [])}
+want = {"image_token_id": "<|image_pad|>", "video_token_id": "<|video_pad|>",
+        "vision_start_token_id": "<|vision_start|>", "vision_end_token_id": "<|vision_end|>"}
+missing = [t for t in want.values() if t not in ids]
+missing and die("tokenizer.json lacks %s" % missing)
+# tokenizer_config.json: the embedded Qwen3.5 chat_template must not shadow chat_template.jinja
+tc, tcp = load("tokenizer_config.json")
+if tc is not None and "chat_template" in tc:
+    tc.pop("chat_template"); dump(tc, tcp); print("==> fixup(qwen3_5): tokenizer_config.json chat_template stripped (golden chat_template.jinja is authoritative)")
+# config.json: token ids == tokenizer, tie false, adapter out dim == text hidden
+c, cp_ = load("config.json"); changed = False
+for key, t in want.items():
+    if c.get(key) != ids[t]:
+        print("==> fixup(qwen3_5): config.%s %s -> %s (tokenizer %s)" % (key, c.get(key), ids[t], t)); c[key] = ids[t]; changed = True
+if c.get("tie_word_embeddings") is not False:
+    print("==> fixup(qwen3_5): tie_word_embeddings %s -> false (lm_head is a trained, untied tensor)" % c.get("tie_word_embeddings")); c["tie_word_embeddings"] = False; changed = True
+th, vo = c["text_config"].get("hidden_size"), (c.get("vision_config") or {}).get("out_hidden_size")
+th == vo or die("vision_config.out_hidden_size=%s != text_config.hidden_size=%s (adapter dim mismatch)" % (vo, th))
+rp = c["text_config"].get("rope_parameters") or c["text_config"].get("rope_scaling") or {}
+rp.get("mrope_section") or die("text_config has no rope_parameters.mrope_section (Qwen3.5 trains with interleaved mrope)")
+if changed: dump(c, cp_)
+# generation_config.json: Qwen3.5 eos/pad
+gc, gcp = load("generation_config.json"); gc = gc or {}
+im_end, eot = ids.get("<|im_end|>"), ids.get("<|endoftext|>")
+eos = gc.get("eos_token_id"); eos = eos if isinstance(eos, list) else ([eos] if eos is not None else [])
+if im_end is not None and (im_end not in eos or gc.get("pad_token_id") != eot):
+    gc["eos_token_id"] = [x for x in (im_end, eot) if x is not None]; gc["pad_token_id"] = eot; gc.setdefault("do_sample", False)
+    dump(gc, gcp); print("==> fixup(qwen3_5): generation_config.json eos=%s pad=%s" % (gc["eos_token_id"], eot))
+# configuration class must deserialize text_config as a REAL Qwen3.5 text config (a hardcoded Qwen3MoeConfig
+# silently coerces model_type -> qwen3_moe -> AutoModel builds a plain Qwen3-MoE -> GDN weights load as missing).
+code = ("import sys;from transformers import AutoConfig;c=AutoConfig.from_pretrained(sys.argv[1],trust_remote_code=True);"
+        "t=c.text_config;print(type(t).__name__, t.model_type, bool(getattr(t,'layer_types',None)))")
+def check():
+    r = subprocess.run([sys.executable, "-c", code, d], capture_output=True, text=True)
+    out = (r.stdout or "").strip(); ok = r.returncode == 0 and out.startswith("Qwen3_5") and " qwen3_5" in out and out.endswith("True")
+    return ok, (out or (r.stderr or "").strip()[-300:])
+try:
+    import transformers  # noqa
+except Exception as e:
+    print("==> fixup(qwen3_5): WARN transformers not importable here (%s); dispatch check skipped" % e); sys.exit(0)
+ok, info = check()
+print("==> fixup(qwen3_5): configuration dispatch check: %s (%s)" % ("PASS" if ok else "FAIL", info))
+if not ok:
+    shutil.copy2(vendored_cfg, os.path.join(d, os.path.basename(vendored_cfg)))
+    ok, info = check()
+    print("==> fixup(qwen3_5): installed vendored configuration_llava_onevision2_moe.py -> %s (%s)" % ("PASS" if ok else "FAIL", info))
+    ok or die("text_config still does not deserialize as Qwen3_5MoeTextConfig")
+FIXQ35
+  fi
 }
 
 do_export(){

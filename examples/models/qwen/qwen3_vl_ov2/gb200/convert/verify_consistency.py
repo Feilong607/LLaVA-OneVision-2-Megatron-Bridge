@@ -50,6 +50,17 @@ _SAMPLE_PATTERNS = [
     r"pre_mlp_layernorm",
     r"\badapter\b",
     r"vision",
+    # Qwen3.5 backbone families (GatedDeltaNet hybrid + shared experts + MTP). Absent from the 30B ckpt, so
+    # they add nothing there; on a qwen35 ckpt 'sample' would otherwise skip 30/40 layers' mixers entirely.
+    r"self_attention\.in_proj\.weight",
+    r"self_attention\.in_proj\.layer_norm_weight",
+    r"self_attention\.conv1d\.weight",
+    r"self_attention\.A_log",
+    r"self_attention\.dt_bias",
+    r"self_attention\.out_norm\.weight",
+    r"self_attention\.out_proj\.weight",
+    r"mlp\.shared_experts\.",
+    r"\bmtp\.",
 ]
 
 

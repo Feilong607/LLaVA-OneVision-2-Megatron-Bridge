@@ -13,9 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Export a trained OV2-30B-A3B torch_dist checkpoint to a complete HuggingFace VLM.
+# Export a trained OV2 torch_dist checkpoint (30B-A3B, or the Qwen3.5-35B-A3B line) to a complete HuggingFace VLM.
 # This is the GB200 launch wrapper; convert.sh remains the backend because it performs
 # AutoBridge export, tokenizer/processor copying, HF skeleton fixups, and optional roundtrip verification.
+#
+# CFG is the dispatch skeleton whose config.json / tokenizer / processor / remote-code files END UP IN THE EXPORT
+# (the bridge conforms the exported config to it). The default is the 30B skeleton. For a Qwen3.5 checkpoint pass
+# CFG=<dir built by examples/models/qwen/qwen35_vl_ov2/convert/build_qwen35_hf_skeleton.py> (text_config
+# qwen3_5_moe_text, image_token_id 248056, mrope_section) -- with the 30B skeleton the export would describe a
+# Qwen3-MoE over Qwen3.5 weights and load with 30/40 layers random. Also use VERIFY=0 for Qwen3.5 until the
+# HF->mcore roundtrip is validated on that backbone, and run it in an image that has `fla` (the mcore GDN layer
+# imports it at construction).
 
 set -euo pipefail
 

@@ -851,6 +851,10 @@ class LlavaOnevision2PreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn = True
     _supports_sdpa = True
+    # Qwen3.5 backbone exports carry the trained MTP head as top-level `mtp.*` (the Qwen3.5-native HF layout,
+    # which HF's own Qwen3_5Moe classes ignore with this same pattern). Inference never instantiates MTP, so
+    # silence the unexpected-key noise; the 30B/4B exports have no such keys -> no-op there.
+    _keys_to_ignore_on_load_unexpected = [r"^mtp\."]
 
     def _init_weights(self, module):
         super()._init_weights(module)
@@ -1307,6 +1311,187 @@ class LlavaOnevision2VisionPretrainedModel(LlavaOnevision2PreTrainedModel):
         return output
 
 
+# ---------------------------------------------------------------------------
+# M-RoPE (Qwen3.5 backbone) -- position ids for the composite.
+#
+# The 30B / 4B OV2 lines (qwen3_moe / qwen3 text models) train and infer with plain 1D RoPE, so the
+# composite historically handed the text model 1D position_ids. The Qwen3.5 line trains with
+# interleaved multimodal RoPE: image tokens get 2D-grid (h, w) positions per vision run via
+# get_rope_index (LLaVA-OneVision-2-Megatron-Bridge: src/megatron/bridge/models/qwen_vl_ov2/llava_ov2.py,
+# `_grid_rows_per_vision_run` + qwen_vl/modelling_qwen3_vl/rope.py `get_rope_index`). HF's Qwen3.5 text model
+# accepts [3|4, b, s] positions and, when given a 2D tensor, silently expands it to identical t/h/w -- i.e.
+# plain 1D rope on image tokens. Text-only probes cannot see that (t==h==w on text), so the composite must
+# build the 3D positions itself. Everything below is gated on the text config declaring mrope_section, so the
+# 30B / 4B path stays byte-identical. Ported verbatim (torch-only) from the training-side code.
+# ---------------------------------------------------------------------------
+def _ov2_mrope_section(text_config):
+    """mrope_section of the inner text config (transformers 5.x `rope_parameters`, legacy `rope_scaling`), else None."""
+    for name in ("rope_parameters", "rope_scaling"):
+        rp = getattr(text_config, name, None)
+        if rp is None:
+            continue
+        ms = rp.get("mrope_section") if isinstance(rp, dict) else getattr(rp, "mrope_section", None)
+        if ms:
+            return list(ms)
+    return None
+
+
+def _ov2_grid_rows_per_vision_run(input_ids, image_grid_thw, merge, image_token_id, vision_start_token_id):
+    """AIAK/lmms-eval frame-chunked video grid -> Qwen3.5-native per-run grid rows for get_rope_index.
+
+    The OV2 encoder (and the lmms-eval chat wrapper) emit ONE collapsed grid row [F,H,W] per video but F
+    per-frame ``<|vision_start|>..<|vision_end|>`` runs in the token stream (text timestamps carry time).
+    get_rope_index implements the Qwen3.5-native convention -- one grid row PER run, "llm_grid_t is always
+    1" -- so feeding it the collapsed row makes it treat the first per-frame run as the whole video and the
+    next ``.index(image_token_id, st)`` dies with "not in list". Walk the vision runs in token order, split
+    every grid row across the runs it covers, and emit one ``[t_k, h, w]`` row per run with
+    ``t_k = run_len / (h*w//merge^2)``. Image rows (t==1) reproduce themselves exactly (image-only batches
+    are a no-op). Raises ValueError with both sides of the bookkeeping when runs and grid disagree.
+    """
+    if image_grid_thw is None or image_grid_thw.numel() == 0:
+        return image_grid_thw
+    if bool((image_grid_thw[:, 0] <= 1).all()):
+        return image_grid_thw  # image-only: already one run per row
+    msq = merge * merge
+    run_lens = []
+    for row in input_ids.tolist():
+        n, i = len(row), 0
+        while i < n:
+            if row[i] == vision_start_token_id:
+                j = i + 1
+                while j < n and row[j] == image_token_id:
+                    j += 1
+                run_lens.append(j - i - 1)
+                i = j
+            else:
+                i += 1
+    rows, r = [], 0
+    for g in image_grid_thw:
+        t, h, w = int(g[0]), int(g[1]), int(g[2])
+        per_t = (h * w) // msq  # merged tokens per single-frame chunk
+        budget = t * per_t
+        while budget > 0:
+            if r >= len(run_lens) or run_lens[r] % per_t != 0 or run_lens[r] > budget:
+                raise ValueError(
+                    f"OV2 mrope grid/run mismatch: grid row {g.tolist()} (budget {t}x{per_t}) vs "
+                    f"vision run lengths {run_lens} at run#{r} -- encoder/packing inconsistency"
+                )
+            rows.append([run_lens[r] // per_t, h, w])
+            budget -= run_lens[r]
+            r += 1
+    if r != len(run_lens):
+        raise ValueError(f"OV2 mrope grid/run mismatch: {len(run_lens)} vision runs but grid rows cover only {r}")
+    return torch.tensor(rows, dtype=image_grid_thw.dtype, device=image_grid_thw.device)
+
+
+def _ov2_get_rope_index(
+    spatial_merge_size,
+    image_token_id,
+    video_token_id,
+    vision_start_token_id,
+    input_ids,
+    image_grid_thw=None,
+    video_grid_thw=None,
+    attention_mask=None,
+):
+    """Qwen3-VL-style 3D rope index (timestamps carry time -> llm_grid_t == 1 per run).
+
+    Returns ``(position_ids [3, b, s], mrope_position_deltas [b, 1])``. Port of Megatron-Bridge
+    ``megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope.get_rope_index`` without the packed-sequence
+    branch (HF inference is never THD-packed).
+    """
+    if video_grid_thw is not None:
+        video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+        video_grid_thw[:, 0] = 1
+
+    mrope_position_deltas = []
+    if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+        total_input_ids = input_ids
+        if attention_mask is None:
+            attention_mask = torch.ones_like(total_input_ids)
+        elif attention_mask.dim() > 2:
+            attention_mask = attention_mask.any(dim=-1)
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.squeeze(1)
+            attention_mask = attention_mask.to(dtype=total_input_ids.dtype)
+        position_ids = torch.ones(
+            3, input_ids.shape[0], input_ids.shape[1], dtype=input_ids.dtype, device=input_ids.device
+        )
+        image_index, video_index = 0, 0
+        attention_mask = attention_mask.to(total_input_ids.device)
+        for i, sample_input_ids in enumerate(total_input_ids):
+            sample_input_ids = sample_input_ids[attention_mask[i] == 1]
+            vision_start_indices = torch.argwhere(sample_input_ids == vision_start_token_id).squeeze(1)
+            vision_tokens = sample_input_ids[vision_start_indices + 1]
+            image_nums = int((vision_tokens == image_token_id).sum())
+            video_nums = int((vision_tokens == video_token_id).sum())
+            input_tokens = sample_input_ids.tolist()
+            llm_pos_ids_list = []
+            st = 0
+            remain_images, remain_videos = image_nums, video_nums
+            for _ in range(image_nums + video_nums):
+                if image_token_id in input_tokens and remain_images > 0:
+                    ed_image = input_tokens.index(image_token_id, st)
+                else:
+                    ed_image = len(input_tokens) + 1
+                if video_token_id in input_tokens and remain_videos > 0:
+                    ed_video = input_tokens.index(video_token_id, st)
+                else:
+                    ed_video = len(input_tokens) + 1
+                if ed_image < ed_video:
+                    t, h, w = image_grid_thw[image_index][0], image_grid_thw[image_index][1], image_grid_thw[image_index][2]
+                    image_index += 1
+                    remain_images -= 1
+                    ed = ed_image
+                else:
+                    t, h, w = video_grid_thw[video_index][0], video_grid_thw[video_index][1], video_grid_thw[video_index][2]
+                    video_index += 1
+                    remain_videos -= 1
+                    ed = ed_video
+                llm_grid_t, llm_grid_h, llm_grid_w = (
+                    int(t),
+                    int(h) // spatial_merge_size,
+                    int(w) // spatial_merge_size,
+                )
+                text_len = ed - st
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                # t_index is always 0 because llm_grid_t is 1 per run (timestamps encode time for videos)
+                t_index = torch.arange(llm_grid_t).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten()
+                h_index = torch.arange(llm_grid_h).view(1, -1, 1).expand(llm_grid_t, -1, llm_grid_w).flatten()
+                w_index = torch.arange(llm_grid_w).view(1, 1, -1).expand(llm_grid_t, llm_grid_h, -1).flatten()
+                llm_pos_ids_list.append(torch.stack([t_index, h_index, w_index]) + text_len + st_idx)
+                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+        mrope_position_deltas = torch.tensor(mrope_position_deltas, device=total_input_ids.device).unsqueeze(1)
+        return position_ids, mrope_position_deltas
+
+    # no vision tokens: plain 1D positions replicated on the three axes
+    if attention_mask is not None:
+        if attention_mask.dim() > 2:
+            attention_mask = attention_mask.any(dim=-1)
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.squeeze(1)
+            attention_mask = attention_mask.to(dtype=torch.long)
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 1)
+        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
+        max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
+        mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+    else:
+        position_ids = (
+            torch.arange(input_ids.shape[1], device=input_ids.device).view(1, 1, -1).expand(3, input_ids.shape[0], -1)
+        )
+        mrope_position_deltas = torch.zeros([input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype)
+    return position_ids, mrope_position_deltas
+
+
 @auto_docstring
 class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
     base_model_prefix = ""
@@ -1320,6 +1505,10 @@ class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
         super().__init__(config)
         self.visual = LlavaOnevision2VisionPretrainedModel._from_config(config.vision_config)
         self.language_model = AutoModel.from_config(config.text_config)
+        # Qwen3.5 backbone -> interleaved M-RoPE: the composite builds [text; t; h; w] positions itself (see the
+        # M-RoPE helpers above). None for qwen3 / qwen3_moe text models -> the 1D path below, unchanged.
+        self._ov2_mrope_section = _ov2_mrope_section(config.text_config)
+        self.rope_deltas = None  # [b, 1] from the prefill's get_rope_index; consumed on decode steps
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1425,6 +1614,72 @@ class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
                 f"got {pixel_values.shape if hasattr(pixel_values, 'shape') else type(pixel_values)}"
             )
 
+    def _ov2_mrope_position_ids(
+        self,
+        input_ids,
+        inputs_embeds,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        cache_position,
+        image_grid_thw,
+        video_grid_thw,
+    ):
+        """[4, b, s] positions for a Qwen3.5 text model: row 0 = 1D text positions (causal mask / cache
+        bookkeeping), rows 1-3 = (t, h, w) M-RoPE. Prefill computes the 3D positions from input_ids +
+        image_grid_thw (per-run grid rows, see _ov2_grid_rows_per_vision_run) and caches rope_deltas; decode
+        steps add rope_deltas to the running 1D position, mirroring HF's Qwen3.5-VL. A caller that already
+        passes 3- or 4-row positions is trusted."""
+        if position_ids is not None and position_ids.dim() == 3 and position_ids.shape[0] in (3, 4):
+            return position_ids
+        batch_size, seq_length = inputs_embeds.shape[:2]
+        device = inputs_embeds.device
+        if past_key_values is not None:
+            past_len = int(past_key_values.get_seq_length())
+        elif cache_position is not None:
+            past_len = int(cache_position[0])
+        else:
+            past_len = 0
+        mask_2d = attention_mask if (attention_mask is not None and attention_mask.dim() == 2) else None
+
+        # row 0: 1D text positions (what the composite always fed the text model before)
+        if position_ids is not None and position_ids.dim() == 2:
+            text_pos = position_ids.long()
+        elif mask_2d is not None and mask_2d.shape[-1] == seq_length and past_len == 0:
+            text_pos = mask_2d.long().cumsum(-1) - 1
+            text_pos.masked_fill_(mask_2d == 0, 1)
+        else:
+            text_pos = torch.arange(past_len, past_len + seq_length, device=device).unsqueeze(0).expand(batch_size, -1)
+        text_pos = text_pos.to(device)
+
+        if past_len == 0 and input_ids is not None:
+            merge = int(self.visual.spatial_merge_size)
+            grid = image_grid_thw
+            if grid is not None and grid.numel() > 0:
+                grid = _ov2_grid_rows_per_vision_run(
+                    input_ids, grid, merge, self.config.image_token_id, self.config.vision_start_token_id
+                )
+            mrope_pos, deltas = _ov2_get_rope_index(
+                merge,
+                self.config.image_token_id,
+                self.config.video_token_id,
+                self.config.vision_start_token_id,
+                input_ids,
+                image_grid_thw=grid,
+                video_grid_thw=video_grid_thw,
+                attention_mask=(mask_2d if (mask_2d is not None and mask_2d.shape[-1] == seq_length) else None),
+            )
+            self.rope_deltas = deltas.to(device)
+            mrope_pos = mrope_pos.to(device=device, dtype=torch.long)
+        else:
+            deltas = self.rope_deltas
+            if deltas is None or past_len == 0:
+                deltas = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+            elif deltas.shape[0] != batch_size:
+                deltas = deltas.repeat_interleave(batch_size // deltas.shape[0], dim=0)  # beam expansion
+            mrope_pos = (text_pos + deltas.to(device=device, dtype=torch.long)).unsqueeze(0).expand(3, -1, -1)
+        return torch.cat([text_pos.unsqueeze(0), mrope_pos], dim=0)
+
     def get_placeholder_mask(
         self,
         input_ids: torch.LongTensor,
@@ -1527,8 +1782,22 @@ class LlavaOnevision2Model(LlavaOnevision2PreTrainedModel):
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        # Use simple 1D position_ids
-        if position_ids is None:
+        if self._ov2_mrope_section is not None:
+            # Qwen3.5 backbone: 3D (t, h, w) M-RoPE positions exactly as trained; a 2D position_ids handed in by
+            # GenerationMixin is only used as the text/mask row (HF's text model would otherwise expand it to
+            # identical t/h/w = 1D rope on image tokens).
+            position_ids = self._ov2_mrope_position_ids(
+                input_ids,
+                inputs_embeds,
+                attention_mask,
+                position_ids,
+                past_key_values,
+                cache_position,
+                image_grid_thw,
+                video_grid_thw,
+            )
+        elif position_ids is None:
+            # Use simple 1D position_ids (qwen3 / qwen3_moe backbones -- unchanged)
             batch_size, seq_length, _ = inputs_embeds.shape
             if attention_mask is not None:
                 position_ids = attention_mask.long().cumsum(-1) - 1
