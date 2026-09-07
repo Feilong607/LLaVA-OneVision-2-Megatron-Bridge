@@ -141,4 +141,38 @@ if str(_export_config.text_config.model_type).startswith("qwen3_5"):
 log("save_hf_pretrained -> " + HF)
 bridge.save_hf_pretrained(model, HF)
 dist.barrier()
+
+# Stamp how this export was produced, next to the weights. verify_export_parity.py compares two exports
+# of one checkpoint and must know that they really came from DIFFERENT expert-parallel layouts and from
+# the SAME source checkpoint -- a hand-passed --label-* proves nothing, and comparing a directory with
+# itself would otherwise "pass". Written by rank 0 after the barrier, so it only exists on a completed
+# save. Pure metadata: no HF loader or eval check reads it, so the 30B path is behaviourally unchanged.
+if dist.get_rank() == 0:
+    import json as _json
+    from datetime import datetime, timezone
+
+    _src = os.path.abspath(CKPT.rstrip("/"))
+    _digits = "".join(ch for ch in os.path.basename(_src) if ch.isdigit())
+    _iteration = int(_digits) if _digits and os.path.basename(_src).startswith("iter_") else None
+    if _iteration is None:
+        _tracker = os.path.join(_src, "latest_checkpointed_iteration.txt")
+        if os.path.isfile(_tracker):
+            with open(_tracker) as _fh:
+                _raw = _fh.read().strip()
+            _iteration = int(_raw) if _raw.isdigit() else None
+    with open(os.path.join(HF, "export_provenance.json"), "w") as _fh:
+        _json.dump(
+            {
+                "expert_parallel_size": EP,
+                "world_size": WORLD,
+                "source_checkpoint": _src,
+                "iteration": _iteration,
+                "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "config_skeleton": os.path.abspath(CFG),
+            },
+            _fh,
+            indent=2,
+        )
+    log(f"provenance stamped: ep={EP} iter={_iteration} src={_src}")
+dist.barrier()
 log("EP export DONE")
