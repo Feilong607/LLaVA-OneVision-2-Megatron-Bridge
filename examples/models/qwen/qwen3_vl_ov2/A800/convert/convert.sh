@@ -162,8 +162,16 @@ do_export(){
   echo "==> [$PLAT] export: mcore $CKPTA_DEF -> HF $HF_OUT   (cfg=$CFG_RDY)"
   CFG="$CFG_RDY" CKPTA="$CKPTA_DEF" HF="$HF_OUT" dist "$HERE/ov2_30b_export_ep8.py"
   echo "==> [$PLAT] copy custom .py + tokenizer/processor aux into HF (save_hf_pretrained can't auto-copy from a local source)"
+  local _export_tmt
+  _export_tmt="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("text_config",{}).get("model_type",""))' "$CFG_RDY/config.json")"
   for f in "$CFG_RDY"/*.py "$CFG_RDY"/tokenizer* "$CFG_RDY"/*token* "$CFG_RDY"/*preprocessor* "$CFG_RDY"/generation_config.json "$CFG_RDY"/vocab.json "$CFG_RDY"/merges.txt "$CFG_RDY"/chat_template.jinja "$CFG_RDY"/added_tokens.json; do
-    [ -f "$f" ] && cp -n "$f" "$HF_OUT/" 2>/dev/null || true
+    if [[ "$_export_tmt" == qwen3_5* ]]; then
+      # A retry must use the current skeleton, not stale tokenizer/config code.
+      # Propagate copy failures so completion cannot be reported on partial assets.
+      if [[ -f "$f" ]]; then cp -f "$f" "$HF_OUT/"; fi
+    else
+      [ -f "$f" ] && cp -n "$f" "$HF_OUT/" 2>/dev/null || true
+    fi
   done
   # The p16m33 auto_model skeleton config WRONGLY ships use_patch_position_encoding:true, but the trained
   # mcore ckpt has ZERO adapter.pos_emb_* keys (never trained with -pos; no AIAK script ever passed it;

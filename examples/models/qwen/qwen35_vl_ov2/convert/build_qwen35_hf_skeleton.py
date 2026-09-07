@@ -242,6 +242,7 @@ def build(args: argparse.Namespace) -> str:
     cfg["architectures"] = ["LlavaOnevision2ForConditionalGeneration"]
     cfg["auto_map"] = dict(cfg["auto_map"])
     cfg["auto_map"]["AutoConfig"] = "configuration_llava_onevision2_moe.LlavaOnevision2MoeConfig"
+    cfg["auto_map"]["AutoModelForCausalLM"] = "modeling_llava_onevision2_moe.LlavaOnevision2ForConditionalGeneration"
     cfg["text_config"] = text_config
     cfg["vision_config"] = vision_config
     cfg.update(tok_ids)

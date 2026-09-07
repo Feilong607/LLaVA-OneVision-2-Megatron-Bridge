@@ -25,7 +25,10 @@ def skeleton(tmp_path):
         shutil.copy(golden / name, tmp_path / name)
     config = {
         "model_type": "llava_onevision2_moe",
-        "auto_map": {"AutoConfig": "configuration_llava_onevision2_moe.LlavaOnevision2MoeConfig"},
+        "auto_map": {
+            "AutoConfig": "configuration_llava_onevision2_moe.LlavaOnevision2MoeConfig",
+            "AutoModelForCausalLM": "modeling_llava_onevision2_moe.LlavaOnevision2ForConditionalGeneration",
+        },
         "image_token_id": 248056,
         "tie_word_embeddings": False,
         "text_config": {
@@ -336,3 +339,99 @@ def test_export_norm_guard_handles_precision_wrappers(wrapper_depth, damage):
         assert namespace["_adapter"] is inner.adapter
     assert namespace["model"] is model
     assert model[0] is wrapped  # Save still receives the original precision wrapper.
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad_config", [False, True])
+def test_config_preflight_reports_all_norm_errors_before_weights(skeleton, bad_config):
+    config_path = skeleton / "config.json"
+    config = json.loads(config_path.read_text())
+    config["architectures"] = ["LlavaOnevision2ForConditionalGeneration"]
+    config["text_config"]["mtp_num_hidden_layers"] = 1
+    config["vision_config"].update(
+        use_post_layernorm=True,
+        use_head=False,
+        zero_centered_gamma=True,
+        merger_zero_centered_gamma=True,
+        layer_norm_type="layer_norm",
+        layer_norm_eps=1e-5,
+        post_layernorm_eps=1e-5,
+        pre_layernorm_eps=1e-4,
+        merger_layernorm_eps=1e-6,
+    )
+    if bad_config:
+        config["vision_config"].update(zero_centered_gamma=False, pre_layernorm_eps=1e-6)
+    config_path.write_text(json.dumps(config))
+    if bad_config:
+        with pytest.raises(ValueError) as error:
+            validator.check_export_config(skeleton, require_mtp=True)
+        assert "zero_centered_gamma" in str(error.value)
+        assert "pre_layernorm_eps" in str(error.value)
+    else:
+        validator.check_export_config(skeleton, require_mtp=True)
+        assert validator.expected_shapes(skeleton)
+    assert not list(skeleton.glob("*.safetensors"))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("hardware", ["gb200", "A800"])
+@pytest.mark.parametrize("copy_fails", [False, True])
+def test_export_refreshes_aux_files_and_propagates_copy_failure(tmp_path, hardware, copy_fails):
+    import os
+    import subprocess
+
+    source = ROOT / f"examples/models/qwen/qwen3_vl_ov2/{hardware}/convert/convert.sh"
+    text = source.read_text()
+    start = text.index("  local _export_tmt", text.index("do_export(){"))
+    end = text.index("  # The p16m33", start)
+    copy_block = text[start:end]
+    cfg = tmp_path / "cfg"
+    out = tmp_path / "out"
+    cfg.mkdir()
+    out.mkdir()
+    (cfg / "config.json").write_text(json.dumps({"text_config": {"model_type": "qwen3_5_moe_text"}}))
+    for name in ["configuration_llava_onevision2_moe.py", "tokenizer.json", "preprocessor_config.json"]:
+        (cfg / name).write_text("current")
+        (out / name).write_text("stale")
+    script = "set -euo pipefail\n"
+    if copy_fails:
+        script += "cp() { return 37; }\n"
+    script += "copy_assets() {\n" + copy_block + "}\ncopy_assets\necho COPY_COMPLETE\n"
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={**os.environ, "CFG_RDY": str(cfg), "HF_OUT": str(out)},
+        capture_output=True,
+        text=True,
+    )
+    if copy_fails:
+        assert result.returncode == 37
+        assert "COPY_COMPLETE" not in result.stdout
+    else:
+        assert result.returncode == 0, result.stderr
+        for name in ["configuration_llava_onevision2_moe.py", "tokenizer.json", "preprocessor_config.json"]:
+            assert (out / name).read_text() == "current"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "reference", [None, "external/repo--modeling_llava_onevision2_moe.LlavaOnevision2ForConditionalGeneration"]
+)
+def test_actual_hf_auto_dispatch_is_required(skeleton, reference):
+    path = skeleton / "config.json"
+    config = json.loads(path.read_text())
+    if reference is None:
+        config["auto_map"].pop("AutoModelForCausalLM")
+    else:
+        config["auto_map"]["AutoModelForCausalLM"] = reference
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="AutoModelForCausalLM"):
+        validator.expected_shapes(skeleton)
+
+
+@pytest.mark.unit
+def test_monolithic_and_sharded_weights_cannot_coexist(tmp_path):
+    save_file({"correct": torch.zeros(2)}, tmp_path / "part.safetensors")
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {"correct": "part.safetensors"}}))
+    save_file({"stale": torch.ones(2)}, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match="Ambiguous HF weights"):
+        validator.tensor_inventory(tmp_path)
