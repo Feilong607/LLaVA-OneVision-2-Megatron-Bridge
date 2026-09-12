@@ -27,6 +27,7 @@ LOG_EVERY="${LOG_EVERY:-1}"; SAVE_EVERY="${SAVE_EVERY:-2000}"
 NPROC="${NPROC:-4}"   # GB200 = 4 GPU/node
 TP="${TP:-1}"         # 1 = the 2-node/8-GPU bring-up MINIMUM (DP must reach EP=8). The production wrapper
                       # sets 2; TP=1 vs TP=2 steady-state throughput is UNMEASURED (smoke ab-tp1 pending).
+ETP="${OV2_ETP:-$TP}"  # Default unchanged; explicit ETP=2 enables the 48-GPU TP4/EP8 test topology.
 if [[ "$TP" -gt 1 ]]; then SP=true; else SP=false; fi
 # seed85m packed length. NB: packed with the Qwen2.5-VL tokenizer -> under 3.5 (248056) some packs
 # exceed seq_length and get SkipSample'd; check the dropped-pack rate before a long run.
@@ -121,8 +122,10 @@ WORLD=$(( NPROC * NNODES ))
 (( WORLD % TP == 0 )) || { echo "[ov2-qwen35] FATAL: WORLD=$WORLD must be divisible by TP=$TP." >&2; exit 1; }
 DP=$(( WORLD / TP ))
 (( MIDTRAIN_GBS % DP == 0 )) || { echo "[ov2-qwen35] FATAL: DP=$DP does not divide GBS=$MIDTRAIN_GBS; adjust TP/NNODES or OV2_MIDTRAIN_GBS." >&2; exit 1; }
-# EP=8 fixed in the recipe.
-(( DP >= 8 && DP % 8 == 0 )) || { echo "[ov2-qwen35] FATAL: EP=8 needs DP=$DP to be a multiple of 8 (bring-up: 2 nodes x 4 GPU at TP=1 -> DP=8; production: 32 GPU at TP=2 -> DP=16)." >&2; exit 1; }
+# EP=8, PP=CP=1. Expert TP can differ from attention TP (MoE parallel folding).
+[[ "$ETP" =~ ^[1-9][0-9]*$ ]] && (( WORLD % (ETP * 8) == 0 )) || {
+  echo "[ov2-qwen35] FATAL: WORLD=$WORLD must be divisible by ETP=$ETP * EP=8 (OV2_ETP defaults to TP)." >&2; exit 1; }
+EXPERT_DP=$(( WORLD / (ETP * 8) ))
 # Length-aligned batching window = ONE iteration's worth of bins per rank (GBS/DP), so the sorter aligns
 # per-microbatch cost across ranks WITHOUT manufacturing alternating light/heavy iterations. Measured
 # 2026-09-04 (ab-tp1-hep: TP=1 -> 8 mb/rank under the old fixed window 16 = two iterations): iteration
@@ -204,9 +207,9 @@ if [[ "$FLEX_BACKEND" == "hybridep" ]]; then
   else
     [[ "$_hep_domain_override" =~ ^[0-9]+$ ]] && (( _hep_domain_override > 0 )) || {
       echo "[ov2-qwen35] FATAL: OV2_HYBRIDEP_NVLINK_DOMAIN_RANKS must be auto or a positive integer, got $_hep_domain_override" >&2; exit 1; }
-    _hep_group_ranks=$(( TP * 8 ))   # HybridEP communicates over TP x EP.
+    _hep_group_ranks=$(( ETP * 8 ))   # HybridEP communicates over expert TP x EP.
     (( _hep_group_ranks % _hep_domain_override == 0 )) || {
-      echo "[ov2-qwen35] FATAL: NVLink domain override=$_hep_domain_override must divide TPxEP=$_hep_group_ranks." >&2; exit 1; }
+      echo "[ov2-qwen35] FATAL: NVLink domain override=$_hep_domain_override must divide ETPxEP=$_hep_group_ranks." >&2; exit 1; }
     export NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN="$_hep_domain_override"
   fi
   export NVSHMEM_DISABLE_CUDA_VMM="${NVSHMEM_DISABLE_CUDA_VMM:-1}"   # nvshmem CUDA-VMM broken on this platform
@@ -244,6 +247,7 @@ OVERRIDES="dataset.path=$DATA_PATH"
 OVERRIDES="$OVERRIDES checkpoint.save=$SAVE checkpoint.load=$SAVE dataset.dataloader_save=$SAVE"
 OVERRIDES="$OVERRIDES checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS validation.eval_iters=0 logger.log_interval=$LOG_EVERY logger.timing_log_level=${OV2_TIMING_LOG_LEVEL:-2} train.micro_batch_size=1"   # packing REQUIRES mbs=1
 OVERRIDES="$OVERRIDES model.tensor_model_parallel_size=$TP model.sequence_parallel=$SP $MOE_CAPACITY_ARGS"
+[[ -n "${OV2_ETP:-}" ]] && OVERRIDES="$OVERRIDES model.expert_tensor_parallel_size=$ETP"
 OVERRIDES="$OVERRIDES model.moe_router_dtype=${OV2_ROUTER_DTYPE:-fp32}"   # 256-expert router stability
 OVERRIDES="$OVERRIDES scheduler.lr_warmup_iters=$WARMUP_ITERS"
 OVERRIDES="$OVERRIDES optimizer.lr=${OV2_LR:-1e-5} optimizer.min_lr=${OV2_MIN_LR:-1e-6}"
@@ -296,7 +300,7 @@ if [[ ("$RECIPE" == *midtrain* && "${OV2_MIDTRAIN_MUON:-0}" == "1") || ("$RECIPE
     exit 1
   fi
 fi
-echo "[ov2-qwen35-gb200] in-container | repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF mtp_scale=${OV2_MTP_LOSS_SCALE:-default} alloc=${PYTORCH_CUDA_ALLOC_CONF} offload=${OV2_OPT_OFFLOAD:-false} node_rank=$NODE_RANK nnodes=$NNODES"
+echo "[ov2-qwen35-gb200] in-container | repo=$REPO recipe=$RECIPE accel=$ACCEL mp=$MIXED_PRECISION flex=${OV2_FLEX_BACKEND:-alltoall} recompute_off=$DISABLE_RECOMPUTE recompute_full=$OV2_RECOMPUTE_FULL peak=${MFU_PEAK_TFLOPS}TF nproc=$NPROC world=$WORLD dp=$DP tp=$TP etp=$ETP expert_dp=$EXPERT_DP sp=$SP seq=$SEQ_LEN gbs=$MIDTRAIN_GBS iters=$ITERS warmup=$WARMUP_ITERS lr=${OV2_LR:-1e-5}->${OV2_MIN_LR:-1e-6} router_dtype=${OV2_ROUTER_DTYPE:-fp32} permute_fusion=$OV2_MOE_PERMUTE_FUSION aux_loss=$OV2_MOE_AUX_LOSS_COEFF mtp_scale=${OV2_MTP_LOSS_SCALE:-default} alloc=${PYTORCH_CUDA_ALLOC_CONF} offload=${OV2_OPT_OFFLOAD:-false} node_rank=$NODE_RANK nnodes=$NNODES"
 # shellcheck disable=SC2086
 python -m torch.distributed.run $RDZV --nproc_per_node="$NPROC" scripts/training/run_recipe.py \
   --recipe "$RECIPE" --dataset vlm-energon --step_func ov2_step \
