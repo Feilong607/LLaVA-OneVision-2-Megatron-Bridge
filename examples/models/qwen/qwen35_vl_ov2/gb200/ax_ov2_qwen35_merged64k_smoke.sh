@@ -9,9 +9,14 @@
 # iteration time, dropped-pack rate at the chosen SEQ_LEN, DP straggler spread,
 # and per-pod peak memory.
 #
-# Topology (NPROC=4/pod; EP=8 fixed; guards: WORLD%TP==0, DP%8==0, GBS%DP==0):
+# Topology (NPROC=4/pod; EP=8 fixed; guards: WORLD%TP==0, WORLD%(ETP*8)==0, GBS%DP==0; ETP defaults to TP):
+#   16 GPU = 4 pods  (Workers=3):  TP=4 needs OV2_ETP=2 -> DP=4, expert DP=1 | TP=2->DP=8 (ETP=2) | TP=1->DP=16
 #   32 GPU = 8 pods  (Workers=7):  TP=4->DP=8 (default) | TP=2->DP=16 | TP=1->DP=32
+#   48 GPU = 12 pods (Workers=11): TP=4 needs OV2_ETP=2 -> DP=12, expert DP=3 (same per-rank shard as 16 GPU)
 #   64 GPU = 16 pods (Workers=15): TP=4->DP=16          | TP=2->DP=32 | TP=1 needs GBS>=64
+# Per-rank memory and per-microbatch time do not depend on DP, so a 16-GPU TP4/ETP2 run measures
+# the 48-GPU TP4/ETP2 production shard (Muon state is sharded over DP, so 16 GPU reads ~3 GiB HIGHER
+# than 48 GPU: conservative). Match microbatches per rank with GBS = 4*DP to compare iteration time.
 #
 # Defaults deliberately conservative for the GDN+MTP hybrid:
 #   ACCEL=0 (bf16+alltoall; HybridEP/MXFP8 are UNVALIDATED on this backbone),
@@ -29,11 +34,14 @@
 # Blend: SMOKE-ONLY equal-weight yaml auto-generated over every
 # <pack>/<part>/webdataset under the stage-4 mount (95 expected). Real blend
 # weights are a recipe decision — do not reuse the generated yaml for a run.
+# DATA_PATH=<yaml> (absolute, or a basename resolved next to this script, e.g.
+# DATA_PATH=merged_s23_img30.yaml) skips the generator and smokes a real blend:
+# the SkipSample rate then reflects the weights that a launch would actually use.
 #
 # Workload form: Distributed/PyTorch, image feilong-nemo, gb200-nvl72-nodes,
 # Command bash (both sides), Args = this file's absolute path (both sides),
-# env OV2_K8S_NAMESPACE=runai-mv0004 (both sides). Optional env: TP, SEQ_LEN
-# (OV2_SEQ_LEN), GBS (OV2_MIDTRAIN_GBS), ACCEL, OV2_RECOMPUTE_FULL.
+# env OV2_K8S_NAMESPACE=runai-mv0004 (both sides). Optional env: TP, OV2_ETP, SEQ_LEN
+# (OV2_SEQ_LEN), GBS (OV2_MIDTRAIN_GBS), ACCEL, OV2_RECOMPUTE_FULL, DATA_PATH, OV2_MEM_PROBE.
 # =============================================================================
 set -euo pipefail
 
@@ -74,8 +82,20 @@ _pick() {  # _pick VAR file candidates...
 export OV2_LLM_HF_QWEN35 OV2_HF_PROC_QWEN35_P16M33
 [[ "$OV2_LLM_HF_QWEN35" == *"-text" ]] || echo "[qwen35-smoke] WARN: llm_hf=$OV2_LLM_HF_QWEN35 is not a '-text' extract; if the build dies routing the VLM config, run tools/extract_qwen35_text.py --weights first." | tee -a "$LOG" >&2
 
-# ── SMOKE-ONLY blend: every part of the stage-4 pool, equal weight ───────────
+# ── blend: DATA_PATH=<yaml> if given, else SMOKE-ONLY equal weight over the stage-4 pool ──
 mkdir -p "$SAVE_DIR"
+if [[ -n "${DATA_PATH:-}" ]]; then
+  [[ "$DATA_PATH" == */* ]] || DATA_PATH="$_SM_DIR/$DATA_PATH"
+  [[ -f "$DATA_PATH" ]] || _die "DATA_PATH not found: $DATA_PATH"
+  grep -q "__class__: Metadataset" "$DATA_PATH" || _die "DATA_PATH is not an energon Metadataset yaml: $DATA_PATH"
+  _SM_YAML="$DATA_PATH"
+  # Every dataset dir must be mounted in THIS pod: a missing mount surfaces from energon as a late,
+  # rank-local traceback, not as a preflight message.
+  grep -E '^\s*path:' "$_SM_YAML" | awk '{print $2}' | while read -r _d; do
+    [[ -d "$_d" ]] || _die "DATA_PATH dataset dir not mounted: $_d"
+  done
+  echo "[qwen35-smoke] blend: external yaml $_SM_YAML (weights as in the file)" | tee -a "$LOG"
+else
 _SM_YAML="$SAVE_DIR/smoke_blend_equal.yaml"
 {
   echo "# SMOKE-ONLY equal-weight blend over $_SM_POOL — real weights are a recipe decision."
@@ -88,12 +108,14 @@ _SM_YAML="$SAVE_DIR/smoke_blend_equal.yaml"
     printf '      - weight: 1\n        path: %s\n        subflavors: {augmentation: false}\n' "$d"
   done
 } > "$_SM_YAML"
-_n_ds="$(grep -c "path:" "$_SM_YAML" || true)"
-(( _n_ds > 0 )) || _die "no <pack>/<part>/webdataset dirs found under $_SM_POOL"
-echo "[qwen35-smoke] blend: $_n_ds datasets (expected 95) -> $_SM_YAML" | tee -a "$LOG"
+fi
+_n_ds="$(grep -cE '^\s*(- )?path:' "$_SM_YAML" || true)"
+(( _n_ds > 0 )) || _die "no datasets in blend $_SM_YAML"
+echo "[qwen35-smoke] blend: $_n_ds datasets -> $_SM_YAML" | tee -a "$LOG"
 
 # ── scale + knobs (see header) ────────────────────────────────────────────────
 export TP="${TP:-4}"
+[[ -z "${OV2_ETP:-}" ]] || export OV2_ETP   # read by the base launcher (WORLD % (ETP*8) guard)
 export OV2_SEQ_LEN="${OV2_SEQ_LEN:-${SEQ_LEN:-65536}}"
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-${GBS:-32}}"
 export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( OV2_MIDTRAIN_GBS * 20 ))}"  # -> 20 iters
@@ -128,7 +150,7 @@ export OV2_LENGTH_SORT_WINDOW="${OV2_LENGTH_SORT_WINDOW:-16}"
   done ) &
 _mon=$!
 
-echo "[qwen35-smoke] launch: tp=$TP seq=$OV2_SEQ_LEN gbs=$OV2_MIDTRAIN_GBS accel=$ACCEL recompute_full=$OV2_RECOMPUTE_FULL muon=$OV2_MIDTRAIN_MUON sort_window=$OV2_LENGTH_SORT_WINDOW init=$INIT_CKPT" | tee -a "$LOG"
+echo "[qwen35-smoke] launch: tp=$TP etp=${OV2_ETP:-$TP} seq=$OV2_SEQ_LEN gbs=$OV2_MIDTRAIN_GBS accel=$ACCEL recompute_full=$OV2_RECOMPUTE_FULL muon=$OV2_MIDTRAIN_MUON sort_window=$OV2_LENGTH_SORT_WINDOW init=$INIT_CKPT" | tee -a "$LOG"
 set +e
 bash "$_SM_BASE" 2>&1 | tee -a "$LOG"
 _rc=${PIPESTATUS[0]}
@@ -139,13 +161,13 @@ echo "[qwen35-smoke] rc=$_rc pod_peak_mem_mib=$_peak" | tee -a "$LOG"
 
 # ── verdict: written by the pod whose log carries iteration lines ────────────
 python3 - "$LOG" "$RESULT" "$_rc" "$_peak" "$TP" "$OV2_SEQ_LEN" "$OV2_MIDTRAIN_GBS" "$_n_ds" \
-          "$OV2_MIDTRAIN_MUON" "$OV2_LENGTH_SORT_WINDOW" <<'PYEOF'
+          "$OV2_MIDTRAIN_MUON" "$OV2_LENGTH_SORT_WINDOW" "${OV2_ETP:-$TP}" "$OV2_RECOMPUTE_FULL" "$_SM_YAML" <<'PYEOF'
 import os
 import re
 import statistics as st
 import sys
 
-log, result, rc, peak, tp, seq, gbs, n_ds, muon, sortw = sys.argv[1:11]
+log, result, rc, peak, tp, seq, gbs, n_ds, muon, sortw, etp, rfull, blend = sys.argv[1:14]
 text = open(log, errors="replace").read()
 sort_on = "length-sorted batching ON" in text
 its = [float(x) for x in re.findall(r"elapsed time per iteration \(ms\): ([\d.]+)", text)][3:]
@@ -153,10 +175,14 @@ tf = [float(x) for x in re.findall(r"TFLOP/s/GPU\)?: ([\d.]+)", text)][3:]
 fb = [(float(a), float(b)) for a, b in re.findall(r"forward-backward[ .]*:? *\(([\d.]+), ([\d.]+)\)", text)][3:]
 skips = sum(1 for ln in text.splitlines() if "exceed seq_length" in ln or "Skipping this pack" in ln)
 nans = len(re.findall(r"skipping batch|found NaN|nan detected", text, re.I))
+# OV2_MEM_PROBE lines (torch view; pod_peak_mem_mib is nvidia-smi = torch reserved + ~15 GiB non-torch).
+mx_alloc = [float(x) for x in re.findall(r"max_allocated=([\d.]+)G", text)]
+mx_res = [float(x) for x in re.findall(r"max_reserved=([\d.]+)G", text)]
 if not its and rc == "0":
     sys.exit(0)  # healthy waiter pod (iteration lines print on the last rank only)
 
-lines = [f"qwen35 merged-stage 64k smoke — TP={tp} seq={seq} gbs={gbs} datasets={n_ds} "
+lines = [f"qwen35 merged-stage 64k smoke — TP={tp} ETP={etp} seq={seq} gbs={gbs} recompute_full={rfull} "
+         f"datasets={n_ds} blend={os.path.basename(blend)} "
          f"muon={muon} sort_window={sortw} (engaged: {'yes' if sort_on else 'NO — check recipe log'})"]
 if its:
     s = sorted(its)
@@ -168,6 +194,11 @@ if fb:
     ratio = st.median(hi / lo for lo, hi in fb if lo > 0)
     lines.append(f"fb straggler spread (max/min across ranks) p50={ratio:.2f}")
 lines.append(f"pod_peak_mem_mib={peak} (per-pod; grep pod_peak ~/train_logs/smoke_qwen35_merged64k_*.log)")
+if mx_alloc:
+    lines.append(f"torch memory (this pod's ranks, GiB): max_allocated={max(mx_alloc):.1f} max_reserved={max(mx_res) if mx_res else 0:.1f} "
+                 f"(cap = OV2_CUDA_MEM_FRACTION x 184.0; 0.88 -> 161.9)")
+else:
+    lines.append("torch memory: no MEMPROBE lines — set OV2_MEM_PROBE=4 to get max_allocated (the number the DP-independent memory model uses)")
 lines.append(f"dropped packs (seq_length exceeded): {skips}")
 if skips:
     lines.append(f"SEQ VERDICT: {skips} packs skipped at seq={seq} — biased data loss; rerun with SEQ_LEN=73728 (30B stage-3 precedent) or repack.")
