@@ -200,7 +200,8 @@ if fb:
 lines.append(f"pod_peak_mem_mib={peak} (per-pod; grep pod_peak ~/train_logs/smoke_qwen35_merged64k_*.log)")
 if mx_alloc:
     lines.append(f"torch memory (this pod's ranks, GiB): max_allocated={max(mx_alloc):.1f} max_reserved={max(mx_res) if mx_res else 0:.1f} "
-                 f"(cap = OV2_CUDA_MEM_FRACTION x 184.0; 0.88 -> 161.9)")
+                 f"(cap = OV2_CUDA_MEM_FRACTION {os.environ.get('OV2_CUDA_MEM_FRACTION', 'unset')} x 184.0 = "
+                 f"{float(os.environ.get('OV2_CUDA_MEM_FRACTION') or 1.0) * 184.0:.1f} GiB)")
 else:
     lines.append("torch memory: no MEMPROBE lines — set OV2_MEM_PROBE=4 to get max_allocated (the number the DP-independent memory model uses)")
 lines.append(f"dropped packs (seq_length exceeded): {skips}")

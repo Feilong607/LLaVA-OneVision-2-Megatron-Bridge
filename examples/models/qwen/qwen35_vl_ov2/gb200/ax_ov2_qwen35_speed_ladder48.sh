@@ -56,7 +56,13 @@ _say() { echo "[speed-ladder] $*" | tee -a "$HOME/train_logs/smoke_speed_ladder_
 # ---- constants shared by all legs (validated 09-13; the launcher applies workers=2/buffer=16 at seq>=32768) ----
 export OV2_K8S_NAMESPACE=runai-mv0004
 export OV2_SEQ_LEN=73728   # ACCEL is per leg
-export OV2_MEM_PROBE=4 OV2_CUDA_MEM_FRACTION=0.88 OV2_LENGTH_SORT_WINDOW=4
+export OV2_MEM_PROBE=4 OV2_LENGTH_SORT_WINDOW=4
+# torch CUDA pool cap as a fraction of the 184 GiB device. 0.88 -> 161.9 GiB is the validated default (a clean torch
+# OOM instead of an NCCL death when over). 09-13 leg S (selective, no MTP) needed ~164 GiB = 2 GiB over that cap;
+# 0.92 -> 169.3 GiB is the retry value. ~15 GB of the device is non-torch (NCCL buffers, context), so 0.92 is the
+# ceiling: a value above it trades a torch OOM for an NCCL allocation failure. Override per launch, default unchanged.
+export OV2_CUDA_MEM_FRACTION="${OV2_CUDA_MEM_FRACTION:-0.88}"
+[[ "$OV2_CUDA_MEM_FRACTION" =~ ^0\.[5-9][0-9]?$ ]] || { echo "[speed-ladder] FATAL: OV2_CUDA_MEM_FRACTION must be 0.50-0.99, got '$OV2_CUDA_MEM_FRACTION'" >&2; exit 3; }
 export OV2_CE_FUSION="${OV2_CE_FUSION:-false}"   # see header: not a memory lever
 export OV2_MTP_LAYERS="${OV2_MTP_LAYERS:-0}"          # no MTP block/head = the §13 objective (set 1 to A/B the old build)
 export OV2_MIDTRAIN_MUON=1 OV2_LR=1e-5 OV2_MIN_LR=1e-6 OV2_MOE_AUX_LOSS_COEFF=0.01
@@ -126,7 +132,7 @@ _leg() {
   local name="$1" tp="$2" gbs="$3" accel="$4" r
   r="$(_result_of "$name")"
   _barrier "prepare_${name}"
-  _say "==== leg $name: TP=$tp ETP=2 GBS=$gbs ACCEL=$accel iters=$_ITERS full=$OV2_RECOMPUTE_FULL moe=$OV2_RECOMPUTE_MOE vision=$OV2_VISION_RECOMPUTE ce_fusion=$OV2_CE_FUSION mtp_layers=$OV2_MTP_LAYERS lr=$OV2_LR->$OV2_MIN_LR wd=.01 muon_extra=.15 beta2=.95 ===="
+  _say "==== leg $name: TP=$tp ETP=2 GBS=$gbs ACCEL=$accel iters=$_ITERS full=$OV2_RECOMPUTE_FULL moe=$OV2_RECOMPUTE_MOE vision=$OV2_VISION_RECOMPUTE ce_fusion=$OV2_CE_FUSION mtp_layers=$OV2_MTP_LAYERS mem_fraction=$OV2_CUDA_MEM_FRACTION lr=$OV2_LR->$OV2_MIN_LR wd=.01 muon_extra=.15 beta2=.95 ===="
   local smoke_rc raw_rc local_log
   OV2_SMOKE_LEG="$name" TP="$tp" OV2_ETP=2 OV2_MIDTRAIN_GBS="$gbs" GBS="$gbs" ACCEL="$accel" ITERS="$_ITERS" OV2_MIDTRAIN_N_SAMPLES=$(( gbs * _ITERS )) bash "$_L_SMOKE"
   smoke_rc=$?
@@ -198,7 +204,7 @@ _RC=0; for _l in $_LEGS; do _passed "$(_result_of "$_l")" || _RC=1; done
 if (( _L_IS_MASTER )); then
   _tmp="$_L_OUT.$$"
   {
-    echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS legs [$_LEGS] iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
+    echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS mem_fraction $OV2_CUDA_MEM_FRACTION legs [$_LEGS] iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
     echo "reference (09-13 memory smoke, WITH MTP, 20 iters, different LR-decay length): TP4 full recompute max_allocated 115.2 GiB, ~100 s/iter during warm-up"
     echo "optimizer: Muon spectral, lr=$OV2_LR->$OV2_MIN_LR, extra_scale=0.15, adam_beta2=0.95, optimizer/scheduler weight_decay=0.01; all components trainable"
     echo
