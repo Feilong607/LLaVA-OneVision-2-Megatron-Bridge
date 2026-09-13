@@ -4,7 +4,7 @@
 # =============================================================================
 # Qwen3.5-35B-A3B merged video stage (= the 30B line's s2+s3 with the data merged): 48-GPU production.
 #
-# Spec (BRINGUP §13): everything but the data matches the 30B video s2 production run
+# Spec (BRINGUP §13): objective and optimizer follow the 30B video s2 production run
 # (~/ckpts_video_sft/ov2_30b_a3b_stage2mix_v3_gbs32, run_config.yaml read 09-13):
 #   objective   LM + MoE-aux 0.01, NO MTP head (OV2_MTP_LAYERS=0 -> the block is not built; runtime check in llava_ov2)
 #   optimizer   Muon spectral, lr 1e-5 -> 1e-6 cosine, warmup 0.002 x iters, weight_decay 0.01 (optimizer AND
@@ -131,8 +131,10 @@ export OV2_HF_PROC_QWEN35_P16M33="${OV2_HF_PROC_QWEN35_P16M33:-$HOME/qwen35_p16m
 # ---- EXTRA_ARGS may not override anything this wrapper pins (it would pass the preflight and change the run) -------
 _USER_EXTRA="${EXTRA_ARGS:-}"
 for _tok in $_USER_EXTRA; do
-  case "$_tok" in
-    model.tensor_model_parallel_size=*|model.expert_tensor_parallel_size=*|model.expert_model_parallel_size=*|model.pipeline_model_parallel_size=*|model.context_parallel_size=*|model.seq_length=*|model.mtp_num_layers=*|model.freeze_*|train.*|optimizer.*|scheduler.*|dataset.*|checkpoint.*)
+  _key="${_tok%%=*}"
+  while [[ "$_key" == [+~]* ]]; do _key="${_key:1}"; done
+  case "$_key" in
+    model|model.*|train|train.*|optimizer|optimizer.*|scheduler|scheduler.*|dataset|dataset.*|checkpoint|checkpoint.*|dist|dist.*|ddp|ddp.*|mixed_precision|mixed_precision.*)
       _die "EXTRA_ARGS override of a pinned key is refused: '$_tok' (change the wrapper or start a new SAVE deliberately)";;
   esac
 done
@@ -206,10 +208,13 @@ PY
 fi
 
 # ---- launch fingerprint: stream-defining settings must match on resume; memory-only ones are logged ------------
+_STATE_HELPER="$_M48_DIR/merged48_state.py"
+[[ -f "$_STATE_HELPER" ]] || _die "missing state helper: $_STATE_HELPER"
+export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"
 _FP="$SAVE/ov2_launch_fingerprint.json"
 _yaml_sha="$( (shasum -a 256 "$DATA_PATH" 2>/dev/null || sha256sum "$DATA_PATH") | awk '{print $1}')"
 [[ "$_yaml_sha" =~ ^[0-9a-f]{64}$ ]] || _die "could not hash $DATA_PATH"
-_STREAM_FP="data_sha256=$_yaml_sha data_path=$DATA_PATH gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES iters=$_ITERS warmup=$_WARMUP seq=$OV2_SEQ_LEN tp=4 etp=2 ep=8 dp=12 mtp_layers=0 workers=${OV2_NUM_WORKERS:-2} buffer=${OV2_SHUFFLE_BUFFER:-16} sort_window=${OV2_LENGTH_SORT_WINDOW:-$MB_PER_RANK} sort_key=${OV2_LENGTH_SORT_KEY:-tokens} muon=1 lr=$OV2_LR min_lr=$OV2_MIN_LR wd=0.01 extra=0.15 beta2=0.95 aux=$OV2_MOE_AUX_LOSS_COEFF"
+_STREAM_FP="data_sha256=$_yaml_sha data_path=$DATA_PATH gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES iters=$_ITERS warmup=$_WARMUP seq=$OV2_SEQ_LEN tp=4 etp=2 ep=8 dp=12 mtp_layers=0 workers=${OV2_NUM_WORKERS:-2} buffer=${OV2_SHUFFLE_BUFFER:-16} sort_window=${OV2_LENGTH_SORT_WINDOW:-$MB_PER_RANK} sort_key=${OV2_LENGTH_SORT_KEY:-tokens} parallel_shard_iters=$OV2_PARALLEL_SHARD_ITERS muon=1 lr=$OV2_LR min_lr=$OV2_MIN_LR wd=0.01 extra=0.15 beta2=0.95 aux=$OV2_MOE_AUX_LOSS_COEFF"
 _MEM_FP="recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE mem_fraction=$OV2_CUDA_MEM_FRACTION accel=$ACCEL"
 if (( _RESUME_STEP > 0 )); then
   [[ -f "$_FP" ]] || _die "SAVE has checkpoints but no $_FP -- cannot prove the data stream/topology are unchanged; restore the fingerprint or start a new SAVE"
@@ -222,8 +227,8 @@ if (( _RESUME_STEP > 0 )); then
   [[ "$_old_mem" == "$_MEM_FP" ]] || _say "memory-only settings changed on resume (allowed): saved [$_old_mem] -> launch [$_MEM_FP]"
 elif [[ "${OV2_PREFLIGHT_ONLY:-0}" != 1 ]]; then
   mkdir -p "$SAVE"
-  python3 -c 'import json,sys,time; json.dump({"stream": sys.argv[2], "memory": sys.argv[3], "written": time.strftime("%Y-%m-%d %H:%M:%S")}, open(sys.argv[1], "w"), indent=1)' "$_FP" "$_STREAM_FP" "$_MEM_FP"
-  _say "fingerprint written: $_FP"
+  python3 "$_STATE_HELPER" fingerprint "$_FP" "$_STREAM_FP" "$_MEM_FP" || _die "fresh launch fingerprint conflict"
+  _say "fingerprint published/verified: $_FP"
 fi
 
 if (( _RESUME_STEP > 0 )); then
@@ -243,11 +248,9 @@ fi
 export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_scale_mode=spectral optimizer.muon_extra_scale_factor=0.15 optimizer.adam_beta2=0.95 optimizer.weight_decay=0.01 scheduler.start_weight_decay=0.01 scheduler.end_weight_decay=0.01 model.freeze_language_model=false model.freeze_vision_model=false model.freeze_adapter=false checkpoint.most_recent_k=${OV2_KEEP_CKPTS:-3} logger.log_throughput=${OV2_LOG_THROUGHPUT:-true} checkpoint.finetune=false checkpoint.load_optim=true checkpoint.load_rng=true scheduler.override_opt_param_scheduler=false scheduler.use_checkpoint_opt_param_scheduler=true"
 
 # ---- permanent archive every OV2_ARCHIVE_EVERY iters (master pod only; 0 disables) ------------------------------
-# mcore only knows most_recent_k. This background loop watches the tracker and, once a save at a multiple of
-# OV2_ARCHIVE_EVERY is complete (tracker step >= N, metadata + train_state present), hard-links it to
-# ${SAVE}_archive/iter_N (cp -al: zero extra space; rotation later unlinks the original names, the data stays).
-# Falls back to a real copy if hard links fail. Idempotent across restarts (skips archives that already exist).
-# Kept OUTSIDE $SAVE so mcore's iter_* rotation never sees it.
+# Publish archives atomically with the completion marker already inside. The helper verifies the
+# recursive file manifest, tries hard links per file, and falls back to copying into a unique temp dir.
+# Existing unmarked destinations are refused, never overwritten or treated as complete.
 export OV2_ARCHIVE_EVERY="${OV2_ARCHIVE_EVERY:-5000}"
 [[ "$OV2_ARCHIVE_EVERY" =~ ^[0-9]+$ ]] || _die "OV2_ARCHIVE_EVERY must be an integer (0 disables)"
 if (( OV2_ARCHIVE_EVERY > 0 )) && [[ "$(hostname)" == *-master-0 && "${OV2_PREFLIGHT_ONLY:-0}" != 1 ]]; then
@@ -273,14 +276,10 @@ PY2
       for (( _n=OV2_ARCHIVE_EVERY; _n<=_step; _n+=OV2_ARCHIVE_EVERY )); do
         _src="$SAVE/$(printf 'iter_%07d' "$_n")"; _dst="$_ARCHIVE/$(printf 'iter_%07d' "$_n")"
         [[ -d "$_src" && -f "$_src/train_state.pt" && ( -f "$_src/.metadata" || -f "$_src/metadata.json" ) ]] || continue
-        [[ -f "$_dst/.archived" ]] && continue
-        rm -rf "$_dst.tmp"
-        if cp -al "$_src" "$_dst.tmp" 2>/dev/null || cp -a "$_src" "$_dst.tmp"; then
-          if [[ "$(ls "$_src" | wc -l)" == "$(ls "$_dst.tmp" | wc -l)" ]]; then
-            mv "$_dst.tmp" "$_dst" && date '+%F %T' > "$_dst/.archived" && echo "[qwen35-merged48] archived $_src -> $_dst" >> "$LOG"
-          else
-            echo "[qwen35-merged48] WARN: archive of $_src incomplete, will retry" >> "$LOG"; rm -rf "$_dst.tmp"
-          fi
+        if python3 "$_STATE_HELPER" archive "$_src" "$_dst" --dp "$DP"; then
+          :
+        else
+          echo "[qwen35-merged48] WARN: archive of $_src failed; original retained until normal rotation, inspect archiver error" >> "$LOG"
         fi
       done
     done ) &
