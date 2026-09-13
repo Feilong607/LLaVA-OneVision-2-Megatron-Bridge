@@ -73,6 +73,24 @@ export DATA_PATH=stage3_img38_video62_maveric.yaml
 export OV2_LLM_HF_QWEN35="${OV2_LLM_HF_QWEN35:-$HOME/Qwen3.5-35B-A3B-text}"
 export OV2_HF_PROC_QWEN35_P16M33="${OV2_HF_PROC_QWEN35_P16M33:-$HOME/qwen35_p16m33_auto_model}"
 _ITERS="${OV2_LADDER_ITERS:-80}"
+# OV2_LADDER_NCCL_TRACE=1: arm torch's NCCL flight recorder for a hang hunt (09-13 leg T: TP2/ETP2 alltoall at
+# 73728 completed fwd/bwd on the observed pod, then every rank sat at 0% in a collective with no traceback).
+# Each rank keeps a ring buffer of its last collectives; when the process-group watchdog hits the (shortened)
+# timeout it dumps <TORCH_NCCL_DEBUG_INFO_TEMP_FILE><rank> for every rank and aborts -> compare the 48 dumps
+# for the collective that some ranks issued and others did not (seq number / group / op). Read with
+#   torchfrtrace -d ~/train_logs/nccl_trace_<job>/   (torch>=2.5; else python -m torch.distributed.flight_recorder.fr_trace)
+# Default off: production numerics/timing untouched. Only meaningful with a single leg (OV2_LADDER_LEGS=T).
+export OV2_LADDER_NCCL_TRACE="${OV2_LADDER_NCCL_TRACE:-0}"
+if [[ "$OV2_LADDER_NCCL_TRACE" == 1 ]]; then
+  _NCCL_TRACE_DIR="${OV2_LADDER_NCCL_TRACE_DIR:-$HOME/train_logs/nccl_trace_${_L_TAG}}"
+  mkdir -p "$_NCCL_TRACE_DIR"
+  export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}"   # collectives kept per rank
+  export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+  export TORCH_NCCL_ENABLE_TIMING=1                                              # per-collective start/end stamps
+  export TORCH_NCCL_DEBUG_INFO_TEMP_FILE="${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:-$_NCCL_TRACE_DIR/rank_}"
+  export OV2_DIST_TIMEOUT_MIN="${OV2_DIST_TIMEOUT_MIN:-15}"                       # dump after 15 min, not 60
+  export OV2_NCCL_DEBUG="${OV2_NCCL_DEBUG:-INFO}"                                 # communicator creation lines in the pod logs
+fi
 # OV2_LADDER_LEGS: which legs to run, in order (default all three). e.g. "S T" skips the no-MTP full-recompute
 # baseline when the with-MTP A number is already on file (09-13: 0.726 samples/s at 80 iters). Pass it through
 # the workload as  Command=env  Args="OV2_LADDER_LEGS=S,T bash <this file>"  (use commas: the Args field is
@@ -132,7 +150,7 @@ _leg() {
   local name="$1" tp="$2" gbs="$3" accel="$4" r
   r="$(_result_of "$name")"
   _barrier "prepare_${name}"
-  _say "==== leg $name: TP=$tp ETP=2 GBS=$gbs ACCEL=$accel iters=$_ITERS full=$OV2_RECOMPUTE_FULL moe=$OV2_RECOMPUTE_MOE vision=$OV2_VISION_RECOMPUTE ce_fusion=$OV2_CE_FUSION mtp_layers=$OV2_MTP_LAYERS mem_fraction=$OV2_CUDA_MEM_FRACTION lr=$OV2_LR->$OV2_MIN_LR wd=.01 muon_extra=.15 beta2=.95 ===="
+  _say "==== leg $name: TP=$tp ETP=2 GBS=$gbs ACCEL=$accel iters=$_ITERS full=$OV2_RECOMPUTE_FULL moe=$OV2_RECOMPUTE_MOE vision=$OV2_VISION_RECOMPUTE ce_fusion=$OV2_CE_FUSION mtp_layers=$OV2_MTP_LAYERS mem_fraction=$OV2_CUDA_MEM_FRACTION nccl_trace=$OV2_LADDER_NCCL_TRACE lr=$OV2_LR->$OV2_MIN_LR wd=.01 muon_extra=.15 beta2=.95 ===="
   local smoke_rc raw_rc local_log
   OV2_SMOKE_LEG="$name" TP="$tp" OV2_ETP=2 OV2_MIDTRAIN_GBS="$gbs" GBS="$gbs" ACCEL="$accel" ITERS="$_ITERS" OV2_MIDTRAIN_N_SAMPLES=$(( gbs * _ITERS )) bash "$_L_SMOKE"
   smoke_rc=$?
@@ -204,7 +222,7 @@ _RC=0; for _l in $_LEGS; do _passed "$(_result_of "$_l")" || _RC=1; done
 if (( _L_IS_MASTER )); then
   _tmp="$_L_OUT.$$"
   {
-    echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS mem_fraction $OV2_CUDA_MEM_FRACTION legs [$_LEGS] iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
+    echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS mem_fraction $OV2_CUDA_MEM_FRACTION nccl_trace $OV2_LADDER_NCCL_TRACE legs [$_LEGS] iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
     echo "reference (09-13 memory smoke, WITH MTP, 20 iters, different LR-decay length): TP4 full recompute max_allocated 115.2 GiB, ~100 s/iter during warm-up"
     echo "optimizer: Muon spectral, lr=$OV2_LR->$OV2_MIN_LR, extra_scale=0.15, adam_beta2=0.95, optimizer/scheduler weight_decay=0.01; all components trainable"
     echo
