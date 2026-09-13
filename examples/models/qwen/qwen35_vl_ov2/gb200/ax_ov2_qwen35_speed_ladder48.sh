@@ -29,8 +29,7 @@
 #   A leg that does not fit dies as a clean torch OOM at step 1 (~15 min). No leg is gated on another.
 #   Throughput is compared as samples/s (GBS / mean Step Time), never as s/iter: T's GBS is 2x A's.
 #   speedup(X vs A) = (GBS_X / X_s) / (48 / A_s); for T that is 2 * A_s / T_s.
-# Loss table: first 5 lm loss of A vs the 09-13 smoke (same data/seed, WITH MTP). Iteration 1 must match to
-# bf16 noise (identical trunk weights; MTP does not touch the LM logits before the first update); later
+# Loss table: first 5 lm loss of A vs the 09-13 smoke (same data/seed, WITH MTP). Iteration 1 is comparable only with matched inputs, masks and trunk weights; later
 # steps may drift (different gradients, different LR-decay length). Descriptive only.
 #
 # Coordination: fresh workload names only. All 12 exact pod identities rendezvous before
@@ -60,6 +59,10 @@ export OV2_SEQ_LEN=73728   # ACCEL is per leg
 export OV2_MEM_PROBE=4 OV2_CUDA_MEM_FRACTION=0.88 OV2_LENGTH_SORT_WINDOW=4
 export OV2_CE_FUSION="${OV2_CE_FUSION:-false}"   # see header: not a memory lever
 export OV2_MTP_LAYERS="${OV2_MTP_LAYERS:-0}"          # no MTP block/head = the §13 objective (set 1 to A/B the old build)
+export OV2_MIDTRAIN_MUON=1 OV2_LR=1e-5 OV2_MIN_LR=1e-6 OV2_MOE_AUX_LOSS_COEFF=0.01
+# Apply after the shared midtrain defaults (beta2=.95, wd=.01, extra_scale=.15).
+# Scheduler weight decay must match optimizer weight decay on every step.
+export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_scale_mode=spectral optimizer.muon_extra_scale_factor=0.2 optimizer.adam_beta2=0.99 optimizer.weight_decay=0 scheduler.start_weight_decay=0 scheduler.end_weight_decay=0 model.freeze_language_model=false model.freeze_vision_model=false model.freeze_adapter=false"
 export DATA_PATH=stage3_img38_video62_maveric.yaml
 export OV2_LLM_HF_QWEN35="${OV2_LLM_HF_QWEN35:-$HOME/Qwen3.5-35B-A3B-text}"
 export OV2_HF_PROC_QWEN35_P16M33="${OV2_HF_PROC_QWEN35_P16M33:-$HOME/qwen35_p16m33_auto_model}"
@@ -116,7 +119,7 @@ _leg() {
   local name="$1" tp="$2" gbs="$3" accel="$4" r
   r="$(_result_of "$name")"
   _barrier "prepare_${name}"
-  _say "==== leg $name: TP=$tp ETP=2 GBS=$gbs ACCEL=$accel iters=$_ITERS full=$OV2_RECOMPUTE_FULL moe=$OV2_RECOMPUTE_MOE vision=$OV2_VISION_RECOMPUTE ce_fusion=$OV2_CE_FUSION mtp_layers=$OV2_MTP_LAYERS ===="
+  _say "==== leg $name: TP=$tp ETP=2 GBS=$gbs ACCEL=$accel iters=$_ITERS full=$OV2_RECOMPUTE_FULL moe=$OV2_RECOMPUTE_MOE vision=$OV2_VISION_RECOMPUTE ce_fusion=$OV2_CE_FUSION mtp_layers=$OV2_MTP_LAYERS lr=$OV2_LR->$OV2_MIN_LR wd=0 muon_extra=.2 beta2=.99 ===="
   local smoke_rc raw_rc local_log
   OV2_SMOKE_LEG="$name" TP="$tp" OV2_ETP=2 OV2_MIDTRAIN_GBS="$gbs" GBS="$gbs" ACCEL="$accel" ITERS="$_ITERS" OV2_MIDTRAIN_N_SAMPLES=$(( gbs * _ITERS )) bash "$_L_SMOKE"
   smoke_rc=$?
@@ -183,6 +186,7 @@ if (( _L_IS_MASTER )); then
   {
     echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
     echo "reference (09-13 memory smoke, WITH MTP, 20 iters, different LR-decay length): TP4 full recompute max_allocated 115.2 GiB, ~100 s/iter during warm-up"
+    echo "optimizer: Muon spectral, lr=$OV2_LR->$OV2_MIN_LR, extra_scale=0.2, adam_beta2=0.99, optimizer/scheduler weight_decay=0; all components trainable"
     echo
     echo "---- throughput (samples/s = GBS / mean of last 20 Step Time; s/iter is NOT comparable across legs) ----"
     echo "A: $(_tput A 48)"
@@ -200,14 +204,14 @@ if (( _L_IS_MASTER )); then
       echo "T vs A speedup: n/a (a leg failed, ran too few steps, or has no valid timing)"
     fi
     echo
-    echo "---- descriptive loss comparison: first 5 lm loss, 09-13 reference (WITH MTP, 20-step schedule) vs leg A (no MTP, 80-step); iter 1 should match to bf16 noise ----"
+    echo "---- descriptive loss comparison: first 5 lm loss, 09-13 reference (WITH MTP, 20-step schedule) vs leg A (no MTP, 80-step); input identity is not verified; descriptive only ----"
     _ref="$(_first_losses $_REF_GLOB)"; _a="$(_first_losses $(_leg_logs A))"
     echo "ref: ${_ref:-n/a}"; echo "A:   ${_a:-n/a}"
     python3 - "$_ref" "$_a" <<'PY'
 import sys
 r, a = (list(map(float, s.split())) for s in sys.argv[1:3]) if all(sys.argv[1:3]) else ([], [])
 n = min(len(r), len(a))
-print(f"iter-1 |diff| = {abs(r[0]-a[0]):.4f} (identical trunk weights before the first update: expect ~1e-2); max |diff| over first {n} = {max(abs(x-y) for x,y in zip(r[:n],a[:n])):.4f} (later drift from the removed MTP gradient and the LR-decay length is expected; descriptive only, NOT numerical acceptance)" if n else "iter-1 |diff|: n/a (missing series)")
+print(f"iter-1 |diff| = {abs(r[0]-a[0]):.4f} (only meaningful with matched input IDs/labels/masks; not an acceptance threshold); max |diff| over first {n} = {max(abs(x-y) for x,y in zip(r[:n],a[:n])):.4f} (later drift from the removed MTP gradient and the LR-decay length is expected; descriptive only, NOT numerical acceptance)" if n else "iter-1 |diff|: n/a (missing series)")
 PY
     for leg in A S T; do
       echo; echo "---- leg $leg ----"

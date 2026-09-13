@@ -248,6 +248,12 @@ OVERRIDES="$OVERRIDES checkpoint.save=$SAVE checkpoint.load=$SAVE dataset.datalo
 OVERRIDES="$OVERRIDES checkpoint.save_interval=$SAVE_EVERY train.train_iters=$ITERS validation.eval_iters=0 logger.log_interval=$LOG_EVERY logger.timing_log_level=${OV2_TIMING_LOG_LEVEL:-2} train.micro_batch_size=1"   # packing REQUIRES mbs=1
 OVERRIDES="$OVERRIDES model.tensor_model_parallel_size=$TP model.sequence_parallel=$SP $MOE_CAPACITY_ARGS"
 [[ -n "${OV2_ETP:-}" ]] && OVERRIDES="$OVERRIDES model.expert_tensor_parallel_size=$ETP"
+if [[ -n "${OV2_MTP_LAYERS:-}" ]]; then
+  [[ "$OV2_MTP_LAYERS" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "FATAL: OV2_MTP_LAYERS must be a nonnegative integer" >&2; exit 1; }
+  _mtp_config="$OV2_MTP_LAYERS"; [[ "$_mtp_config" != 0 ]] || _mtp_config=null
+  # Keep checkpoint metadata/FLOP accounting in sync with the inner model build.
+  OVERRIDES="$OVERRIDES model.mtp_num_layers=$_mtp_config"
+fi
 OVERRIDES="$OVERRIDES model.moe_router_dtype=${OV2_ROUTER_DTYPE:-fp32}"   # 256-expert router stability
 OVERRIDES="$OVERRIDES scheduler.lr_warmup_iters=$WARMUP_ITERS"
 OVERRIDES="$OVERRIDES optimizer.lr=${OV2_LR:-1e-5} optimizer.min_lr=${OV2_MIN_LR:-1e-6}"

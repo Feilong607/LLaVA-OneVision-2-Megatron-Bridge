@@ -1039,11 +1039,14 @@ def build_llava_ov2(
     # 73728). This is NOT OV2_MTP_LOSS_SCALE=0, which only zeroes the MTP gradient while the head is
     # still built, computed and stored. Loading a checkpoint that carries mtp.* tensors into a no-MTP
     # model relies on torch_dist loading only the keys the model asks for (default strictness).
-    if hasattr(prov, "mtp_num_layers"):
+    _mtp_hf = getattr(getattr(bridge, "hf_pretrained", None), "config", None)
+    if hasattr(prov, "mtp_num_layers") and str(getattr(_mtp_hf, "model_type", "")).startswith("qwen3_5"):
         import os
         _mtp_layers = os.environ.get("OV2_MTP_LAYERS", "").strip()
         if _mtp_layers != "":
             _n = int(_mtp_layers)
+            if _n < 0:
+                raise ValueError("OV2_MTP_LAYERS must be nonnegative")
             prov.mtp_num_layers = _n if _n > 0 else None
             logger.info("[ov2 build] OV2_MTP_LAYERS=%s -> mtp_num_layers=%s (0 = no MTP block/head)", _mtp_layers, prov.mtp_num_layers)
     _fill_init(prov, perform_init=perform_init)
@@ -1119,6 +1122,12 @@ def build_llava_ov2(
             getattr(prov, "fp8_recipe", None),
         )
     language_model = prov.provide(pre_process=pre_process, post_process=post_process)
+    if str(getattr(_mtp_hf, "model_type", "")).startswith("qwen3_5") and _os.environ.get("OV2_MTP_LAYERS", "").strip() == "0":
+        if getattr(language_model.config, "mtp_num_layers", None) or getattr(language_model, "mtp_process", False):
+            raise RuntimeError("OV2_MTP_LAYERS=0 did not disable the built MTP model")
+        if any("mtp" in name.split(".") for name, _ in language_model.named_parameters()):
+            raise RuntimeError("MTP parameters remain after OV2_MTP_LAYERS=0")
+        logger.info("[ov2 build] no-MTP runtime check PASS: no MTP block/head parameters")
     # Interleaved M-RoPE: Qwen3.5 config has mrope_interleaved=True, but stock mcore builds the CHUNKED
     # MultimodalRotaryEmbedding (cat([m[i%3]...])). For text tokens t==h==w so chunked==interleaved, but
     # IMAGE tokens (t!=h!=w) get the wrong rotary layout. Swap in the repo's native interleaved module
