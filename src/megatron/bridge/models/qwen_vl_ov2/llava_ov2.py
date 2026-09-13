@@ -1031,6 +1031,21 @@ def build_llava_ov2(
     if hasattr(prov, "moe_permute_fusion"):
         import os
         prov.moe_permute_fusion = os.environ.get("OV2_MOE_PERMUTE_FUSION", "0") == "1"
+    # OV2_MTP_LAYERS: BUILD-time MTP depth override (only meaningful on backbones whose HF config carries
+    # mtp_num_hidden_layers, i.e. the Qwen3.5 line; unset/empty = HF value, so every validated path is
+    # untouched). "0" removes the MTP block altogether: no extra transformer layer and no second
+    # 248k-vocab logits head, so the objective is LM + MoE-aux exactly like the 30B s2/s3 line (the merged
+    # video stage is specified to match it), and the fp32-logits memory term halves (~22 GiB at TP4 /
+    # 73728). This is NOT OV2_MTP_LOSS_SCALE=0, which only zeroes the MTP gradient while the head is
+    # still built, computed and stored. Loading a checkpoint that carries mtp.* tensors into a no-MTP
+    # model relies on torch_dist loading only the keys the model asks for (default strictness).
+    if hasattr(prov, "mtp_num_layers"):
+        import os
+        _mtp_layers = os.environ.get("OV2_MTP_LAYERS", "").strip()
+        if _mtp_layers != "":
+            _n = int(_mtp_layers)
+            prov.mtp_num_layers = _n if _n > 0 else None
+            logger.info("[ov2 build] OV2_MTP_LAYERS=%s -> mtp_num_layers=%s (0 = no MTP block/head)", _mtp_layers, prov.mtp_num_layers)
     _fill_init(prov, perform_init=perform_init)
     # M-RoPE: build the LLM as mrope if the HF config declares mrope_section (Qwen3.5:
     # rope_parameters.mrope_section=[11,11,10]). The text bridge defaults to plain 1D "rope";
