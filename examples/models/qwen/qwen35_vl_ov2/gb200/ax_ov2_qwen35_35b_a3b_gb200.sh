@@ -264,7 +264,22 @@ if [[ "${OV2_OPT_OFFLOAD:-false}" == "true" ]]; then
 else
   OVERRIDES="$OVERRIDES optimizer.optimizer_cpu_offload=false optimizer.use_precision_aware_optimizer=false"
 fi
-OVERRIDES="$OVERRIDES dataset.num_workers=${OV2_NUM_WORKERS:-8}"
+# Dataloader host-RAM budget. Validated s1.5 path (seq 10192, seed85m) keeps 8 workers x recipe buffer 100.
+# 64k packs are a different animal: one decoded pandas bin = a 384-frame video + 13 images, and the shuffle
+# buffer holds DECODED bins per worker. 09-13 48-GPU smoke on stage3_img38_video62_maveric.yaml: 8x100 killed
+# the whole pod inside the first step (no traceback, no rc=, pod cgroup limit 1 TB); 2x16 (the 30B 64k
+# launchers' explicit values) ran at ~550 GB anon+shmem. So for SEQ_LEN >= 32768 default to 2 workers /
+# buffer 16 unless OV2_NUM_WORKERS / OV2_SHUFFLE_BUFFER are set explicitly. Below that nothing changes.
+if (( SEQ_LEN >= 32768 )); then
+  _OV2_DL_WORKERS="${OV2_NUM_WORKERS:-2}"
+  _OV2_DL_BUFFER="${OV2_SHUFFLE_BUFFER:-16}"
+  echo "[ov2-qwen35-gb200] 64k-pack dataloader budget: num_workers=$_OV2_DL_WORKERS shuffle_buffer=$_OV2_DL_BUFFER (seq=$SEQ_LEN; pod cgroup ~1 TB, 8x100 OOM-killed 09-13)" >&2
+else
+  _OV2_DL_WORKERS="${OV2_NUM_WORKERS:-8}"
+  _OV2_DL_BUFFER="${OV2_SHUFFLE_BUFFER:-}"
+fi
+OVERRIDES="$OVERRIDES dataset.num_workers=$_OV2_DL_WORKERS"
+[[ -z "$_OV2_DL_BUFFER" ]] || OVERRIDES="$OVERRIDES dataset.shuffle_buffer_size=$_OV2_DL_BUFFER"
 OVERRIDES="$OVERRIDES dist.distributed_timeout_minutes=${OV2_DIST_TIMEOUT_MIN:-300}"   # first-step JIT + ckpt load exceed 100
 # CE fusion OFF pending a TP=2 A/B (OV2_CE_FUSION=true; smoke ab-cefusion). The original reason was TP=1: an
 # unsharded [seq, 248k] fp32 logits spike (~10GB) plus per-shape recompiles. At TP=2 the vocab is sharded,
