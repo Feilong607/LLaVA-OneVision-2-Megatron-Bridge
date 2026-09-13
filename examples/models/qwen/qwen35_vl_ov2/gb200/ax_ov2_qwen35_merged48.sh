@@ -15,10 +15,10 @@
 #   data        stage3_img38_video62_maveric.yaml (Barrett 0821 img38/video62 on MAVERIC paths; image side = 47m_v3
 #               placeholder until the 56m SFT set arrives -- see the yaml header)
 #   init        s1.5 final iter_0033334 (copied to ~/ckpts_keep; weights only, Muon state is rebuilt)
-#   budget      sum of the blend weights = 966,252 samples = 20,131 iters @ GBS48 (OV2_MIDTRAIN_N_SAMPLES overrides;
-#               960000 -> exactly 20,000 iters so the final save coincides with the last SAVE_EVERY save).
-#               This is a weight-defined budget, NOT "one pass over every source": with per-part bin counts as
-#               weights the video sources see ~1 epoch each, the 47m_v3 image placeholder only ~0.52 epoch.
+#   budget      2 x the blend weight sum = 1,932,504 samples = 40,261 iters @ GBS48 (ceil) (OV2_MIDTRAIN_N_SAMPLES overrides).
+#               Decided 09-13: "2 epochs by weight", the 2B line's definition (1 epoch = sum of the per-part bin-count
+#               weights). Weight-defined, NOT one pass per source: video sources ~2.0 epochs each (180s matches the
+#               30B s2 run's 2 passes; pandas is 2x the 30B s3), the 47m_v3 image placeholder ~1.04 epoch.
 #   saves       every 1000 iters, most_recent_k 3 (final + 2 before it); every OV2_ARCHIVE_EVERY=5000 a hard-linked
 #               permanent copy under ${SAVE}_archive/ (master pod, background; mcore's rotation cannot reach it)
 #
@@ -26,8 +26,10 @@
 #   OV2_RECOMPUTE_FULL=1 (default)  full recompute, ~94 GiB predicted (115.2 measured WITH MTP) -- fits with margin,
 #                                    0.726 samples/s measured with MTP (last-20 of 80 iters)
 #   OV2_RECOMPUTE_FULL=0 OV2_RECOMPUTE_MOE=1 OV2_CUDA_MEM_FRACTION=0.92
-#                                    selective attn+moe = the 30B s2/s3 lane; needed ~164 GiB at the 0.88 cap (OOM by 2),
-#                                    the 0.92 cap (169.3) is the retry -- switch here only after the ladder passes it.
+#                                    selective attn+moe = the 30B s2/s3 lane -- DOES NOT FIT on 48 GPUs: OOM at the 0.88
+#                                    cap (09-13) AND at the 0.92 cap (169.3): usage grew to the cap and still asked for the
+#                                    15.9 GiB fp32 logits block, i.e. true peak >= 185 GiB > the 184 GiB device. Kept only
+#                                    as a documented dead end; the next speed lever is block recompute (round 2).
 #
 # First launch: fresh SAVE, weights from INIT_CKPT, full budget; a launch fingerprint (data yaml sha256, stream and
 # topology settings) is written to $SAVE/ov2_launch_fingerprint.json. Restart: same Args + same SAVE (+ Workers=11);
@@ -88,7 +90,7 @@ _TOTAL_W="$(grep -E '^\s*(- )?weight:' "$DATA_PATH" | awk '{s+=$NF} END {print s
 
 # ---- budget / batch / schedule ------------------------------------------------------------------------------------
 export OV2_MIDTRAIN_GBS="${OV2_MIDTRAIN_GBS:-48}"
-export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$_TOTAL_W}"   # weights are per-part bin counts -> 1 epoch
+export OV2_MIDTRAIN_N_SAMPLES="${OV2_MIDTRAIN_N_SAMPLES:-$(( 2 * _TOTAL_W ))}"   # 2 x weight sum = "2 epochs" (2B-line definition)
 for _name in OV2_MIDTRAIN_GBS OV2_MIDTRAIN_N_SAMPLES; do
   [[ "${!_name}" =~ ^[1-9][0-9]*$ ]] || _die "$_name must be a positive decimal integer, got '${!_name}'"
 done
@@ -113,7 +115,7 @@ export OV2_VISION_RECOMPUTE="${OV2_VISION_RECOMPUTE:-1}"
 export OV2_CUDA_MEM_FRACTION="${OV2_CUDA_MEM_FRACTION:-0.88}"
 [[ "$OV2_CUDA_MEM_FRACTION" =~ ^0\.[5-9][0-9]?$ ]] || _die "OV2_CUDA_MEM_FRACTION must be 0.50-0.99"
 if [[ "$OV2_RECOMPUTE_FULL" == 0 && "$OV2_CUDA_MEM_FRACTION" == 0.88 ]]; then
-  _die "selective recompute needed ~164 GiB on this blend (09-13 ladder S: OOM at the 0.88 cap); pass OV2_CUDA_MEM_FRACTION=0.92 or use OV2_RECOMPUTE_FULL=1"
+  _die "selective recompute does not fit on 48 GPUs (09-13: OOM at the 0.88 AND 0.92 caps, true peak >= 185 GiB); use OV2_RECOMPUTE_FULL=1"
 fi
 export OV2_MEM_PROBE="${OV2_MEM_PROBE:-$MB_PER_RANK}"
 export SAVE_EVERY="${SAVE_EVERY:-1000}"
