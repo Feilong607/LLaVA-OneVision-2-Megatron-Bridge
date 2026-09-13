@@ -67,6 +67,13 @@ export DATA_PATH=stage3_img38_video62_maveric.yaml
 export OV2_LLM_HF_QWEN35="${OV2_LLM_HF_QWEN35:-$HOME/Qwen3.5-35B-A3B-text}"
 export OV2_HF_PROC_QWEN35_P16M33="${OV2_HF_PROC_QWEN35_P16M33:-$HOME/qwen35_p16m33_auto_model}"
 _ITERS="${OV2_LADDER_ITERS:-80}"
+# OV2_LADDER_LEGS: which legs to run, in order (default all three). e.g. "S T" skips the no-MTP full-recompute
+# baseline when the with-MTP A number is already on file (09-13: 0.726 samples/s at 80 iters). Pass it through
+# the workload as  Command=env  Args="OV2_LADDER_LEGS=S,T bash <this file>"  (use commas: the Args field is
+# split on spaces; commas or spaces are both accepted here).
+_LEGS="$(tr ',' ' ' <<<"${OV2_LADDER_LEGS:-A S T}")"
+for _l in $_LEGS; do [[ "$_l" =~ ^[AST]$ ]] || { echo "[speed-ladder] FATAL: OV2_LADDER_LEGS must be a subset of A S T, got '$_LEGS'" >&2; exit 3; }; done
+_want() { [[ " $_LEGS " == *" $1 "* ]]; }
 # Reference logs for the loss table: the 09-13 48-GPU memory smoke (leg A's config but WITH MTP; 20-iteration run, different LR-decay length).
 _REF_GLOB="${OV2_LADDER_REF_GLOB:-$HOME/train_logs/smoke_qwen35_merged64k_q35-img38-smoke48-0913-2_*.log}"
 
@@ -160,31 +167,38 @@ _tput() {
 # First 5 "lm loss" values from a set of logs (megatron iteration lines, last rank).
 _first_losses() { cat "$@" 2>/dev/null | grep -o 'lm loss: [0-9.eE+-]*' | head -5 | awk '{print $3}' | tr '\n' ' ' | sed 's/ *$//'; }
 
+_A_RES="$(_result_of A)"; _S_RES="$(_result_of S)"; _T_RES="$(_result_of T)"
 # ---------------- A: TP4 full recompute, HybridEP (steady-state baseline) ----------------
+if _want A; then
 export OV2_RECOMPUTE_FULL=1 OV2_RECOMPUTE_MOE=0 OV2_VISION_RECOMPUTE=1
 _leg A 4 48 2
-_A_RES="$(_result_of A)"; _A_MEM="$(_max_alloc "$_A_RES")"
+_A_MEM="$(_max_alloc "$_A_RES")"
 _say "A: passed=$(_passed "$_A_RES" && echo yes || echo no) max_allocated=${_A_MEM:-?} GiB; $(_tput A 48)"
+fi
 
 # ---------------- S: TP4 selective attn+moe, HybridEP (the §13 production recompute: does it fit?) ----------------
+if _want S; then
 export OV2_RECOMPUTE_FULL=0 OV2_RECOMPUTE_MOE=1 OV2_VISION_RECOMPUTE=1
 _leg S 4 48 2
-_S_RES="$(_result_of S)"; _S_MEM="$(_max_alloc "$_S_RES")"
+_S_MEM="$(_max_alloc "$_S_RES")"
 _say "S: passed=$(_passed "$_S_RES" && echo yes || echo no) max_allocated=${_S_MEM:-?} GiB; $(_tput S 48)"
+fi
 
 # ---------------- T: TP2 full recompute, alltoall (fits without MTP? faster?) ----------------
+if _want T; then
 export OV2_RECOMPUTE_FULL=1 OV2_RECOMPUTE_MOE=0 OV2_VISION_RECOMPUTE=1
 _leg T 2 96 0
-_T_RES="$(_result_of T)"; _T_MEM="$(_max_alloc "$_T_RES")"
+_T_MEM="$(_max_alloc "$_T_RES")"
 _say "T: passed=$(_passed "$_T_RES" && echo yes || echo no) max_allocated=${_T_MEM:-?} GiB; $(_tput T 96)"
+fi
 
-_RC=0; _passed "$_A_RES" && _passed "$_S_RES" && _passed "$_T_RES" || _RC=1
+_RC=0; for _l in $_LEGS; do _passed "$(_result_of "$_l")" || _RC=1; done
 
 # ---------------- summary (master only; workers just mirror the exit code) ----------------
 if (( _L_IS_MASTER )); then
   _tmp="$_L_OUT.$$"
   {
-    echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
+    echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS legs [$_LEGS] iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
     echo "reference (09-13 memory smoke, WITH MTP, 20 iters, different LR-decay length): TP4 full recompute max_allocated 115.2 GiB, ~100 s/iter during warm-up"
     echo "optimizer: Muon spectral, lr=$OV2_LR->$OV2_MIN_LR, extra_scale=0.15, adam_beta2=0.95, optimizer/scheduler weight_decay=0.01; all components trainable"
     echo
@@ -215,6 +229,7 @@ print(f"iter-1 |diff| = {abs(r[0]-a[0]):.4f} (only meaningful with matched input
 PY
     for leg in A S T; do
       echo; echo "---- leg $leg ----"
+      _want "$leg" || { echo "not selected (OV2_LADDER_LEGS=$_LEGS)"; continue; }
       case "$leg" in
         A) echo "TP4/ETP2 GBS48 (DP12), full recompute, ACCEL=2 HybridEP, no MTP (OV2_MTP_LAYERS=$OV2_MTP_LAYERS)";;
         S) echo "TP4/ETP2 GBS48 (DP12), selective attn+moe = the §13 production recompute, ACCEL=2 HybridEP, no MTP";;

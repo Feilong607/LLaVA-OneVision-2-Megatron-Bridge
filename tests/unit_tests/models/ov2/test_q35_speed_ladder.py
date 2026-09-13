@@ -46,16 +46,17 @@ def run_ladder(tmp_path):
     (binary / "hostname").chmod(0o755)
     env = {"HOME": str(tmp_path), "PATH": f"{binary}:{Path(sys.executable).parent}:/usr/bin:/bin", "PET_NNODES": "12"}
 
-    def run(mode="", nodes=12):
+    def run(mode="", nodes=12, legs=None):
         if nodes != 12:
             script.write_text(script.read_text().replace("90 * 60", "2"))
         children = []
         for rank in range(nodes):
             host = "job-master-0" if rank == 0 else f"job-worker-{rank - 1}"
+            extra = {"OV2_LADDER_LEGS": legs} if legs else {}
             children.append(
                 subprocess.Popen(
                     ["bash", str(script)],
-                    env={**env, "FAKE_HOST": host, "PET_NODE_RANK": str(rank), "FAKE_MODE": mode},
+                    env={**env, **extra, "FAKE_HOST": host, "PET_NODE_RANK": str(rank), "FAKE_MODE": mode},
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -108,3 +109,16 @@ def test_shared_pass_cannot_hide_worker_failure_or_short_run(run_ladder, mode):
     assert all(rc == 1 for rc, _, _ in outputs), outputs
     summary = (root / "train_logs/smoke_speed_ladder_job.txt").read_text()
     assert "T vs A speedup: n/a" in summary
+
+
+def test_leg_selection_skips_unselected_legs(run_ladder):
+    run, root = run_ladder
+    outputs = run(legs="S,T")
+    assert all(rc == 0 for rc, _, _ in outputs), outputs
+    logs = root / "train_logs"
+    assert not list(logs.glob("A.*.started"))
+    assert len(list(logs.glob("S.*.finished"))) == 12 and len(list(logs.glob("T.*.finished"))) == 12
+    summary = (logs / "smoke_speed_ladder_job.txt").read_text()
+    assert "legs [S T]" in summary
+    assert "not selected (OV2_LADDER_LEGS=S T)" in summary  # the A block says so instead of "no RESULT file"
+    assert "S vs A speedup: n/a" in summary and "T vs A speedup: n/a" in summary  # no A to compare against
