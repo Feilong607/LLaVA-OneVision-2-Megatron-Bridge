@@ -48,7 +48,9 @@ set -euo pipefail
 _SM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _SM_BASE="$_SM_DIR/ax_ov2_qwen35_35b_a3b_gb200.sh"
 _SM_POOL="${OV2_STAGE4_POOL:-/datasets/feilong-stage4-datasets}"
-_SM_TAG="$(hostname | sed -E 's/-(master|worker)-[0-9]+$//')"
+# OV2_SMOKE_LEG=<name> suffixes the tag so several legs launched from ONE workload (speed ladder) get
+# their own SAVE / RESULT / LOG instead of overwriting each other and short-circuiting the result wait.
+_SM_TAG="$(hostname | sed -E 's/-(master|worker)-[0-9]+$//')${OV2_SMOKE_LEG:+-$OV2_SMOKE_LEG}"
 _SM_ROOT="$HOME/ckpts_video_sft/_smoke_qwen35_merged64k"
 SAVE_DIR="$_SM_ROOT/$_SM_TAG"
 RESULT="$HOME/train_logs/smoke_qwen35_merged64k_result_${_SM_TAG}.txt"
@@ -173,7 +175,9 @@ sort_on = "length-sorted batching ON" in text
 its = [float(x) for x in re.findall(r"elapsed time per iteration \(ms\): ([\d.]+)", text)][3:]
 tf = [float(x) for x in re.findall(r"TFLOP/s/GPU\)?: ([\d.]+)", text)][3:]
 fb = [(float(a), float(b)) for a, b in re.findall(r"forward-backward[ .]*:? *\(([\d.]+), ([\d.]+)\)", text)][3:]
-skips = sum(1 for ln in text.splitlines() if "exceed seq_length" in ln or "Skipping this pack" in ln)
+# One skipped pack logs once per rank in this pod (4 lines) and the same "running A+B" never repeats,
+# so count UNIQUE running values, not lines (09-13: 24 lines were 6 packs).
+skips = len(set(re.findall(r"running (\d+\+\d+)", text))) or sum(1 for ln in text.splitlines() if "Skipping this pack" in ln)
 nans = len(re.findall(r"skipping batch|found NaN|nan detected", text, re.I))
 # OV2_MEM_PROBE lines (torch view; pod_peak_mem_mib is nvidia-smi = torch reserved + ~15 GiB non-torch).
 mx_alloc = [float(x) for x in re.findall(r"max_allocated=([\d.]+)G", text)]
@@ -201,7 +205,7 @@ else:
     lines.append("torch memory: no MEMPROBE lines — set OV2_MEM_PROBE=4 to get max_allocated (the number the DP-independent memory model uses)")
 lines.append(f"dropped packs (seq_length exceeded): {skips}")
 if skips:
-    lines.append(f"SEQ VERDICT: {skips} packs skipped at seq={seq} — biased data loss; rerun with SEQ_LEN=73728 (30B stage-3 precedent) or repack.")
+    lines.append(f"SEQ VERDICT: {skips} packs skipped at seq={seq} — biased data loss; at seq<73728 rerun with 73728 (30B precedent); at 73728 already this is the residual tokenizer/budget mismatch — accept, raise seq, or repack.")
 else:
     lines.append(f"SEQ VERDICT: no skips at seq={seq} in this sample — keep watching the counter over a longer run.")
 lines.append(f"nan/skipped-batch lines: {nans}")
