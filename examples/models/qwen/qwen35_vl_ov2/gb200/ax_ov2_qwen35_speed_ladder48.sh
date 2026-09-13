@@ -8,7 +8,7 @@
 # recompute WITH the MTP head: max_allocated 115.2 GiB of a 161.9 cap, 0.6% packs dropped, 0 NaN).
 #
 # The merged video stage is specified (BRINGUP §13) to match the 30B s2/s3 line: LM + MoE-aux objective with
-# NO MTP head, Muon lr 1e-5->1e-6 / wd 0 / extra 0.2 / beta2 0.99, selective recompute (attn+moe), TP4
+# NO MTP head, Muon s2 defaults: lr 1e-5->1e-6 / wd 0.01 / extra 0.15 / beta2 0.95, selective recompute (attn+moe), TP4
 # HybridEP, seq 73728, 4 microbatches per rank. Every leg here is therefore built WITHOUT the MTP block
 # (OV2_MTP_LAYERS=0, fork 3018a1c0). The 09-13 smoke still carried the MTP layer + its 248k-vocab head,
 # which the §12.1 model prices at ~22 GiB (TP4) / ~45 GiB (TP2) of fp32 logits, so 115.2 is an upper bound.
@@ -60,9 +60,9 @@ export OV2_MEM_PROBE=4 OV2_CUDA_MEM_FRACTION=0.88 OV2_LENGTH_SORT_WINDOW=4
 export OV2_CE_FUSION="${OV2_CE_FUSION:-false}"   # see header: not a memory lever
 export OV2_MTP_LAYERS="${OV2_MTP_LAYERS:-0}"          # no MTP block/head = the §13 objective (set 1 to A/B the old build)
 export OV2_MIDTRAIN_MUON=1 OV2_LR=1e-5 OV2_MIN_LR=1e-6 OV2_MOE_AUX_LOSS_COEFF=0.01
-# Apply after the shared midtrain defaults (beta2=.95, wd=.01, extra_scale=.15).
+# Pin the selected s2 defaults after any inherited CLI overrides (not the optional MUON_STABLE preset).
 # Scheduler weight decay must match optimizer weight decay on every step.
-export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_scale_mode=spectral optimizer.muon_extra_scale_factor=0.2 optimizer.adam_beta2=0.99 optimizer.weight_decay=0 scheduler.start_weight_decay=0 scheduler.end_weight_decay=0 model.freeze_language_model=false model.freeze_vision_model=false model.freeze_adapter=false"
+export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_scale_mode=spectral optimizer.muon_extra_scale_factor=0.15 optimizer.adam_beta2=0.95 optimizer.weight_decay=0.01 scheduler.start_weight_decay=0.01 scheduler.end_weight_decay=0.01 model.freeze_language_model=false model.freeze_vision_model=false model.freeze_adapter=false"
 export DATA_PATH=stage3_img38_video62_maveric.yaml
 export OV2_LLM_HF_QWEN35="${OV2_LLM_HF_QWEN35:-$HOME/Qwen3.5-35B-A3B-text}"
 export OV2_HF_PROC_QWEN35_P16M33="${OV2_HF_PROC_QWEN35_P16M33:-$HOME/qwen35_p16m33_auto_model}"
@@ -119,7 +119,7 @@ _leg() {
   local name="$1" tp="$2" gbs="$3" accel="$4" r
   r="$(_result_of "$name")"
   _barrier "prepare_${name}"
-  _say "==== leg $name: TP=$tp ETP=2 GBS=$gbs ACCEL=$accel iters=$_ITERS full=$OV2_RECOMPUTE_FULL moe=$OV2_RECOMPUTE_MOE vision=$OV2_VISION_RECOMPUTE ce_fusion=$OV2_CE_FUSION mtp_layers=$OV2_MTP_LAYERS lr=$OV2_LR->$OV2_MIN_LR wd=0 muon_extra=.2 beta2=.99 ===="
+  _say "==== leg $name: TP=$tp ETP=2 GBS=$gbs ACCEL=$accel iters=$_ITERS full=$OV2_RECOMPUTE_FULL moe=$OV2_RECOMPUTE_MOE vision=$OV2_VISION_RECOMPUTE ce_fusion=$OV2_CE_FUSION mtp_layers=$OV2_MTP_LAYERS lr=$OV2_LR->$OV2_MIN_LR wd=.01 muon_extra=.15 beta2=.95 ===="
   local smoke_rc raw_rc local_log
   OV2_SMOKE_LEG="$name" TP="$tp" OV2_ETP=2 OV2_MIDTRAIN_GBS="$gbs" GBS="$gbs" ACCEL="$accel" ITERS="$_ITERS" OV2_MIDTRAIN_N_SAMPLES=$(( gbs * _ITERS )) bash "$_L_SMOKE"
   smoke_rc=$?
@@ -186,7 +186,7 @@ if (( _L_IS_MASTER )); then
   {
     echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
     echo "reference (09-13 memory smoke, WITH MTP, 20 iters, different LR-decay length): TP4 full recompute max_allocated 115.2 GiB, ~100 s/iter during warm-up"
-    echo "optimizer: Muon spectral, lr=$OV2_LR->$OV2_MIN_LR, extra_scale=0.2, adam_beta2=0.99, optimizer/scheduler weight_decay=0; all components trainable"
+    echo "optimizer: Muon spectral, lr=$OV2_LR->$OV2_MIN_LR, extra_scale=0.15, adam_beta2=0.95, optimizer/scheduler weight_decay=0.01; all components trainable"
     echo
     echo "---- throughput (samples/s = GBS / mean of last 20 Step Time; s/iter is NOT comparable across legs) ----"
     echo "A: $(_tput A 48)"
