@@ -89,10 +89,14 @@ def test_all_pods_wait_and_receive_same_summary(run_ladder):
     assert all(rc == 0 for rc, _, _ in outputs), outputs
     logs = root / "train_logs"
     last_a = max(float(p.read_text()) for p in logs.glob("A.*.finished"))
+    first_s = min(float(p.read_text()) for p in logs.glob("S.*.started"))
+    last_s = max(float(p.read_text()) for p in logs.glob("S.*.finished"))
     first_t = min(float(p.read_text()) for p in logs.glob("T.*.started"))
-    assert first_t >= last_a
+    assert first_s >= last_a and first_t >= last_s  # legs are lock-stepped A -> S -> T across all pods
     summary = (logs / "smoke_speed_ladder_job.txt").read_text()
-    assert "1.333x" in summary  # 96/150 divided by 48/100, not 100/150.
+    assert "1.333x" in summary  # T: 96/150 divided by 48/100, not 100/150.
+    assert "S vs A speedup = (48/150.0) / (48/100.0) = A_s/S_s = 0.667x" in summary  # same GBS: plain ratio
+    assert "mtp_layers 0" in summary  # every leg is the no-MTP build (§13 objective)
     assert len(list((logs / ".ladder_barrier_job").glob("summary_read.*"))) == 12
     assert all(rc != 0 for rc, _, _ in run()), "old attempts must not reuse barrier markers"
 
