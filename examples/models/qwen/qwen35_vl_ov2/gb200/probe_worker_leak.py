@@ -1,0 +1,203 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Offline repro for the dataloader-worker host-memory growth seen on the merged48 production runs.
+
+Runs the SAME energon pipeline a `pt_data_worker` runs (task encoder + energon dataset from the blend
+yaml), in ONE process with num_workers=0, and every N samples prints three memory views side by side:
+
+  rss      RssAnon of this process (/proc/self/status)       -- what the cgroup sees
+  py       tracemalloc live bytes (Python-owned allocations)  -- Python-level retention
+  malloc   glibc mallinfo2: in-use (uordblks+hblkhd) / free-but-held (fordblks)
+
+Verdict logic (printed at the end, plus a malloc_trim(0) test):
+  rss grows, py flat, malloc in-use flat, malloc free grows  => glibc heap fragmentation (allocator)
+  rss grows, py grows                                        => Python-level per-sample retention;
+                                                                 the tracemalloc top list names the line
+  rss grows, py flat, malloc in-use grows                    => C/C++-level leak (PIL / PyAV / numpy /
+                                                                 tokenizers), not visible to tracemalloc
+
+CPU-only, no GPU, no torchrun. Needs the datasets mount and the HF processor dir. Typical run
+(from ~/bridge-export, in the training image):
+
+  python examples/models/qwen/qwen35_vl_ov2/gb200/probe_worker_leak.py --n 300 --every 25
+
+Env knobs: OV2_HF_PROC_QWEN35_P16M33 (processor dir; default $HOME/qwen35_p16m33_auto_model like the
+production wrapper), OV2_PRETRAIN_ROOT, OV2_EXTRA_PYLIBS. To A/B an allocator fix, prefix the same command
+with MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072, or (GB200 qwen35-fla image, aarch64)
+LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libtcmalloc_minimal.so.4, and compare the rss column only -- under
+a non-glibc allocator the mallinfo2 columns describe glibc's (idle) arena and the verdict is meaningless.
+"""
+import argparse
+import ctypes
+import gc
+import logging
+import os
+import sys
+import time
+import tracemalloc
+from pathlib import Path
+
+logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout, force=True)
+logger = logging.getLogger(__name__)
+
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parents[4]
+for _p in (_REPO / "src", _REPO / "3rdparty" / "Megatron-LM", _REPO / "aiak_shim"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+for _extra in filter(None, os.environ.get("OV2_EXTRA_PYLIBS", "").split(":")):
+    sys.path.insert(0, _extra)
+
+
+class _MallInfo2(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_size_t) for n in (
+        "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks", "fsmblks", "uordblks", "fordblks", "keepcost")]
+
+
+def _libc():
+    try:
+        lib = ctypes.CDLL("libc.so.6")
+        lib.mallinfo2.restype = _MallInfo2
+        lib.malloc_trim.argtypes = [ctypes.c_size_t]
+        lib.malloc_trim.restype = ctypes.c_int
+        return lib
+    except (OSError, AttributeError):
+        return None
+
+
+def _rss_anon_mb():
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("RssAnon:"):
+                return int(line.split()[1]) / 1024.0
+    return float("nan")
+
+
+def _malloc_mb(lib):
+    if lib is None:
+        return float("nan"), float("nan")
+    mi = lib.mallinfo2()
+    return (mi.uordblks + mi.hblkhd) / 2**20, mi.fordblks / 2**20
+
+
+def _sample_bytes(batch):
+    total = 0
+    vals = batch.values() if isinstance(batch, dict) else (vars(batch).values() if hasattr(batch, "__dict__") else [])
+    for v in vals:
+        if hasattr(v, "numel") and hasattr(v, "element_size"):
+            total += v.numel() * v.element_size()
+        elif isinstance(v, (list, tuple)):
+            for t in v:
+                if hasattr(t, "numel") and hasattr(t, "element_size"):
+                    total += t.numel() * t.element_size()
+    return total / 2**20
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--data", default=str(_HERE / "stage3_img38_video62_maveric.yaml"), help="blend yaml (energon Metadataset)")
+    ap.add_argument("--proc", default=None, help="HF processor dir (default: the qwen3.5 backbone's hf_proc)")
+    ap.add_argument("--seq", type=int, default=73728)
+    ap.add_argument("--n", type=int, default=300, help="samples to pull")
+    ap.add_argument("--every", type=int, default=25, help="report interval (samples)")
+    ap.add_argument("--buffer", type=int, default=8, help="shuffle_buffer_size (production: 8)")
+    ap.add_argument("--top", type=int, default=8, help="tracemalloc top-N lines per report")
+    ap.add_argument("--merge", type=int, default=3, help="spatial_merge_size (qwen3.5 p16m33: 3)")
+    args = ap.parse_args()
+
+    import megatron.bridge.recipes.ov2.ov2_qwen35 as q35  # registers the backbone
+    from megatron.bridge.recipes.ov2.ov2 import _OV2_BACKBONES
+    from megatron.bridge.recipes.ov2.data.energon.task_encoder import OV2TaskEncoder
+    from megatron.energon import WorkerConfig, get_savable_loader, get_train_dataset
+
+    # Processor dir resolution mirrors the production wrapper (ax_ov2_qwen35_merged48.sh): explicit flag,
+    # then $OV2_HF_PROC_QWEN35_P16M33, then $HOME/qwen35_p16m33_auto_model, then the backbone default.
+    _cands = [args.proc, os.environ.get("OV2_HF_PROC_QWEN35_P16M33"),
+              os.path.join(os.path.expanduser("~"), "qwen35_p16m33_auto_model"),
+              _OV2_BACKBONES[q35._QWEN35_BACKBONE]["hf_proc"]]
+    proc = next((c for c in _cands if c and os.path.isfile(os.path.join(c, "preprocessor_config.json"))), None)
+    if proc is None:
+        sys.exit(f"[probe] FATAL: no HF processor dir with preprocessor_config.json among {[c for c in _cands if c]}; pass --proc")
+    logger.info(f"[probe] repo={_REPO} data={args.data} proc={proc} seq={args.seq} buffer={args.buffer} n={args.n}")
+    logger.info(f"[probe] pid={os.getpid()} MALLOC_ARENA_MAX={os.environ.get('MALLOC_ARENA_MAX')} "
+          f"MALLOC_MMAP_THRESHOLD_={os.environ.get('MALLOC_MMAP_THRESHOLD_')} "
+          f"MALLOC_TRIM_THRESHOLD_={os.environ.get('MALLOC_TRIM_THRESHOLD_')} LD_PRELOAD={os.environ.get('LD_PRELOAD')}")
+
+    lib = _libc()
+    tracemalloc.start(12)
+    te = OV2TaskEncoder(hf_processor_path=proc, seq_length=args.seq, spatial_merge_size=args.merge)
+    # The Qwen3 s2/s3 runs (feilong-nemo image) never showed this growth on the same code, data and
+    # settings, so the dependency stack is a prime suspect -- print what THIS image resolves to.
+    import numpy, PIL, torch, transformers
+    import megatron.energon as energon
+    _ip = getattr(te.proc, "image_processor", None)
+    logger.info(f"[probe] stack: torch={torch.__version__} transformers={transformers.__version__} PIL={PIL.__version__} "
+                f"numpy={numpy.__version__} energon={getattr(energon, '__version__', '?')} "
+                f"processor={type(te.proc).__name__} image_processor={type(_ip).__name__} "
+                f"torch_threads={torch.get_num_threads()}")
+    wc = WorkerConfig.default_worker_config(0)  # in-process: this process IS the worker
+    ds = get_train_dataset(
+        args.data, batch_size=1, task_encoder=te, worker_config=wc, split_part="train",
+        shuffle_buffer_size=args.buffer, max_samples_per_sequence=None, packing_buffer_size=None,
+        image_decode="pil", parallel_shard_iters=int(os.environ.get("OV2_PARALLEL_SHARD_ITERS", "16")),
+    )
+    loader = get_savable_loader(ds, worker_config=wc)
+    gc.collect()
+    base_snap = tracemalloc.take_snapshot()
+    rss0, (mu0, mf0) = _rss_anon_mb(), _malloc_mb(lib)
+    py0 = tracemalloc.get_traced_memory()[0] / 2**20
+    logger.info(f"[probe] baseline: rss={rss0:.0f}M py={py0:.0f}M malloc_inuse={mu0:.0f}M malloc_free={mf0:.0f}M")
+    logger.info("[probe]   n   rss_M  d_rss   py_M  d_py  minuse_M d_minuse  mfree_M d_mfree  batch_MB  s/sample")
+
+    t0 = time.time()
+    n = 0
+    hist = []
+    batch_mb = 0.0
+    for batch in loader:
+        n += 1
+        batch_mb += _sample_bytes(batch)
+        del batch
+        if n % args.every == 0 or n == args.n:
+            gc.collect()
+            rss, (mu, mf) = _rss_anon_mb(), _malloc_mb(lib)
+            py = tracemalloc.get_traced_memory()[0] / 2**20
+            hist.append((n, rss, py, mu, mf))
+            logger.info(f"[probe] {n:4d} {rss:7.0f} {rss - rss0:+6.0f} {py:6.0f} {py - py0:+5.0f} {mu:9.0f} {mu - mu0:+8.0f} {mf:8.0f} {mf - mf0:+7.0f} "
+                  f"{batch_mb / args.every:9.1f} {(time.time() - t0) / n:9.2f}")
+            batch_mb = 0.0
+            snap = tracemalloc.take_snapshot()
+            stats = [s for s in snap.compare_to(base_snap, "lineno") if "tracemalloc" not in str(s.traceback)]
+            for s in stats[: args.top]:
+                fr = s.traceback[0]
+                logger.info(f"[probe]      py top: {s.size_diff / 2**20:+8.1f}M ({s.count_diff:+d} blocks) {fr.filename}:{fr.lineno}")
+        if n >= args.n:
+            break
+
+    # ---- verdict ----
+    rss1, py1, mu1, mf1 = hist[-1][1], hist[-1][2], hist[-1][3], hist[-1][4]
+    d_rss, d_py, d_mu, d_mf = rss1 - rss0, py1 - py0, mu1 - mu0, mf1 - mf0
+    trimmed = lib.malloc_trim(0) if lib is not None else -1
+    rss_after_trim = _rss_anon_mb()
+    logger.info(f"[probe] after malloc_trim(0): rss={rss_after_trim:.0f}M (released {rss1 - rss_after_trim:+.0f}M; trim rc={trimmed})")
+    # second-half slope: is growth still linear or flattening?
+    if len(hist) >= 4:
+        h = len(hist) // 2
+        s1 = (hist[h][1] - hist[0][1]) / max(1, hist[h][0] - hist[0][0])
+        s2 = (hist[-1][1] - hist[h][1]) / max(1, hist[-1][0] - hist[h][0])
+        logger.info(f"[probe] rss slope MB/sample: first half {s1:.2f}, second half {s2:.2f}")
+    grew = d_rss > 200
+    if not grew:
+        verdict = "NO significant RSS growth in-process (<200 MB); the production growth needs the worker/IPC path (torch shm sends) -- rerun with --workers via the real loader"
+    elif d_py > 0.5 * d_rss:
+        verdict = "PYTHON-LEVEL retention: tracemalloc grows with RSS; see the 'py top' lines for the allocating line"
+    elif d_mu > 0.5 * d_rss:
+        verdict = "C-LEVEL leak: malloc in-use grows with RSS but Python does not see it (PIL/PyAV/numpy/tokenizers)"
+    elif d_mf > 0.3 * d_rss or (rss1 - rss_after_trim) > 0.3 * d_rss:
+        verdict = "GLIBC FRAGMENTATION: RSS grows while malloc in-use is flat and free-but-held grows / trim releases it -> MALLOC_MMAP_THRESHOLD_/TRIM_THRESHOLD_ or jemalloc"
+    else:
+        verdict = "UNCLASSIFIED: RSS grows but neither py, malloc in-use nor malloc free explains it (mmap outside malloc? torch shm?)"
+    logger.info(f"[probe] VERDICT over {n} samples: d_rss={d_rss:+.0f}M d_py={d_py:+.0f}M d_malloc_inuse={d_mu:+.0f}M d_malloc_free={d_mf:+.0f}M -> {verdict}")
+
+
+if __name__ == "__main__":
+    main()
