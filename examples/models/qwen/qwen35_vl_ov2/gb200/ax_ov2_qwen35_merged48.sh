@@ -118,7 +118,9 @@ if [[ "$OV2_RECOMPUTE_FULL" == 0 && "$OV2_CUDA_MEM_FRACTION" == 0.88 ]]; then
   _die "selective recompute does not fit on 48 GPUs (09-13: OOM at the 0.88 AND 0.92 caps, true peak >= 185 GiB); use OV2_RECOMPUTE_FULL=1"
 fi
 export OV2_MEM_PROBE="${OV2_MEM_PROBE:-$MB_PER_RANK}"
-export SAVE_EVERY="${SAVE_EVERY:-1000}"
+# 09-14: the first production attempt lost 579 iterations (8h53m) when the master pod vanished before the first
+# save -- keep saves dense until the failure mode is understood, then raise back to 1000 (SAVE_EVERY=1000).
+export SAVE_EVERY="${SAVE_EVERY:-250}"
 export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_qwen35_merged_img38_tp4_dp12}"
 
 # ---- HF assets (config source + processor): the on-cluster extracts, not the pool's raw VL config ----------------
@@ -246,6 +248,20 @@ fi
 # Muon s2 constants pinned AFTER the recipe's midtrain defaults; scheduler wd must equal optimizer wd every step.
 # most_recent_k bounds the SAVE (~340 GB per save); OV2_KEEP_CKPTS raises the window (3 = final + two before it).
 export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_scale_mode=spectral optimizer.muon_extra_scale_factor=0.15 optimizer.adam_beta2=0.95 optimizer.weight_decay=0.01 scheduler.start_weight_decay=0.01 scheduler.end_weight_decay=0.01 model.freeze_language_model=false model.freeze_vision_model=false model.freeze_adapter=false checkpoint.most_recent_k=${OV2_KEEP_CKPTS:-3} logger.log_throughput=${OV2_LOG_THROUGHPUT:-true} checkpoint.finetune=false checkpoint.load_optim=true checkpoint.load_rng=true scheduler.override_opt_param_scheduler=false scheduler.use_checkpoint_opt_param_scheduler=true"
+
+# ---- host-memory sampler (every pod, every OV2_HOSTMEM_EVERY_S seconds, into this pod's LOG) -------------------------
+# The pod cgroup limit is ~1 TB; the 09-13 smoke saw anon+shmem climb 463 -> 584 GB in minutes at workers=2/buffer=16
+# and the 09-14 production master pod died without a traceback. One line per sample keeps the evidence.
+export OV2_HOSTMEM_EVERY_S="${OV2_HOSTMEM_EVERY_S:-300}"
+if [[ "$OV2_HOSTMEM_EVERY_S" =~ ^[1-9][0-9]*$ && "${OV2_PREFLIGHT_ONLY:-0}" != 1 && -r /sys/fs/cgroup/memory.current ]]; then
+  ( while sleep "$OV2_HOSTMEM_EVERY_S"; do
+      _cur="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"; _max="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
+      _st="$(awk '/^(anon|file|shmem) /{printf "%s=%.1fG ", $1, $2/1e9}' /sys/fs/cgroup/memory.stat 2>/dev/null)"
+      _gpu="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -1)"
+      printf '[hostmem %s] cgroup current=%.1fG max=%s %s gpu_max_used=%sMiB\n' "$(date '+%F %T')" "$(( ${_cur:-0} / 1000000 ))e-3" "${_max:-?}" "$_st" "${_gpu:-?}" >> "$LOG"
+    done ) &
+  _say "hostmem sampler: every ${OV2_HOSTMEM_EVERY_S}s -> $LOG (grep hostmem)"
+fi
 
 # ---- permanent archive every OV2_ARCHIVE_EVERY iters (master pod only; 0 disables) ------------------------------
 # Publish archives atomically with the completion marker already inside. The helper verifies the
