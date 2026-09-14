@@ -33,6 +33,10 @@ def _cuda(x):
 def get_batch(data_iterator: Iterable):
     """Pull one batch from the (energon) iterator and move tensors to CUDA. No label shift."""
     batch = next(data_iterator)
+    if os.environ.get("OV2_LONG_CONTEXT_PROBE_DIR"):
+        from megatron.bridge.models.qwen_vl_ov2.long_context_probe import record_batch as record_long_batch
+
+        record_long_batch(batch)
     if os.environ.get("OV2_AB_INPUT_DIR"):
         from megatron.bridge.models.qwen_vl_ov2.ablation_inputs import record_batch
 
@@ -92,6 +96,10 @@ def forward_step(
         (output_tensor, loss_function) where output_tensor is the per-token loss [b, s]
         returned by the model (labels provided) and loss_function reduces it with loss_mask.
     """
+    if os.environ.get("OV2_LONG_CONTEXT_PROBE_DIR"):
+        from megatron.bridge.models.qwen_vl_ov2.long_context_probe import record_runtime
+
+        record_runtime(state, model)
     timers = state.timers
     timers("batch-generator", log_level=2).start()
     tokens, labels, loss_mask, attention_mask, pixel_values, image_grid_thw, cu_seqlens, patch_positions = get_batch(data_iterator)
