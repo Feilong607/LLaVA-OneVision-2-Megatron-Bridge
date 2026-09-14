@@ -118,9 +118,9 @@ if [[ "$OV2_RECOMPUTE_FULL" == 0 && "$OV2_CUDA_MEM_FRACTION" == 0.88 ]]; then
   _die "selective recompute does not fit on 48 GPUs (09-13: OOM at the 0.88 AND 0.92 caps, true peak >= 185 GiB); use OV2_RECOMPUTE_FULL=1"
 fi
 export OV2_MEM_PROBE="${OV2_MEM_PROBE:-$MB_PER_RANK}"
-# 09-14: the first production attempt lost 579 iterations (8h53m) when the master pod vanished before the first
-# save -- keep saves dense until the failure mode is understood, then raise back to 1000 (SAVE_EVERY=1000).
-export SAVE_EVERY="${SAVE_EVERY:-250}"
+# 09-14: the first attempt lost 579 iterations (8h53m) to a GPU launch failure + nvshmem chain before the first
+# save. Operator decision: keep 1000 (at ~40 s/iter that is ~11 h between saves); pass SAVE_EVERY=250 to densify.
+export SAVE_EVERY="${SAVE_EVERY:-1000}"
 export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_qwen35_merged_img38_tp4_dp12}"
 
 # ---- HF assets (config source + processor): the on-cluster extracts, not the pool's raw VL config ----------------
