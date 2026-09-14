@@ -229,7 +229,22 @@ if (( _RESUME_STEP > 0 )); then
   [[ "$_old_mem" == "$_MEM_FP" ]] || _say "memory-only settings changed on resume (allowed): saved [$_old_mem] -> launch [$_MEM_FP]"
 elif [[ "${OV2_PREFLIGHT_ONLY:-0}" != 1 ]]; then
   mkdir -p "$SAVE"
-  python3 "$_STATE_HELPER" fingerprint "$_FP" "$_STREAM_FP" "$_MEM_FP" || _die "fresh launch fingerprint conflict"
+  # Fresh launch (no checkpoint in SAVE). A fingerprint left by an earlier attempt that never saved (09-14 #2:
+  # 208 iters, then restarted with OV2_SHUFFLE_BUFFER=8) protects nothing and must not block the relaunch: the
+  # MASTER pod removes a stale one, then publishes; workers that arrive before that and see a conflict retry
+  # for up to 2 minutes (the helper's publish-once/verify-all semantics still catch pods launched with
+  # different settings, which never converge).
+  if [[ "$(hostname)" == *-master-0 && -f "$_FP" ]]; then
+    _say "fresh launch: replacing stale fingerprint left by an attempt that never saved ($_FP)"
+    rm -f "$_FP"
+  fi
+  _fp_ok=0
+  for _try in $(seq 1 24); do
+    if python3 "$_STATE_HELPER" fingerprint "$_FP" "$_STREAM_FP" "$_MEM_FP" 2>/dev/null; then _fp_ok=1; break; fi
+    (( _try == 1 )) && _say "fingerprint conflict on a fresh launch; waiting for the master to republish (up to 120 s)"
+    sleep 5
+  done
+  (( _fp_ok )) || { python3 "$_STATE_HELPER" fingerprint "$_FP" "$_STREAM_FP" "$_MEM_FP"; _die "fresh launch fingerprint conflict persisted 120 s -- pods were launched with different settings, or a stale fingerprint on a non-master pod: rm $_FP and relaunch"; }
   _say "fingerprint published/verified: $_FP"
 fi
 
