@@ -17,7 +17,8 @@ Verdict logic (printed at the end, plus a malloc_trim(0) test):
                                                                  tokenizers), not visible to tracemalloc
 
 CPU-only, no GPU, no torchrun. Needs the datasets mount and the HF processor dir. Typical run
-(from ~/bridge-export, in the training image):
+(from ~/bridge-export, in the training image; no PYTHONPATH needed -- the script folds in src/,
+Megatron-LM, aiak_shim, pylibs and the _verify_stubs sitecustomize itself):
 
   python examples/models/qwen/qwen35_vl_ov2/gb200/probe_worker_leak.py --n 300 --every 25
 
@@ -45,8 +46,22 @@ _REPO = _HERE.parents[4]
 for _p in (_REPO / "src", _REPO / "3rdparty" / "Megatron-LM", _REPO / "aiak_shim"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
-for _extra in filter(None, os.environ.get("OV2_EXTRA_PYLIBS", "").split(":")):
-    sys.path.insert(0, _extra)
+# Offline packages the launchers fold in ($HOME/pylibs, $REPO/pylibs, OV2_EXTRA_PYLIBS), same precedence.
+for _extra in [*filter(None, os.environ.get("OV2_EXTRA_PYLIBS", "").split(":")),
+               str(_REPO / "pylibs"), os.path.join(os.path.expanduser("~"), "pylibs")]:
+    if os.path.isdir(_extra) and _extra not in sys.path:
+        sys.path.insert(0, _extra)
+# The launchers put $REPO/_verify_stubs FIRST on PYTHONPATH so its sitecustomize runs at interpreter start
+# (boto3<->botocore rename compat for this image's mixed dist-packages/venv, diffusers/modelopt stubs).
+# A bare `python probe.py` skips that, and `from transformers import AutoProcessor` then dies in
+# accelerate -> boto3. Load the same module by path (not by name: the system sitecustomize owns that name).
+_STUBS = _REPO / "_verify_stubs" / "sitecustomize.py"
+if _STUBS.is_file():
+    import importlib.util
+
+    _spec = importlib.util.spec_from_file_location("_ov2_verify_stubs", _STUBS)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
 
 
 class _MallInfo2(ctypes.Structure):
@@ -134,6 +149,7 @@ def main():
     logger.info(f"[probe] stack: torch={torch.__version__} transformers={transformers.__version__} PIL={PIL.__version__} "
                 f"numpy={numpy.__version__} energon={getattr(energon, '__version__', '?')} "
                 f"processor={type(te.proc).__name__} image_processor={type(_ip).__name__} "
+                f"tokenizer={type(getattr(te.proc, 'tokenizer', te.proc)).__name__} "
                 f"torch_threads={torch.get_num_threads()}")
     wc = WorkerConfig.default_worker_config(0)  # in-process: this process IS the worker
     ds = get_train_dataset(
