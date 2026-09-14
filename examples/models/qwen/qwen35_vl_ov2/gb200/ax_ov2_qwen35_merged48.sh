@@ -257,8 +257,11 @@ if [[ "$OV2_HOSTMEM_EVERY_S" =~ ^[1-9][0-9]*$ && "${OV2_PREFLIGHT_ONLY:-0}" != 1
   ( while sleep "$OV2_HOSTMEM_EVERY_S"; do
       _cur="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"; _max="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
       _st="$(awk '/^(anon|file|shmem) /{printf "%s=%.1fG ", $1, $2/1e9}' /sys/fs/cgroup/memory.stat 2>/dev/null)"
-      _gpu="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -1)"
-      printf '[hostmem %s] cgroup current=%.1fG max=%s %s gpu_max_used=%sMiB\n' "$(date '+%F %T')" "$(( ${_cur:-0} / 1000000 ))e-3" "${_max:-?}" "$_st" "${_gpu:-?}" >> "$LOG"
+      _gpu="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr '\n' '/' | sed 's#/$##')"
+      # who holds it: /dev/shm (worker->main batch queue) and the top-4 RSS processes (trainer ranks vs dataloader workers)
+      _shm="$(df -k /dev/shm 2>/dev/null | awk 'NR==2{printf "%.1fG", $3/1e6}')"
+      _top="$(ps -eo rss=,comm=,args= --sort=-rss 2>/dev/null | awk 'NR<=4{n=$2; if ($0 ~ /pt_data_worker|DataLoader/) n="dl_worker"; else if ($0 ~ /run_recipe/) n="trainer"; printf "%s:%.0fG ", n, $1/1e6}')"
+      printf '[hostmem %s] cgroup current=%.1fG max=%s %s shm_used=%s top_rss=[%s] gpu_used_MiB=%s\n' "$(date '+%F %T')" "$(( ${_cur:-0} / 1000000 ))e-3" "${_max:-?}" "$_st" "${_shm:-?}" "$_top" "${_gpu:-?}" >> "$LOG"
     done ) &
   _say "hostmem sampler: every ${OV2_HOSTMEM_EVERY_S}s -> $LOG (grep hostmem)"
 fi
