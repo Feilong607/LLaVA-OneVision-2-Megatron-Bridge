@@ -38,7 +38,7 @@
 # Barrier evidence is retained: deleting it while another pod is polling is unsafe.
 # Exit: 0 = all three legs passed, 1 = a candidate failed, 2 = summary failure, 3 = coordination failure.
 #
-# Workload form: Distributed/PyTorch, qwen35-fla image, gb200-nvl72-nodes, Workers=11 (12 pods x 4 GPU),
+# Workload form: Distributed/PyTorch, qwen35-fla image, gb200-nvl72-nodes, Workers=11 (12 pods x 4 GPU) or Workers=3 (4 pods, hang hunt),
 # Command (both sides) = bash, Args (both sides) = this file's absolute path. Nothing else.
 # Read-out (code-sync workspace):  cat ~/train_logs/smoke_speed_ladder_<job>.txt
 # =============================================================================
@@ -106,13 +106,19 @@ _REF_GLOB="${OV2_LADDER_REF_GLOB:-$HOME/train_logs/smoke_qwen35_merged64k_q35-im
 [[ -f "$OV2_HF_PROC_QWEN35_P16M33/preprocessor_config.json" ]] || { _say "FATAL: missing processor at $OV2_HF_PROC_QWEN35_P16M33"; exit 1; }
 
 _result_of() { echo "$HOME/train_logs/smoke_qwen35_merged64k_result_${_L_TAG}-$1.txt"; }
+# Pod count: 12 (48 GPUs, the production shard) or 4 (16 GPUs: exactly ONE expert group of ETP2 x EP8 = 16
+# ranks, i.e. the same alltoall/HybridEP group structure as each of the 48-GPU run's three groups -- enough
+# for a forward-collective hang hunt while the 48 production GPUs are busy). GBS per leg = 4 microbatches per
+# rank = 4 x DP, DP = pods x 4 / TP; the 48 % (ETP*EP) rule holds for both (48 % 16 = 16 % 16 = 0).
 _NPODS="${PET_NNODES:-${OV2_LADDER_NPODS:-12}}"
-[[ "$_NPODS" == 12 && "${NPROC:-4}" == 4 ]] || { _say "FATAL: this ladder requires 12 pods x 4 GPUs"; exit 3; }
+[[ ( "$_NPODS" == 12 || "$_NPODS" == 4 ) && "${NPROC:-4}" == 4 ]] || { _say "FATAL: this ladder requires 12 or 4 pods x 4 GPUs (got PET_NNODES=$_NPODS)"; exit 3; }
 [[ "$_ITERS" =~ ^[1-9][0-9]*$ ]] || { _say "FATAL: invalid OV2_LADDER_ITERS"; exit 3; }
+_WORLD=$(( _NPODS * 4 ))
+_gbs_for_tp() { echo $(( 4 * _WORLD / $1 )); }   # 4 microbatches per rank
 _EXPECTED=("${_L_TAG}-master-0")
-for (( _i=0; _i<11; _i++ )); do _EXPECTED+=("${_L_TAG}-worker-${_i}"); done
+for (( _i=0; _i<_NPODS-1; _i++ )); do _EXPECTED+=("${_L_TAG}-worker-${_i}"); done
 _case_rank=""
-for (( _i=0; _i<12; _i++ )); do [[ "${_EXPECTED[$_i]}" != "$_L_HOST" ]] || _case_rank=$_i; done
+for (( _i=0; _i<_NPODS; _i++ )); do [[ "${_EXPECTED[$_i]}" != "$_L_HOST" ]] || _case_rank=$_i; done
 [[ -n "$_case_rank" && "${PET_NODE_RANK:-$_case_rank}" == "$_case_rank" ]] || { _say "FATAL: invalid/conflicting pod identity"; exit 3; }
 _BAR_DIR="$HOME/train_logs/.ladder_barrier_${_L_TAG}"
 mkdir -p "$_BAR_DIR" || exit 3
@@ -134,8 +140,8 @@ _barrier() {
     if compgen -G "$_BAR_DIR/abort.*" > /dev/null; then _say "FATAL: peer aborted; inspect $_BAR_DIR"; exit 3; fi
     n=0
     for host in "${_EXPECTED[@]}"; do [[ ! -f "$_BAR_DIR/${leg}.${host}" ]] || n=$((n+1)); done
-    (( n == 12 )) && { _say "barrier $leg: 12/12 pods done"; return 0; }
-    (( $(date +%s) < dl )) || { _say "FATAL: barrier $leg timeout ($n/12)"; exit 3; }
+    (( n == _NPODS )) && { _say "barrier $leg: $n/$_NPODS pods done"; return 0; }
+    (( $(date +%s) < dl )) || { _say "FATAL: barrier $leg timeout ($n/$_NPODS)"; exit 3; }
     sleep 1
   done
 }
@@ -195,25 +201,25 @@ _A_RES="$(_result_of A)"; _S_RES="$(_result_of S)"; _T_RES="$(_result_of T)"
 # ---------------- A: TP4 full recompute, HybridEP (steady-state baseline) ----------------
 if _want A; then
 export OV2_RECOMPUTE_FULL=1 OV2_RECOMPUTE_MOE=0 OV2_VISION_RECOMPUTE=1
-_leg A 4 48 2
+_leg A 4 "$(_gbs_for_tp 4)" 2
 _A_MEM="$(_max_alloc "$_A_RES")"
-_say "A: passed=$(_passed "$_A_RES" && echo yes || echo no) max_allocated=${_A_MEM:-?} GiB; $(_tput A 48)"
+_say "A: passed=$(_passed "$_A_RES" && echo yes || echo no) max_allocated=${_A_MEM:-?} GiB; $(_tput A "$(_gbs_for_tp 4)")"
 fi
 
 # ---------------- S: TP4 selective attn+moe, HybridEP (the §13 production recompute: does it fit?) ----------------
 if _want S; then
 export OV2_RECOMPUTE_FULL=0 OV2_RECOMPUTE_MOE=1 OV2_VISION_RECOMPUTE=1
-_leg S 4 48 2
+_leg S 4 "$(_gbs_for_tp 4)" 2
 _S_MEM="$(_max_alloc "$_S_RES")"
-_say "S: passed=$(_passed "$_S_RES" && echo yes || echo no) max_allocated=${_S_MEM:-?} GiB; $(_tput S 48)"
+_say "S: passed=$(_passed "$_S_RES" && echo yes || echo no) max_allocated=${_S_MEM:-?} GiB; $(_tput S "$(_gbs_for_tp 4)")"
 fi
 
 # ---------------- T: TP2 full recompute, alltoall (fits without MTP? faster?) ----------------
 if _want T; then
 export OV2_RECOMPUTE_FULL=1 OV2_RECOMPUTE_MOE=0 OV2_VISION_RECOMPUTE=1
-_leg T 2 96 0
+_leg T 2 "$(_gbs_for_tp 2)" 0
 _T_MEM="$(_max_alloc "$_T_RES")"
-_say "T: passed=$(_passed "$_T_RES" && echo yes || echo no) max_allocated=${_T_MEM:-?} GiB; $(_tput T 96)"
+_say "T: passed=$(_passed "$_T_RES" && echo yes || echo no) max_allocated=${_T_MEM:-?} GiB; $(_tput T "$(_gbs_for_tp 2)")"
 fi
 
 _RC=0; for _l in $_LEGS; do _passed "$(_result_of "$_l")" || _RC=1; done
@@ -222,22 +228,23 @@ _RC=0; for _l in $_LEGS; do _passed "$(_result_of "$_l")" || _RC=1; done
 if (( _L_IS_MASTER )); then
   _tmp="$_L_OUT.$$"
   {
-    echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS mem_fraction $OV2_CUDA_MEM_FRACTION nccl_trace $OV2_LADDER_NCCL_TRACE legs [$_LEGS] iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
+    echo "qwen35 merged-stage 48-GPU speed ladder — job $_L_TAG — $(date '+%F %T') — blend $DATA_PATH seq $OV2_SEQ_LEN ce_fusion $OV2_CE_FUSION mtp_layers $OV2_MTP_LAYERS mem_fraction $OV2_CUDA_MEM_FRACTION nccl_trace $OV2_LADDER_NCCL_TRACE pods $_NPODS (world $_WORLD) legs [$_LEGS] iters/leg $_ITERS (per-rank microbatches equal: GBS = 4 x DP)"
     echo "reference (09-13 memory smoke, WITH MTP, 20 iters, different LR-decay length): TP4 full recompute max_allocated 115.2 GiB, ~100 s/iter during warm-up"
     echo "optimizer: Muon spectral, lr=$OV2_LR->$OV2_MIN_LR, extra_scale=0.15, adam_beta2=0.95, optimizer/scheduler weight_decay=0.01; all components trainable"
     echo
     echo "---- throughput (samples/s = GBS / mean of last 20 Step Time; s/iter is NOT comparable across legs) ----"
-    echo "A: $(_tput A 48)"
-    echo "S: $(_tput S 48)"
-    echo "T: $(_tput T 96)"
+    _g4="$(_gbs_for_tp 4)"; _g2="$(_gbs_for_tp 2)"
+    echo "A: $(_tput A "$_g4")"
+    echo "S: $(_tput S "$_g4")"
+    echo "T: $(_tput T "$_g2")"
     _ma="$(_mean_step A)"; _ms="$(_mean_step S)"; _mt="$(_mean_step T)"
     if _passed "$_A_RES" && _passed "$_S_RES" && [[ -n "$_ma" && -n "$_ms" ]]; then
-      python3 -c "a=float('$_ma'); x=float('$_ms'); print(f'S vs A speedup = (48/{x:.1f}) / (48/{a:.1f}) = A_s/S_s = {a/x:.3f}x')"
+      python3 -c "a=float('$_ma'); x=float('$_ms'); g=$_g4; print(f'S vs A speedup = ({g}/{x:.1f}) / ({g}/{a:.1f}) = A_s/S_s = {a/x:.3f}x')"
     else
       echo "S vs A speedup: n/a (a leg failed, ran too few steps, or has no valid timing)"
     fi
     if _passed "$_A_RES" && _passed "$_T_RES" && [[ -n "$_ma" && -n "$_mt" ]]; then
-      python3 -c "a=float('$_ma'); t=float('$_mt'); print(f'T vs A speedup = (96/{t:.1f}) / (48/{a:.1f}) = 2*A_s/T_s = {2*a/t:.3f}x')"
+      python3 -c "a=float('$_ma'); t=float('$_mt'); g2=$_g2; g4=$_g4; print(f'T vs A speedup = ({g2}/{t:.1f}) / ({g4}/{a:.1f}) = 2*A_s/T_s = {2*a/t:.3f}x')"
     else
       echo "T vs A speedup: n/a (a leg failed, ran too few steps, or has no valid timing)"
     fi
@@ -255,9 +262,9 @@ PY
       echo; echo "---- leg $leg ----"
       _want "$leg" || { echo "not selected (OV2_LADDER_LEGS=$_LEGS)"; continue; }
       case "$leg" in
-        A) echo "TP4/ETP2 GBS48 (DP12), full recompute, ACCEL=2 HybridEP, no MTP (OV2_MTP_LAYERS=$OV2_MTP_LAYERS)";;
-        S) echo "TP4/ETP2 GBS48 (DP12), selective attn+moe = the §13 production recompute, ACCEL=2 HybridEP, no MTP";;
-        T) echo "TP2/ETP2 GBS96 (DP24), full recompute, ACCEL=0 alltoall, no MTP  [per-rank work = 4 microbatches, same as A]";;
+        A) echo "TP4/ETP2 GBS$_g4 (DP$(( _WORLD / 4 ))), full recompute, ACCEL=2 HybridEP, no MTP (OV2_MTP_LAYERS=$OV2_MTP_LAYERS)";;
+        S) echo "TP4/ETP2 GBS$_g4 (DP$(( _WORLD / 4 ))), selective attn+moe = the §13 production recompute, ACCEL=2 HybridEP, no MTP";;
+        T) echo "TP2/ETP2 GBS$_g2 (DP$(( _WORLD / 2 ))), full recompute, ACCEL=0 alltoall, no MTP  [per-rank work = 4 microbatches, same as A]";;
       esac
       r="$(_result_of "$leg")"
       if [[ -f "$r" ]]; then cat "$r"; else echo "no RESULT file (leg died before the verdict -- OOM/FATAL: see its logs)"; fi

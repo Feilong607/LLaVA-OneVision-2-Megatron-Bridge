@@ -14,12 +14,13 @@ from pathlib import Path
 home=Path.home(); host=os.environ['FAKE_HOST']; leg=os.environ['OV2_SMOKE_LEG']
 tag=host.rsplit('-',2)[0]; logs=home/'train_logs'
 (logs/f'{leg}.{host}.started').write_text(str(time.time()))
-if host.endswith('worker-10') and leg=='A': time.sleep(1.5)
+last=os.environ.get('FAKE_LAST','worker-10')
+if host.endswith(last) and leg=='A': time.sleep(1.5)
 bad=os.environ.get('FAKE_MODE')=='worker_fail' and host.endswith('worker-5') and leg=='A'
 seconds=100 if leg=='A' else 150
 log=logs/f'smoke_qwen35_merged64k_{tag}-{leg}_{host}.log'
 log.write_text(('prefix Step Time : '+str(seconds)+'s GPU utilization: 0\\n')*80 + f'[qwen35-smoke] rc={7 if bad else 0} pod_peak_mem_mib=1\\n')
-if host.endswith('worker-10'):
+if host.endswith(last):
     result=logs/f'smoke_qwen35_merged64k_result_{tag}-{leg}.txt'
     n=17 if os.environ.get('FAKE_MODE')=='short_run' else 77
     result.write_text(f'iters: n={n} p50=1ms\\ntorch memory: max_allocated=115.0 max_reserved=120.0\\nVERDICT: PASS\\n')
@@ -46,9 +47,11 @@ def run_ladder(tmp_path):
     (binary / "hostname").chmod(0o755)
     env = {"HOME": str(tmp_path), "PATH": f"{binary}:{Path(sys.executable).parent}:/usr/bin:/bin", "PET_NNODES": "12"}
 
-    def run(mode="", nodes=12, legs=None):
-        if nodes != 12:
+    def run(mode="", nodes=12, legs=None, declared_nodes=None):
+        if nodes != (declared_nodes or 12):
             script.write_text(script.read_text().replace("90 * 60", "2"))
+        env["PET_NNODES"] = str(declared_nodes or 12)
+        env["FAKE_LAST"] = f"worker-{(declared_nodes or 12) - 2}"  # the fake writes RESULT on the last pod
         children = []
         for rank in range(nodes):
             host = "job-master-0" if rank == 0 else f"job-worker-{rank - 1}"
@@ -122,3 +125,14 @@ def test_leg_selection_skips_unselected_legs(run_ladder):
     assert "legs [S T]" in summary
     assert "not selected (OV2_LADDER_LEGS=S T)" in summary  # the A block says so instead of "no RESULT file"
     assert "S vs A speedup: n/a" in summary and "T vs A speedup: n/a" in summary  # no A to compare against
+
+
+def test_four_pod_hang_hunt_shape(run_ladder):
+    run, root = run_ladder
+    outputs = run(nodes=4, declared_nodes=4, legs="T")
+    assert all(rc == 0 for rc, _, _ in outputs), outputs
+    logs = root / "train_logs"
+    assert len(list(logs.glob("T.*.finished"))) == 4 and not list(logs.glob("A.*.started"))
+    summary = (logs / "smoke_speed_ladder_job.txt").read_text()
+    assert "pods 4 (world 16)" in summary
+    assert "TP2/ETP2 GBS32 (DP8)" in summary  # 16 GPUs / TP2 = DP8, 4 microbatches per rank
