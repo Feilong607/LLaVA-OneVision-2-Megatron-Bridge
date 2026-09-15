@@ -324,7 +324,14 @@ class OV2EnergonProvider(EnergonProvider):
         if os.environ.get("OV2_ENERGON_DROP_YIELDED", "0") == "1":
             from megatron.bridge.recipes.ov2.data.energon.energon_patches import apply_drop_yielded_patch
 
-            apply_drop_yielded_patch()
+            # Fail fast (identically on every rank, before any GPU work) rather than run unpatched for hours
+            # and die at the pod's memory limit again: a new image / energon version moves the anchors.
+            if not apply_drop_yielded_patch():
+                raise RuntimeError(
+                    "OV2_ENERGON_DROP_YIELDED=1 but the energon drop_yielded patch could not be applied "
+                    "(see the warning above: anchors did not match this energon version). Update "
+                    "energon_patches.py for this image, or set OV2_ENERGON_DROP_YIELDED=0 to run unpatched."
+                )
         dataset = EnergonMultiModalDataModule(
             path=self.path,
             tokenizer=context.tokenizer if context.tokenizer is not None else self.tokenizer,
