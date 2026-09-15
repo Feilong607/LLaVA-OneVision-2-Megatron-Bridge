@@ -133,11 +133,11 @@ def _live_big_objects():
     }
 
 
-def _who_holds(sample_objs, frame_t, depth=8, chains=3):
+def _who_holds(sample_objs, frame_t, depth=8, chains=3, skip=()):
     """Walk gc.get_referrers upward from a few retained objects and name the containers (type, dict key, len)."""
     import inspect
 
-    skip_ids = {id(sample_objs)}
+    skip_ids = {id(sample_objs), *(id(x) for x in skip)}
     for o in sample_objs[:chains]:
         _sz = getattr(o, "size", None) if not isinstance(o, (bytes, bytearray)) else len(o)
         cur, seen, chain = o, {id(o)}, [f"{type(o).__name__}({_sz})"]
@@ -161,7 +161,15 @@ def _who_holds(sample_objs, frame_t, depth=8, chains=3):
                 if attrs:
                     desc += f".{attrs[0]}"
             if len(refs) > 1:
-                desc += f" (+{len(refs) - 1} other referrers: {sorted({type(x).__name__ for x in refs[1:]})[:4]})"
+                _others = []
+                for x in refs[1:4]:
+                    _d = type(x).__name__
+                    if isinstance(x, dict):
+                        _d += f"[keys={[k for k, v in x.items() if v is cur][:2]!r}]"
+                    elif isinstance(x, (list, tuple)):
+                        _d += f"[len={len(x)}]"
+                    _others.append(_d)
+                desc += f" (+{len(refs) - 1} other referrers: {_others})"
             chain.append(desc)
             seen.add(id(r))
             cur = r
@@ -256,9 +264,10 @@ def main():
                 # (gc.get_objects is roughly allocation-ordered, so the first ones are the long-lived ones),
                 # else large byte strings.
                 pil, big = live["_pil"], live["_big"]
-                _who_holds(pil[: 3] if pil else big, live["_frame_t"])
+                _mine = (live, pil, big)   # the probe's own containers must not show up as "holders"
+                _who_holds(pil[: 3] if pil else big, live["_frame_t"], skip=_mine)
                 if len(pil) > 10:
-                    _who_holds(pil[len(pil) // 2: len(pil) // 2 + 1], live["_frame_t"], chains=1)
+                    _who_holds(pil[len(pil) // 2: len(pil) // 2 + 1], live["_frame_t"], chains=1, skip=_mine)
             del live, pil, big
         if n >= args.n:
             break
