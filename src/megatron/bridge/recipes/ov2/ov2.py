@@ -316,6 +316,15 @@ class OV2EnergonProvider(EnergonProvider):
         if self.task_encoder is not None:
             self.task_encoder.seq_len = self.seq_length
             self.task_encoder.seq_length = self.seq_length
+        # ---- energon per-component sample pinning (default: untouched) ----
+        # OV2_ENERGON_DROP_YIELDED=1 re-compiles energon's RepeatDataset/MapDataset __iter__ so a suspended
+        # blend component no longer keeps its last decoded sample alive (127-way 64k-pack blend: ~50 GB per
+        # dataloader worker, 900 GB per pod on the merged48 runs). Must run BEFORE the loader forks its
+        # persistent workers (energon uses multiprocessing_context="fork"), i.e. here. See energon_patches.py.
+        if os.environ.get("OV2_ENERGON_DROP_YIELDED", "0") == "1":
+            from megatron.bridge.recipes.ov2.data.energon.energon_patches import apply_drop_yielded_patch
+
+            apply_drop_yielded_patch()
         dataset = EnergonMultiModalDataModule(
             path=self.path,
             tokenizer=context.tokenizer if context.tokenizer is not None else self.tokenizer,

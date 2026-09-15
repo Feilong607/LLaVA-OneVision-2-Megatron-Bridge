@@ -22,6 +22,10 @@ Megatron-LM, aiak_shim, pylibs and the _verify_stubs sitecustomize itself):
 
   python examples/models/qwen/qwen35_vl_ov2/gb200/probe_worker_leak.py --n 300 --every 25
 
+--fix applies the energon drop_yielded patch (same code path as OV2_ENERGON_DROP_YIELDED=1 in training) for an
+A/B: unpatched, 'live sample objects' PackedCaptioningSample grows ~1 per touched blend component (38 at n=40);
+patched it should stay near shuffle_buffer + in-flight (<= ~10) and d_rss flatten.
+
 Env knobs: OV2_HF_PROC_QWEN35_P16M33 (processor dir; default $HOME/qwen35_p16m33_auto_model like the
 production wrapper), OV2_PRETRAIN_ROOT, OV2_EXTRA_PYLIBS. To A/B an allocator fix, prefix the same command
 with MALLOC_MMAP_THRESHOLD_=131072 MALLOC_TRIM_THRESHOLD_=131072, or (GB200 qwen35-fla image, aarch64)
@@ -333,6 +337,9 @@ def main():
     ap.add_argument("--buffer", type=int, default=8, help="shuffle_buffer_size (production: 8)")
     ap.add_argument("--top", type=int, default=8, help="tracemalloc top-N lines per report")
     ap.add_argument("--merge", type=int, default=3, help="spatial_merge_size (qwen3.5 p16m33: 3)")
+    ap.add_argument("--fix", action="store_true",
+                    help="apply energon_patches.apply_drop_yielded_patch() before building the dataset (A/B the fix: "
+                         "retained PackedCaptioningSample should stay ~shuffle buffer + in-flight instead of growing with n)")
     args = ap.parse_args()
 
     import megatron.bridge.recipes.ov2.ov2_qwen35 as q35  # registers the backbone
@@ -353,6 +360,10 @@ def main():
           f"MALLOC_MMAP_THRESHOLD_={os.environ.get('MALLOC_MMAP_THRESHOLD_')} "
           f"MALLOC_TRIM_THRESHOLD_={os.environ.get('MALLOC_TRIM_THRESHOLD_')} LD_PRELOAD={os.environ.get('LD_PRELOAD')}")
 
+    if args.fix:
+        from megatron.bridge.recipes.ov2.data.energon.energon_patches import apply_drop_yielded_patch
+
+        logger.info(f"[probe] fix: drop_yielded applied={apply_drop_yielded_patch()}")
     lib = _libc()
     tracemalloc.start(12)
     te = OV2TaskEncoder(hf_processor_path=proc, seq_length=args.seq, spatial_merge_size=args.merge)

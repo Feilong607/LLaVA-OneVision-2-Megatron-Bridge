@@ -78,7 +78,8 @@ class WorkerConfig:
     @staticmethod
     def default_worker_config(n): return "wc"
 fake("megatron"); fake("megatron.bridge"); fake("megatron.bridge.recipes"); fake("megatron.bridge.recipes.ov2")
-fake("megatron.bridge.recipes.ov2.data"); fake("megatron.bridge.recipes.ov2.data.energon")
+fake("megatron.bridge.recipes.ov2.data")
+fake("megatron.bridge.recipes.ov2.data.energon").__path__ = [os.path.join(REPO, "src/megatron/bridge/recipes/ov2/data/energon")]  # real energon_patches
 fake("megatron.energon", __version__="7.4.1-fake", WorkerConfig=WorkerConfig,
      get_train_dataset=lambda *a, **k: "ds", get_savable_loader=lambda ds, worker_config=None: FakeLoader())
 fake("megatron.bridge.recipes.ov2.ov2_qwen35", _QWEN35_BACKBONE="qwen3.5-35b-a3b")
@@ -94,4 +95,62 @@ m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 _tmp = tempfile.mkdtemp(); open(os.path.join(_tmp, "preprocessor_config.json"), "w").write("{}")
 sys.argv = ["probe", "--n", "6", "--every", "3", "--proc", _tmp, "--data", "fake.yaml"]
 m.main()
+
+# ---- --fix path, phase A: fake energon has no wrappers -> patch must report NOT applied and the run must continue
+sys.argv = ["probe", "--n", "3", "--every", "3", "--proc", _tmp, "--data", "fake.yaml", "--fix"]
+m.main()
+
+# ---- --fix path, phase B: fake wrappers shaped exactly like energon 7.4.1 -> patch applies, frames stop pinning
+_wr = tempfile.mkdtemp()
+open(os.path.join(_wr, "repeat_dataset.py"), "w").write(
+    "import math\n"
+    "class RepeatDataset:\n"
+    "    def __init__(self, ds): self.dataset = ds; self._index = 0; self.repeats = 1; self._repetition = 0\n"
+    "    def __iter__(self):\n"
+    "        while self._repetition < self.repeats:\n"
+    "            for sample in self.dataset:\n"
+    "                self._index += 1\n"
+    "                yield sample\n"
+    "            self._repetition += 1\n")
+open(os.path.join(_wr, "map_dataset.py"), "w").write(
+    "def add_sample_restore_key(sample, *a, **k): return sample\n"
+    "class _H:\n"
+    "    def reset(self): pass\n"
+    "class MapDataset:\n"
+    "    def __init__(self, ds, fn): self.dataset = ds; self.map_fn = fn; self._map_failure_handler = _H()\n"
+    "    def __iter__(self):\n"
+    "        for sample in self.dataset:\n"
+    "            if True:\n"
+    "                sample_idx = 0\n"
+    "                mapped_sample = self.map_fn(sample)\n"
+    "                if False:\n"
+    "                    pass\n"
+    "                else:\n"
+    "                    self._map_failure_handler.reset()\n"
+    "                    yield add_sample_restore_key(\n"
+    "                        mapped_sample,\n"
+    "                        sample_idx,\n"
+    "                        src=self,\n"
+    "                    )\n")
+fake("megatron.energon.wrappers").__path__ = [_wr]
+from megatron.bridge.recipes.ov2.data.energon.energon_patches import apply_drop_yielded_patch
+assert apply_drop_yielded_patch() is True, "patch did not apply on 7.4.1-shaped fakes"
+import gc
+from megatron.energon.wrappers.repeat_dataset import RepeatDataset
+from megatron.energon.wrappers.map_dataset import MapDataset
+class Raw:            # the undecoded tar sample (bytes) -- stays bound in MapDataset's frame, accepted
+    pass
+class Decoded:        # what map_fn (decode) produces -- the heavy object the patch must release
+    def __init__(self, raw): self.raw = raw
+raws = [Raw() for _ in range(3)]
+decoded_seen = []
+def _decode(r):
+    d = Decoded(r); decoded_seen.append(d); return d
+chain = RepeatDataset(MapDataset(raws, _decode))             # RepeatDataset -> MapDataset(decode) -> shard list
+it = iter(chain); first = next(it)
+assert first is decoded_seen[0]
+pinned = [r for r in gc.get_referrers(decoded_seen[0]) if type(r).__name__ == "generator"]
+assert not pinned, f"patched generators still pin the DECODED sample: {pinned}"
+assert [x.raw is y for x, y in zip(RepeatDataset(MapDataset(raws, _decode)), raws)] == [True, True, True]
+print("[selftest] drop_yielded: applied on 7.4.1-shaped fakes, no generator pins the yielded sample, order intact")
 print("SELFTEST OK")

@@ -105,6 +105,11 @@ if [[ -z "${OV2_WARMUP_ITERS:-}" ]] && (( _WARMUP < 1 )); then _WARMUP=1; fi
 
 # ---- the §13 constants ---------------------------------------------------------------------------------------------
 export OV2_SEQ_LEN=73728 ACCEL="${ACCEL:-2}"
+# energon pins one decoded 64k pack per blend component in every dataloader worker (127 components -> ~50 GB
+# per worker -> 900 GB per pod, the 09-14/15 host-memory deaths). The recipe re-compiles energon's
+# RepeatDataset/MapDataset __iter__ to drop that reference (energon_patches.py). Memory-only: not in the
+# stream fingerprint. Set 0 to run the unpatched energon.
+export OV2_ENERGON_DROP_YIELDED="${OV2_ENERGON_DROP_YIELDED:-1}"
 export OV2_MTP_LAYERS=0                       # no MTP block/head (30B objective); llava_ov2 fails fast if any survives
 export OV2_CE_FUSION="${OV2_CE_FUSION:-false}"
 export OV2_MIDTRAIN_MUON=1 OV2_LR="${OV2_LR:-1e-5}" OV2_MIN_LR="${OV2_MIN_LR:-1e-6}" OV2_MOE_AUX_LOSS_COEFF="${OV2_MOE_AUX_LOSS_COEFF:-0.01}"
@@ -217,7 +222,7 @@ _FP="$SAVE/ov2_launch_fingerprint.json"
 _yaml_sha="$( (shasum -a 256 "$DATA_PATH" 2>/dev/null || sha256sum "$DATA_PATH") | awk '{print $1}')"
 [[ "$_yaml_sha" =~ ^[0-9a-f]{64}$ ]] || _die "could not hash $DATA_PATH"
 _STREAM_FP="data_sha256=$_yaml_sha data_path=$DATA_PATH gbs=$OV2_MIDTRAIN_GBS n_samples=$OV2_MIDTRAIN_N_SAMPLES iters=$_ITERS warmup=$_WARMUP seq=$OV2_SEQ_LEN tp=4 etp=2 ep=8 dp=12 mtp_layers=0 workers=${OV2_NUM_WORKERS:-2} buffer=${OV2_SHUFFLE_BUFFER:-16} sort_window=${OV2_LENGTH_SORT_WINDOW:-$MB_PER_RANK} sort_key=${OV2_LENGTH_SORT_KEY:-tokens} parallel_shard_iters=$OV2_PARALLEL_SHARD_ITERS muon=1 lr=$OV2_LR min_lr=$OV2_MIN_LR wd=0.01 extra=0.15 beta2=0.95 aux=$OV2_MOE_AUX_LOSS_COEFF"
-_MEM_FP="recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE mem_fraction=$OV2_CUDA_MEM_FRACTION accel=$ACCEL"
+_MEM_FP="recompute_full=$OV2_RECOMPUTE_FULL recompute_moe=$OV2_RECOMPUTE_MOE vision_recompute=$OV2_VISION_RECOMPUTE mem_fraction=$OV2_CUDA_MEM_FRACTION accel=$ACCEL drop_yielded=$OV2_ENERGON_DROP_YIELDED"
 if (( _RESUME_STEP > 0 )); then
   [[ -f "$_FP" ]] || _die "SAVE has checkpoints but no $_FP -- cannot prove the data stream/topology are unchanged; restore the fingerprint or start a new SAVE"
   _old_stream="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["stream"])' "$_FP")"
