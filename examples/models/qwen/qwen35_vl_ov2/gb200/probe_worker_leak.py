@@ -114,43 +114,84 @@ def _sample_bytes(batch):
     return total / 2**20
 
 
+def _modname(o):
+    """Module name of o's type as a str, or "" -- some metaclasses expose __module__ as a non-str descriptor."""
+    m = getattr(type(o), "__module__", None)
+    return m if isinstance(m, str) else ""
+
+
 def _live_big_objects():
-    """Count live large bytes / PIL images / torch tensors (the things a retained decoded sample is made of)."""
+    """Census of the live heap: the things a retained decoded sample is made of (large bytes / PIL images /
+    CPU tensors / numpy arrays), whole-sample containers, and the things that can keep them alive (suspended
+    generators, live frames, tracebacks, exceptions, list_iterators). ONE pass over gc.get_objects() with a
+    per-object try/except: a single odd object type must never abort the probe (run 6 died on a metaclass
+    whose __module__ was a getset_descriptor)."""
+    import inspect
+    from collections import Counter
+
     import torch
 
     gc.collect()
     objs = gc.get_objects()
-    big = [o for o in objs if type(o) is bytes and len(o) > 100_000]
-    pil = [o for o in objs if type(o).__module__.startswith("PIL.") and hasattr(o, "size") and hasattr(o, "mode")]
-    tens = [o for o in objs if torch.is_tensor(o) and o.device.type == "cpu"]
-    arrs = [o for o in objs if type(o).__module__ == "numpy" and hasattr(o, "nbytes") and o.nbytes > 100_000]
-    from collections import Counter
-
-    hist = Counter((o.mode, o.size) for o in pil).most_common(3)
-    # Whole-sample containers still alive (energon sample dataclasses, the encoder's SimpleNamespace subs,
-    # OV2TaskSample) -- if these grow with n, entire samples are retained, not just their images.
+    big, pil, tens, arrs, sample_objs, tbs, list_iters = [], [], [], [], [], [], []
+    samples, gens, frames, excs = Counter(), Counter(), Counter(), Counter()
     _names = ("PackedCaptioningSample", "MultiMixQASample", "OV2TaskSample", "SimpleNamespace", "OV2TaskBatch")
-    samples = Counter(type(o).__name__ for o in objs if type(o).__name__ in _names)
-    sample_objs = [o for o in objs if type(o).__name__ == "PackedCaptioningSample"]
-    # Census of the things that can keep a sample alive: suspended generators / live frames (by function),
-    # tracebacks and exceptions (an exception kept alive pins every local of every frame in its traceback),
-    # and list_iterators (run 4: the retained images hang off a suspended iteration over an image list).
-    import inspect
+    skipped = 0
+    for o in objs:
+        try:
+            t = type(o)
+            if t is bytes:
+                if len(o) > 100_000:
+                    big.append(o)
+                continue
+            tn = t.__name__
+            if tn == "list_iterator":
+                list_iters.append(o)
+            elif tn in _names:
+                samples[tn] += 1
+                if tn == "PackedCaptioningSample":
+                    sample_objs.append(o)
+            elif isinstance(o, types.FrameType):
+                frames[f"{o.f_code.co_name}@{os.path.basename(o.f_code.co_filename)}:{o.f_lineno}"] += 1
+            elif isinstance(o, types.TracebackType):
+                tbs.append(o)
+            elif isinstance(o, BaseException):
+                excs[tn] += 1
+            elif inspect.isgenerator(o):
+                gens[f"{o.gi_code.co_name}@{os.path.basename(o.gi_code.co_filename)}"] += 1
+            elif torch.is_tensor(o):
+                if o.device.type == "cpu":
+                    tens.append(o)
+            else:
+                mod = _modname(o)
+                if mod.startswith("PIL.") and hasattr(o, "size") and hasattr(o, "mode"):
+                    pil.append(o)
+                elif mod == "numpy" and getattr(o, "nbytes", 0) > 100_000:
+                    arrs.append(o)
+        except Exception:
+            skipped += 1
+    hist = Counter((o.mode, o.size) for o in pil).most_common(3)
+    tb_where = Counter()
+    for t in tbs:
+        try:
+            tb_where[f"{t.tb_frame.f_code.co_name}@{os.path.basename(t.tb_frame.f_code.co_filename)}:{t.tb_lineno}"] += 1
+        except Exception:
+            skipped += 1
 
-    gens = Counter(f"{g.gi_code.co_name}@{os.path.basename(g.gi_code.co_filename)}" for g in objs if inspect.isgenerator(g))
-    frames = Counter(f"{f.f_code.co_name}@{os.path.basename(f.f_code.co_filename)}:{f.f_lineno}" for f in objs if isinstance(f, types.FrameType))
-    tbs = [o for o in objs if isinstance(o, types.TracebackType)]
-    tb_where = Counter(f"{t.tb_frame.f_code.co_name}@{os.path.basename(t.tb_frame.f_code.co_filename)}:{t.tb_lineno}" for t in tbs)
-    excs = Counter(type(o).__name__ for o in objs if isinstance(o, BaseException))
-    list_iters = [o for o in objs if type(o).__name__ == "list_iterator"]
+    def _pil_mb(o):
+        try:
+            return o.size[0] * o.size[1] * len(o.getbands())
+        except Exception:
+            return 0
+
     return {
         "pil_hist": hist, "_pil": pil, "samples": dict(samples), "_samples": sample_objs,
-        "census": {"generators": sum(gens.values()), "gen_top": gens.most_common(6),
+        "census": {"objects": len(objs), "skipped": skipped, "generators": sum(gens.values()), "gen_top": gens.most_common(6),
                    "frames_top": frames.most_common(6), "tracebacks": len(tbs), "tb_top": tb_where.most_common(4),
                    "exceptions": dict(excs.most_common(4)), "list_iterators": len(list_iters), "gc_garbage": len(gc.garbage)},
         "_list_iters": list_iters,
         "big_bytes": (len(big), sum(len(o) for o in big) / 2**20),
-        "pil_images": (len(pil), sum((o.size[0] * o.size[1] * len(o.getbands())) for o in pil) / 2**20),
+        "pil_images": (len(pil), sum(_pil_mb(o) for o in pil) / 2**20),
         "cpu_tensors": (len(tens), sum(t.numel() * t.element_size() for t in tens) / 2**20),
         "np_arrays": (len(arrs), sum(o.nbytes for o in arrs) / 2**20),
         "_big": big, "_frame_t": types.FrameType,
@@ -178,6 +219,16 @@ def _who_holds(sample_objs, frame_t, depth=16, chains=3, skip=()):
         return f"frame[{fr.f_code.co_name} @ {os.path.basename(fr.f_code.co_filename)}:{fr.f_lineno}, var={names[:2]}]"
 
     for o in sample_objs[:chains]:
+        try:
+            _walk_one(o, frame_t, depth, skip_ids, _self_file, _frame_desc)
+        except Exception as e:  # never let a diagnostic kill the run
+            logger.info(f"[probe] holder chain: <walk failed: {type(e).__name__}: {str(e)[:80]}>")
+
+
+def _walk_one(o, frame_t, depth, skip_ids, _self_file, _frame_desc):
+    import inspect
+
+    if True:
         _sz = getattr(o, "size", None) if not isinstance(o, (bytes, bytearray)) else len(o)
         cur, seen, chain = o, {id(o)}, [f"{type(o).__name__}({_sz})"]
         # Where was this retained object allocated? (tracemalloc is on) -> original decode vs. a copy.
@@ -334,7 +385,7 @@ def main():
                         _, (lst,), idx = li.__reduce__()
                     except Exception:
                         continue
-                    if lst and type(lst[0]).__module__.startswith("PIL."):
+                    if lst and _modname(lst[0]).startswith("PIL."):
                         _pil_iters.append((li, len(lst), idx))
                 logger.info(f"[probe] list_iterators over PIL lists: {len(_pil_iters)} (of {len(lis)} list_iterators)")
                 for li, ln, idx in _pil_iters[:2]:

@@ -39,6 +39,13 @@ class Image:                       # PIL-like retained object
 class PackedCaptioningSample:
     def __init__(self, imgs): self.images = imgs
 
+# Run 6 died on an object whose type's __module__ is not a str (metaclass descriptor) -- keep such objects alive.
+class Meta(type):
+    __module__ = property(lambda cls: object())
+class Weird(metaclass=Meta):
+    pass
+WEIRD = [Weird() for _ in range(3)]
+
 LEAK = []                          # simulate the production retention: a suspended generator per sample
 def _hold(sample):
     for img in sample.images:
