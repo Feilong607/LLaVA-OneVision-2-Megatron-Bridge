@@ -46,16 +46,32 @@ class Weird(metaclass=Meta):
     pass
 WEIRD = [Weird() for _ in range(3)]
 
+# More zoo: things the census / walks touch on a real torch+transformers heap.
+class BadRepr:                      # dict key whose repr raises (tensor-like keys, broken __repr__)
+    def __repr__(self): raise RuntimeError("no repr")
+class BadGetattr:                   # hasattr() raising something other than AttributeError
+    def __getattr__(self, name): raise RuntimeError("no attrs")
+class PILish:                       # PIL-module object with mode + unhashable size
+    __module__ = "PIL.ImageDraw"
+    def __init__(self): self.mode, self.size = "RGB", [1, 2]
+class BadDict:                      # __dict__ that is not a mapping
+    @property
+    def __dict__(self): raise RuntimeError("no dict")
+ZOO = [BadGetattr(), PILish(), BadDict()]
+
 LEAK = []                          # simulate the production retention: a suspended generator per sample
 def _hold(sample):
     for img in sample.images:
         yield img
+
+BADKEYED = {}                       # a retained image reachable only through a dict with an unprintable key
 
 class FakeLoader:
     def __iter__(self):
         while True:
             s = PackedCaptioningSample([Image() for _ in range(3)])
             g = _hold(s); next(g); LEAK.append(g)
+            BADKEYED[BadRepr()] = Image()
             yield {"tokens": FakeTensor(100), "pixel_values": FakeTensor(1000), "cu_seqlens": None, "list": [FakeTensor(5)]}
 
 class WorkerConfig:

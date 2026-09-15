@@ -170,7 +170,13 @@ def _live_big_objects():
                     arrs.append(o)
         except Exception:
             skipped += 1
-    hist = Counter((o.mode, o.size) for o in pil).most_common(3)
+    hist = Counter()
+    for o in pil:
+        try:
+            hist[(o.mode, o.size)] += 1
+        except Exception:
+            skipped += 1
+    hist = hist.most_common(3)
     tb_where = Counter()
     for t in tbs:
         try:
@@ -184,16 +190,25 @@ def _live_big_objects():
         except Exception:
             return 0
 
+    def _safe_sum(seq, fn):
+        total = 0
+        for x in seq:
+            try:
+                total += fn(x)
+            except Exception:
+                pass
+        return total
+
     return {
         "pil_hist": hist, "_pil": pil, "samples": dict(samples), "_samples": sample_objs,
         "census": {"objects": len(objs), "skipped": skipped, "generators": sum(gens.values()), "gen_top": gens.most_common(6),
                    "frames_top": frames.most_common(6), "tracebacks": len(tbs), "tb_top": tb_where.most_common(4),
                    "exceptions": dict(excs.most_common(4)), "list_iterators": len(list_iters), "gc_garbage": len(gc.garbage)},
         "_list_iters": list_iters,
-        "big_bytes": (len(big), sum(len(o) for o in big) / 2**20),
-        "pil_images": (len(pil), sum(_pil_mb(o) for o in pil) / 2**20),
-        "cpu_tensors": (len(tens), sum(t.numel() * t.element_size() for t in tens) / 2**20),
-        "np_arrays": (len(arrs), sum(o.nbytes for o in arrs) / 2**20),
+        "big_bytes": (len(big), _safe_sum(big, len) / 2**20),
+        "pil_images": (len(pil), _safe_sum(pil, _pil_mb) / 2**20),
+        "cpu_tensors": (len(tens), _safe_sum(tens, lambda t: t.numel() * t.element_size()) / 2**20),
+        "np_arrays": (len(arrs), _safe_sum(arrs, lambda o: o.nbytes) / 2**20),
         "_big": big, "_frame_t": types.FrameType,
     }
 
@@ -207,10 +222,8 @@ def _report_live(live):
     logger.info(f"[probe]      census: {live['census']}")
 
 
-def _who_holds(sample_objs, frame_t, depth=16, chains=3, skip=()):
+def _who_holds(sample_objs, frame_t, depth=12, chains=3, skip=()):
     """Walk gc.get_referrers upward from a few retained objects and name the containers (type, dict key, len)."""
-    import inspect
-
     skip_ids = {id(sample_objs), *(id(x) for x in skip)}
     _self_file = os.path.abspath(__file__)
 
@@ -218,15 +231,69 @@ def _who_holds(sample_objs, frame_t, depth=16, chains=3, skip=()):
         names = [k for k, v in fr.f_locals.items() if v is target]
         return f"frame[{fr.f_code.co_name} @ {os.path.basename(fr.f_code.co_filename)}:{fr.f_lineno}, var={names[:2]}]"
 
-    for o in sample_objs[:chains]:
+    # Index, never slice/iterate: a slice list and the for-loop's list_iterator would both reference the object
+    # and show up as fake holders (runs 3-4 reported exactly that artifact: 'list[len=3] <- list_iterator').
+    for i in range(min(chains, len(sample_objs))):
         try:
-            _walk_one(o, frame_t, depth, skip_ids, _self_file, _frame_desc)
+            _walk_one(sample_objs[i], frame_t, depth, skip_ids, _self_file, _frame_desc)
         except Exception as e:  # never let a diagnostic kill the run
             logger.info(f"[probe] holder chain: <walk failed: {type(e).__name__}: {str(e)[:80]}>")
 
 
+def _srepr(x, n=80):
+    """repr() that can neither blow up nor flood the log (tensor keys, huge bytes, broken __repr__)."""
+    try:
+        return repr(x)[:n]
+    except Exception:
+        return f"<{type(x).__name__}: repr failed>"
+
+
 def _walk_one(o, frame_t, depth, skip_ids, _self_file, _frame_desc):
     import inspect
+
+    def _describe(r, cur, refs):
+        """One level's description; any failure degrades to the bare type name instead of aborting the walk."""
+        desc = type(r).__name__
+        try:
+            if isinstance(r, frame_t):
+                desc = _frame_desc(r, cur)
+            elif inspect.isgenerator(r):
+                _gl = r.gi_frame.f_lineno if r.gi_frame is not None else "finished"
+                desc = f"generator[{r.gi_code.co_name} @ {os.path.basename(r.gi_code.co_filename)}:{_gl}]"
+            elif isinstance(r, types.TracebackType):
+                desc = f"traceback[{r.tb_frame.f_code.co_name} @ {os.path.basename(r.tb_frame.f_code.co_filename)}:{r.tb_lineno}]"
+            elif isinstance(r, BaseException):
+                desc = f"exception[{type(r).__name__}: {_srepr(r, 60)}]"
+            elif type(r).__name__ == "list_iterator":
+                desc = "list_iterator"
+            elif isinstance(r, dict):
+                keys = [k for k, v in r.items() if v is cur]
+                desc += f"[key={[_srepr(k, 40) for k in keys[:2]]}, len={len(r)}]"
+            elif isinstance(r, (list, tuple, set)):
+                desc += f"[len={len(r)}]"
+            else:
+                _d = getattr(r, "__dict__", None)
+                attrs = [a for a, v in _d.items() if v is cur] if isinstance(_d, (dict, types.MappingProxyType)) else []
+                if attrs:
+                    desc += f".{attrs[0]}"
+            if len(refs) > 1:
+                _others = []
+                for x in refs[1:4]:
+                    _dx = type(x).__name__
+                    try:
+                        if isinstance(x, frame_t):
+                            _dx = _frame_desc(x, cur)
+                        elif isinstance(x, dict):
+                            _dx += f"[keys={[_srepr(k, 40) for k, v in x.items() if v is cur][:2]}]"
+                        elif isinstance(x, (list, tuple)):
+                            _dx += f"[len={len(x)}]"
+                    except Exception:
+                        pass
+                    _others.append(_dx)
+                desc += f" (+{len(refs) - 1} other referrers: {_others})"
+        except Exception as e:
+            desc += f"<describe failed: {type(e).__name__}>"
+        return desc
 
     if True:
         _sz = getattr(o, "size", None) if not isinstance(o, (bytes, bytearray)) else len(o)
@@ -246,42 +313,10 @@ def _walk_one(o, frame_t, depth, skip_ids, _self_file, _frame_desc):
                 break
             # Prefer a non-container object (it names the owner); else the first container.
             r = next((x for x in refs if not isinstance(x, (dict, list, tuple, set, frame_t))), refs[0])
-            desc = type(r).__name__
-            if isinstance(r, frame_t):
-                desc = _frame_desc(r, cur)
-            elif inspect.isgenerator(r):
-                _gl = r.gi_frame.f_lineno if r.gi_frame is not None else "finished"
-                desc = f"generator[{r.gi_code.co_name} @ {os.path.basename(r.gi_code.co_filename)}:{_gl}]"
-            elif isinstance(r, types.ModuleType):
-                chain.append(f"module[{r.__name__}]")
+            if isinstance(r, types.ModuleType):
+                chain.append(f"module[{getattr(r, '__name__', '?')}]")
                 break
-            elif isinstance(r, types.TracebackType):
-                desc = f"traceback[{r.tb_frame.f_code.co_name} @ {os.path.basename(r.tb_frame.f_code.co_filename)}:{r.tb_lineno}]"
-            elif isinstance(r, BaseException):
-                desc = f"exception[{type(r).__name__}: {str(r)[:60]!r}]"
-            elif type(r).__name__ == "list_iterator":
-                desc = "list_iterator"
-            elif isinstance(r, dict):
-                keys = [k for k, v in r.items() if v is cur]
-                desc += f"[key={keys[:2]!r}, len={len(r)}]"
-            elif isinstance(r, (list, tuple, set)):
-                desc += f"[len={len(r)}]"
-            else:
-                attrs = [a for a, v in getattr(r, "__dict__", {}).items() if v is cur]
-                if attrs:
-                    desc += f".{attrs[0]}"
-            if len(refs) > 1:
-                _others = []
-                for x in refs[1:4]:
-                    _d = type(x).__name__
-                    if isinstance(x, frame_t):
-                        _d = _frame_desc(x, cur)
-                    elif isinstance(x, dict):
-                        _d += f"[keys={[k for k, v in x.items() if v is cur][:2]!r}]"
-                    elif isinstance(x, (list, tuple)):
-                        _d += f"[len={len(x)}]"
-                    _others.append(_d)
-                desc += f" (+{len(refs) - 1} other referrers: {_others})"
+            desc = _describe(r, cur, refs)
             chain.append(desc)
             seen.add(id(r))
             cur = r
@@ -373,11 +408,11 @@ def main():
                 pil, big, smp, lis = live["_pil"], live["_big"], live["_samples"], live["_list_iters"]
                 _mine = (live, pil, big, smp, lis)   # the probe's own containers must not show up as "holders"
                 # (a) oldest retained PIL images (gc.get_objects is roughly allocation-ordered)
-                _who_holds(pil[: 2] if pil else big, live["_frame_t"], skip=_mine)
+                _who_holds(pil if pil else big, live["_frame_t"], chains=2, skip=_mine)
                 # (b) oldest retained whole samples -- far fewer levels to the holder
                 if smp:
                     logger.info(f"[probe] oldest PackedCaptioningSample refcount={sys.getrefcount(smp[0]) - 2}")
-                    _who_holds(smp[: 2], live["_frame_t"], chains=2, skip=_mine)
+                    _who_holds(smp, live["_frame_t"], chains=2, skip=_mine)
                 # (c) list_iterators whose underlying list holds PIL images: which list, where in it, who holds it
                 _pil_iters = []
                 for li in lis:
@@ -388,9 +423,9 @@ def main():
                     if lst and _modname(lst[0]).startswith("PIL."):
                         _pil_iters.append((li, len(lst), idx))
                 logger.info(f"[probe] list_iterators over PIL lists: {len(_pil_iters)} (of {len(lis)} list_iterators)")
-                for li, ln, idx in _pil_iters[:2]:
-                    logger.info(f"[probe]   iterator at index {idx}/{ln}:")
-                    _who_holds([li], live["_frame_t"], chains=1, skip=_mine + (_pil_iters,))
+                for _k in range(min(2, len(_pil_iters))):
+                    logger.info(f"[probe]   iterator at index {_pil_iters[_k][2]}/{_pil_iters[_k][1]}:")
+                    _who_holds([_pil_iters[_k][0]], live["_frame_t"], chains=1, skip=_mine + (_pil_iters, _pil_iters[_k]))
                 del smp, lis, _pil_iters
             del live, pil, big
         if n >= args.n:
@@ -409,7 +444,7 @@ def main():
                 f"PackedCaptioningSample {b_smp} -> {after['samples'].get('PackedCaptioningSample', 0)}, rss={_rss_anon_mb():.0f}M")
     if after["samples"].get("PackedCaptioningSample", 0) > 2 and after["_samples"]:
         logger.info("[probe] still held after teardown -- the holder is outside the pipeline objects:")
-        _who_holds(after["_samples"][:2], after["_frame_t"], chains=2, skip=(after, after["_samples"], after["_pil"], after["_list_iters"]))
+        _who_holds(after["_samples"], after["_frame_t"], chains=2, skip=(after, after["_samples"], after["_pil"], after["_list_iters"]))
     del after
 
     # ---- verdict ----
