@@ -137,9 +137,10 @@ def _live_big_objects():
     }
 
 
-def _who_holds(sample_objs, frame_t, depth=12, chains=3, skip=()):
+def _who_holds(sample_objs, frame_t, depth=16, chains=3, skip=()):
     """Walk gc.get_referrers upward from a few retained objects and name the containers (type, dict key, len)."""
     import inspect
+    import types
 
     skip_ids = {id(sample_objs), *(id(x) for x in skip)}
     _self_file = os.path.abspath(__file__)
@@ -160,6 +161,7 @@ def _who_holds(sample_objs, frame_t, depth=12, chains=3, skip=()):
             refs = [r for r in gc.get_referrers(cur)
                     if id(r) not in seen and id(r) not in skip_ids and not inspect.isroutine(r) and r is not chain
                     and not (isinstance(r, frame_t) and os.path.abspath(r.f_code.co_filename) == _self_file)]
+            seen.add(id(refs))   # this very list references cur -- never climb into it next level
             if not refs:
                 chain.append("<no referrers>")
                 break
@@ -170,6 +172,12 @@ def _who_holds(sample_objs, frame_t, depth=12, chains=3, skip=()):
                 desc = _frame_desc(r, cur)
             elif inspect.isgenerator(r):
                 desc = f"generator[{r.gi_code.co_name} @ {os.path.basename(r.gi_code.co_filename)}]"
+            elif isinstance(r, types.TracebackType):
+                desc = f"traceback[{r.tb_frame.f_code.co_name} @ {os.path.basename(r.tb_frame.f_code.co_filename)}:{r.tb_lineno}]"
+            elif isinstance(r, BaseException):
+                desc = f"exception[{type(r).__name__}: {str(r)[:60]!r}]"
+            elif type(r).__name__ == "list_iterator":
+                desc = "list_iterator"
             elif isinstance(r, dict):
                 keys = [k for k, v in r.items() if v is cur]
                 desc += f"[key={keys[:2]!r}, len={len(r)}]"
