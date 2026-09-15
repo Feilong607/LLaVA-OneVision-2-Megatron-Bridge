@@ -82,10 +82,15 @@ def _libc():
 
 
 def _rss_anon_mb():
-    with open("/proc/self/status") as f:
-        for line in f:
-            if line.startswith("RssAnon:"):
-                return int(line.split()[1]) / 1024.0
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("RssAnon:"):
+                    return int(line.split()[1]) / 1024.0
+    except OSError:  # no /proc (local dry runs on macOS): fall back to peak RSS
+        import resource
+
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
     return float("nan")
 
 

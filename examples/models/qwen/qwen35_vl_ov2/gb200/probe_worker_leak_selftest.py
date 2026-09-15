@@ -1,0 +1,74 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""Local dry run of probe_worker_leak.main() with fake torch/energon/bridge and a synthetic retention (a suspended
+generator per sample). No GPU, no cluster, no torch needed -- run before every push of the probe:
+
+  python3 examples/models/qwen/qwen35_vl_ov2/gb200/probe_worker_leak_selftest.py
+
+It must print the holder chain naming generator[_hold ...] and end with SELFTEST OK."""
+import importlib.util
+import os
+import sys
+import tempfile
+import types
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), *[".."] * 5))
+
+def fake(name, **attrs):
+    m = types.ModuleType(name); m.__dict__.update(attrs); m.__path__ = []; sys.modules[name] = m; return m
+
+class FakeTensor:
+    def __init__(self, n): self.n = n; self.device = types.SimpleNamespace(type="cpu")
+    def numel(self): return self.n
+    def element_size(self): return 4
+torch = fake("torch", __version__="0.0-fake", is_tensor=lambda o: isinstance(o, FakeTensor), get_num_threads=lambda: 8)
+fake("transformers", __version__="5.3.0-fake")
+try:
+    import PIL  # real if present
+except ImportError:
+    fake("PIL", __version__="fake"); fake("PIL.Image")
+try:
+    import numpy
+except ImportError:
+    fake("numpy", __version__="fake")
+
+class Image:                       # PIL-like retained object
+    __module__ = "PIL.Image"
+    def __init__(self): self.mode, self.size = "RGB", (640, 480)
+    def getbands(self): return ("R", "G", "B")
+class PackedCaptioningSample:
+    def __init__(self, imgs): self.images = imgs
+
+LEAK = []                          # simulate the production retention: a suspended generator per sample
+def _hold(sample):
+    for img in sample.images:
+        yield img
+
+class FakeLoader:
+    def __iter__(self):
+        while True:
+            s = PackedCaptioningSample([Image() for _ in range(3)])
+            g = _hold(s); next(g); LEAK.append(g)
+            yield {"tokens": FakeTensor(100), "pixel_values": FakeTensor(1000), "cu_seqlens": None, "list": [FakeTensor(5)]}
+
+class WorkerConfig:
+    @staticmethod
+    def default_worker_config(n): return "wc"
+fake("megatron"); fake("megatron.bridge"); fake("megatron.bridge.recipes"); fake("megatron.bridge.recipes.ov2")
+fake("megatron.bridge.recipes.ov2.data"); fake("megatron.bridge.recipes.ov2.data.energon")
+fake("megatron.energon", __version__="7.4.1-fake", WorkerConfig=WorkerConfig,
+     get_train_dataset=lambda *a, **k: "ds", get_savable_loader=lambda ds, worker_config=None: FakeLoader())
+fake("megatron.bridge.recipes.ov2.ov2_qwen35", _QWEN35_BACKBONE="qwen3.5-35b-a3b")
+fake("megatron.bridge.recipes.ov2.ov2", _OV2_BACKBONES={"qwen3.5-35b-a3b": {"hf_proc": "/nonexistent"}})
+class OV2TaskEncoder:
+    def __init__(self, hf_processor_path, seq_length, spatial_merge_size=None):
+        ip = type("Qwen2VLImageProcessorFast", (), {})()
+        self.proc = types.SimpleNamespace(image_processor=ip, tokenizer=types.SimpleNamespace())
+fake("megatron.bridge.recipes.ov2.data.energon.task_encoder", OV2TaskEncoder=OV2TaskEncoder)
+
+spec = importlib.util.spec_from_file_location("probe", f"{REPO}/examples/models/qwen/qwen35_vl_ov2/gb200/probe_worker_leak.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+_tmp = tempfile.mkdtemp(); open(os.path.join(_tmp, "preprocessor_config.json"), "w").write("{}")
+sys.argv = ["probe", "--n", "6", "--every", "3", "--proc", _tmp, "--data", "fake.yaml"]
+m.main()
+print("SELFTEST OK")
