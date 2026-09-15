@@ -123,8 +123,12 @@ def _live_big_objects():
     from collections import Counter
 
     hist = Counter((o.mode, o.size) for o in pil).most_common(3)
+    # Whole-sample containers still alive (energon sample dataclasses, the encoder's SimpleNamespace subs,
+    # OV2TaskSample) -- if these grow with n, entire samples are retained, not just their images.
+    _names = ("PackedCaptioningSample", "MultiMixQASample", "OV2TaskSample", "SimpleNamespace", "OV2TaskBatch")
+    samples = Counter(type(o).__name__ for o in objs if type(o).__name__ in _names)
     return {
-        "pil_hist": hist, "_pil": pil,
+        "pil_hist": hist, "_pil": pil, "samples": dict(samples),
         "big_bytes": (len(big), sum(len(o) for o in big) / 2**20),
         "pil_images": (len(pil), sum((o.size[0] * o.size[1] * len(o.getbands())) for o in pil) / 2**20),
         "cpu_tensors": (len(tens), sum(t.numel() * t.element_size() for t in tens) / 2**20),
@@ -133,25 +137,40 @@ def _live_big_objects():
     }
 
 
-def _who_holds(sample_objs, frame_t, depth=8, chains=3, skip=()):
+def _who_holds(sample_objs, frame_t, depth=12, chains=3, skip=()):
     """Walk gc.get_referrers upward from a few retained objects and name the containers (type, dict key, len)."""
     import inspect
 
     skip_ids = {id(sample_objs), *(id(x) for x in skip)}
+    _self_file = os.path.abspath(__file__)
+
+    def _frame_desc(fr, target):
+        names = [k for k, v in fr.f_locals.items() if v is target]
+        return f"frame[{fr.f_code.co_name} @ {os.path.basename(fr.f_code.co_filename)}:{fr.f_lineno}, var={names[:2]}]"
+
     for o in sample_objs[:chains]:
         _sz = getattr(o, "size", None) if not isinstance(o, (bytes, bytearray)) else len(o)
         cur, seen, chain = o, {id(o)}, [f"{type(o).__name__}({_sz})"]
+        # Where was this retained object allocated? (tracemalloc is on) -> original decode vs. a copy.
+        tb = tracemalloc.get_object_traceback(o)
+        if tb is not None:
+            frames = [f"{os.path.basename(f.filename)}:{f.lineno}" for f in list(tb)[-6:]]
+            logger.info(f"[probe] allocated at (innermost last): {' > '.join(frames)}")
         for _ in range(depth):
             refs = [r for r in gc.get_referrers(cur)
-                    if id(r) not in seen and id(r) not in skip_ids and not isinstance(r, frame_t)
-                    and not inspect.isroutine(r) and r is not chain]
+                    if id(r) not in seen and id(r) not in skip_ids and not inspect.isroutine(r) and r is not chain
+                    and not (isinstance(r, frame_t) and os.path.abspath(r.f_code.co_filename) == _self_file)]
             if not refs:
                 chain.append("<no referrers>")
                 break
             # Prefer a non-container object (it names the owner); else the first container.
-            r = next((x for x in refs if not isinstance(x, (dict, list, tuple, set))), refs[0])
+            r = next((x for x in refs if not isinstance(x, (dict, list, tuple, set, frame_t))), refs[0])
             desc = type(r).__name__
-            if isinstance(r, dict):
+            if isinstance(r, frame_t):
+                desc = _frame_desc(r, cur)
+            elif inspect.isgenerator(r):
+                desc = f"generator[{r.gi_code.co_name} @ {os.path.basename(r.gi_code.co_filename)}]"
+            elif isinstance(r, dict):
                 keys = [k for k, v in r.items() if v is cur]
                 desc += f"[key={keys[:2]!r}, len={len(r)}]"
             elif isinstance(r, (list, tuple, set)):
@@ -164,7 +183,9 @@ def _who_holds(sample_objs, frame_t, depth=8, chains=3, skip=()):
                 _others = []
                 for x in refs[1:4]:
                     _d = type(x).__name__
-                    if isinstance(x, dict):
+                    if isinstance(x, frame_t):
+                        _d = _frame_desc(x, cur)
+                    elif isinstance(x, dict):
                         _d += f"[keys={[k for k, v in x.items() if v is cur][:2]!r}]"
                     elif isinstance(x, (list, tuple)):
                         _d += f"[len={len(x)}]"
@@ -256,7 +277,8 @@ def main():
                 logger.info(f"[probe]      py top: {s.size_diff / 2**20:+8.1f}M ({s.count_diff:+d} blocks) {fr.filename}:{fr.lineno}")
             live = _live_big_objects()
             logger.info("[probe]      live: " + "  ".join(f"{k}={v[0]} ({v[1]:.0f}M)" for k, v in live.items()
-                                                       if not k.startswith("_") and k != "pil_hist"))
+                                                       if not k.startswith("_") and k not in ("pil_hist", "samples")))
+            logger.info(f"[probe]      live sample objects: {live['samples']}")
             logger.info(f"[probe]      live PIL (mode,size) top3: {live['pil_hist']}")
             pil = big = None
             if n == args.n or n == args.every * 2:
