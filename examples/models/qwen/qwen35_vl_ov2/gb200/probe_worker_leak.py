@@ -36,6 +36,7 @@ import os
 import sys
 import time
 import tracemalloc
+import types
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout, force=True)
@@ -110,8 +111,6 @@ def _sample_bytes(batch):
 
 def _live_big_objects():
     """Count live large bytes / PIL images / torch tensors (the things a retained decoded sample is made of)."""
-    import types
-
     import torch
 
     gc.collect()
@@ -127,8 +126,24 @@ def _live_big_objects():
     # OV2TaskSample) -- if these grow with n, entire samples are retained, not just their images.
     _names = ("PackedCaptioningSample", "MultiMixQASample", "OV2TaskSample", "SimpleNamespace", "OV2TaskBatch")
     samples = Counter(type(o).__name__ for o in objs if type(o).__name__ in _names)
+    sample_objs = [o for o in objs if type(o).__name__ == "PackedCaptioningSample"]
+    # Census of the things that can keep a sample alive: suspended generators / live frames (by function),
+    # tracebacks and exceptions (an exception kept alive pins every local of every frame in its traceback),
+    # and list_iterators (run 4: the retained images hang off a suspended iteration over an image list).
+    import inspect
+
+    gens = Counter(f"{g.gi_code.co_name}@{os.path.basename(g.gi_code.co_filename)}" for g in objs if inspect.isgenerator(g))
+    frames = Counter(f"{f.f_code.co_name}@{os.path.basename(f.f_code.co_filename)}:{f.f_lineno}" for f in objs if isinstance(f, types.FrameType))
+    tbs = [o for o in objs if isinstance(o, types.TracebackType)]
+    tb_where = Counter(f"{t.tb_frame.f_code.co_name}@{os.path.basename(t.tb_frame.f_code.co_filename)}:{t.tb_lineno}" for t in tbs)
+    excs = Counter(type(o).__name__ for o in objs if isinstance(o, BaseException))
+    list_iters = [o for o in objs if type(o).__name__ == "list_iterator"]
     return {
-        "pil_hist": hist, "_pil": pil, "samples": dict(samples),
+        "pil_hist": hist, "_pil": pil, "samples": dict(samples), "_samples": sample_objs,
+        "census": {"generators": sum(gens.values()), "gen_top": gens.most_common(6),
+                   "frames_top": frames.most_common(6), "tracebacks": len(tbs), "tb_top": tb_where.most_common(4),
+                   "exceptions": dict(excs.most_common(4)), "list_iterators": len(list_iters), "gc_garbage": len(gc.garbage)},
+        "_list_iters": list_iters,
         "big_bytes": (len(big), sum(len(o) for o in big) / 2**20),
         "pil_images": (len(pil), sum((o.size[0] * o.size[1] * len(o.getbands())) for o in pil) / 2**20),
         "cpu_tensors": (len(tens), sum(t.numel() * t.element_size() for t in tens) / 2**20),
@@ -140,7 +155,6 @@ def _live_big_objects():
 def _who_holds(sample_objs, frame_t, depth=16, chains=3, skip=()):
     """Walk gc.get_referrers upward from a few retained objects and name the containers (type, dict key, len)."""
     import inspect
-    import types
 
     skip_ids = {id(sample_objs), *(id(x) for x in skip)}
     _self_file = os.path.abspath(__file__)
@@ -171,7 +185,8 @@ def _who_holds(sample_objs, frame_t, depth=16, chains=3, skip=()):
             if isinstance(r, frame_t):
                 desc = _frame_desc(r, cur)
             elif inspect.isgenerator(r):
-                desc = f"generator[{r.gi_code.co_name} @ {os.path.basename(r.gi_code.co_filename)}]"
+                _gl = r.gi_frame.f_lineno if r.gi_frame is not None else "finished"
+                desc = f"generator[{r.gi_code.co_name} @ {os.path.basename(r.gi_code.co_filename)}:{_gl}]"
             elif isinstance(r, types.TracebackType):
                 desc = f"traceback[{r.tb_frame.f_code.co_name} @ {os.path.basename(r.tb_frame.f_code.co_filename)}:{r.tb_lineno}]"
             elif isinstance(r, BaseException):
@@ -288,19 +303,50 @@ def main():
                                                        if not k.startswith("_") and k not in ("pil_hist", "samples")))
             logger.info(f"[probe]      live sample objects: {live['samples']}")
             logger.info(f"[probe]      live PIL (mode,size) top3: {live['pil_hist']}")
+            logger.info(f"[probe]      census: {live['census']}")
             pil = big = None
             if n == args.n or n == args.every * 2:
-                # Name the holders: walk referrers from a few retained objects -- the OLDEST PIL images
-                # (gc.get_objects is roughly allocation-ordered, so the first ones are the long-lived ones),
-                # else large byte strings.
-                pil, big = live["_pil"], live["_big"]
-                _mine = (live, pil, big)   # the probe's own containers must not show up as "holders"
-                _who_holds(pil[: 3] if pil else big, live["_frame_t"], skip=_mine)
-                if len(pil) > 10:
-                    _who_holds(pil[len(pil) // 2: len(pil) // 2 + 1], live["_frame_t"], chains=1, skip=_mine)
+                pil, big, smp, lis = live["_pil"], live["_big"], live["_samples"], live["_list_iters"]
+                _mine = (live, pil, big, smp, lis)   # the probe's own containers must not show up as "holders"
+                # (a) oldest retained PIL images (gc.get_objects is roughly allocation-ordered)
+                _who_holds(pil[: 2] if pil else big, live["_frame_t"], skip=_mine)
+                # (b) oldest retained whole samples -- far fewer levels to the holder
+                if smp:
+                    logger.info(f"[probe] oldest PackedCaptioningSample refcount={sys.getrefcount(smp[0]) - 2}")
+                    _who_holds(smp[: 2], live["_frame_t"], chains=2, skip=_mine)
+                # (c) list_iterators whose underlying list holds PIL images: which list, where in it, who holds it
+                _pil_iters = []
+                for li in lis:
+                    try:
+                        _, (lst,), idx = li.__reduce__()
+                    except Exception:
+                        continue
+                    if lst and type(lst[0]).__module__.startswith("PIL."):
+                        _pil_iters.append((li, len(lst), idx))
+                logger.info(f"[probe] list_iterators over PIL lists: {len(_pil_iters)} (of {len(lis)} list_iterators)")
+                for li, ln, idx in _pil_iters[:2]:
+                    logger.info(f"[probe]   iterator at index {idx}/{ln}:")
+                    _who_holds([li], live["_frame_t"], chains=1, skip=_mine + (_pil_iters,))
+                del smp, lis, _pil_iters
             del live, pil, big
         if n >= args.n:
             break
+
+    # ---- release experiment: does tearing down the pipeline free the retained samples? ----
+    # Freed => the holder lives inside the energon dataset/loader object state. Still alive => a module-level
+    # cache, an exception/traceback, or another global keeps them.
+    before = _live_big_objects()
+    b_pil, b_smp = before["pil_images"][0], before["samples"].get("PackedCaptioningSample", 0)
+    del before
+    del loader, ds, te
+    gc.collect()
+    after = _live_big_objects()
+    logger.info(f"[probe] release test: del loader/dataset/encoder + gc -> PIL images {b_pil} -> {after['pil_images'][0]}, "
+                f"PackedCaptioningSample {b_smp} -> {after['samples'].get('PackedCaptioningSample', 0)}, rss={_rss_anon_mb():.0f}M")
+    if after["samples"].get("PackedCaptioningSample", 0) > 2 and after["_samples"]:
+        logger.info("[probe] still held after teardown -- the holder is outside the pipeline objects:")
+        _who_holds(after["_samples"][:2], after["_frame_t"], chains=2, skip=(after, after["_samples"], after["_pil"], after["_list_iters"]))
+    del after
 
     # ---- verdict ----
     rss1, py1, mu1, mf1 = hist[-1][1], hist[-1][2], hist[-1][3], hist[-1][4]
