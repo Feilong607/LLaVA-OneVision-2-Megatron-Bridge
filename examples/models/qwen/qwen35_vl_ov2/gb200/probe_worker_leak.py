@@ -108,6 +108,61 @@ def _sample_bytes(batch):
     return total / 2**20
 
 
+def _live_big_objects():
+    """Count live large bytes / PIL images / torch tensors (the things a retained decoded sample is made of)."""
+    import types
+
+    import torch
+
+    gc.collect()
+    objs = gc.get_objects()
+    big = [o for o in objs if type(o) is bytes and len(o) > 100_000]
+    pil = [o for o in objs if type(o).__module__.startswith("PIL.") and hasattr(o, "size") and hasattr(o, "mode")]
+    tens = [o for o in objs if torch.is_tensor(o) and o.device.type == "cpu"]
+    arrs = [o for o in objs if type(o).__module__ == "numpy" and hasattr(o, "nbytes") and o.nbytes > 100_000]
+    return {
+        "big_bytes": (len(big), sum(len(o) for o in big) / 2**20),
+        "pil_images": (len(pil), sum((o.size[0] * o.size[1] * len(o.getbands())) for o in pil) / 2**20),
+        "cpu_tensors": (len(tens), sum(t.numel() * t.element_size() for t in tens) / 2**20),
+        "np_arrays": (len(arrs), sum(o.nbytes for o in arrs) / 2**20),
+        "_big": big, "_frame_t": types.FrameType,
+    }
+
+
+def _who_holds(sample_objs, frame_t, depth=8, chains=3):
+    """Walk gc.get_referrers upward from a few retained objects and name the containers (type, dict key, len)."""
+    import inspect
+
+    skip_ids = {id(sample_objs)}
+    for o in sample_objs[:chains]:
+        cur, seen, chain = o, {id(o)}, [f"{type(o).__name__}({len(o) if hasattr(o, '__len__') else '?'})"]
+        for _ in range(depth):
+            refs = [r for r in gc.get_referrers(cur)
+                    if id(r) not in seen and id(r) not in skip_ids and not isinstance(r, frame_t)
+                    and not inspect.isroutine(r) and r is not chain]
+            if not refs:
+                chain.append("<no referrers>")
+                break
+            # Prefer a non-container object (it names the owner); else the first container.
+            r = next((x for x in refs if not isinstance(x, (dict, list, tuple, set))), refs[0])
+            desc = type(r).__name__
+            if isinstance(r, dict):
+                keys = [k for k, v in r.items() if v is cur]
+                desc += f"[key={keys[:2]!r}, len={len(r)}]"
+            elif isinstance(r, (list, tuple, set)):
+                desc += f"[len={len(r)}]"
+            else:
+                attrs = [a for a, v in getattr(r, "__dict__", {}).items() if v is cur]
+                if attrs:
+                    desc += f".{attrs[0]}"
+            if len(refs) > 1:
+                desc += f" (+{len(refs) - 1} other referrers: {sorted({type(x).__name__ for x in refs[1:]})[:4]})"
+            chain.append(desc)
+            seen.add(id(r))
+            cur = r
+        logger.info("[probe] holder chain: " + "  <-  ".join(chain))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default=str(_HERE / "stage3_img38_video62_maveric.yaml"), help="blend yaml (energon Metadataset)")
@@ -186,6 +241,12 @@ def main():
             for s in stats[: args.top]:
                 fr = s.traceback[0]
                 logger.info(f"[probe]      py top: {s.size_diff / 2**20:+8.1f}M ({s.count_diff:+d} blocks) {fr.filename}:{fr.lineno}")
+            live = _live_big_objects()
+            logger.info("[probe]      live: " + "  ".join(f"{k}={v[0]} ({v[1]:.0f}M)" for k, v in live.items() if not k.startswith("_")))
+            if n == args.n or n == args.every * 2:
+                # Name the holders: walk referrers from a few retained JPEG byte strings.
+                _who_holds(live["_big"], live["_frame_t"])
+            del live
         if n >= args.n:
             break
 
