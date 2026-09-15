@@ -120,7 +120,11 @@ def _live_big_objects():
     pil = [o for o in objs if type(o).__module__.startswith("PIL.") and hasattr(o, "size") and hasattr(o, "mode")]
     tens = [o for o in objs if torch.is_tensor(o) and o.device.type == "cpu"]
     arrs = [o for o in objs if type(o).__module__ == "numpy" and hasattr(o, "nbytes") and o.nbytes > 100_000]
+    from collections import Counter
+
+    hist = Counter((o.mode, o.size) for o in pil).most_common(3)
     return {
+        "pil_hist": hist, "_pil": pil,
         "big_bytes": (len(big), sum(len(o) for o in big) / 2**20),
         "pil_images": (len(pil), sum((o.size[0] * o.size[1] * len(o.getbands())) for o in pil) / 2**20),
         "cpu_tensors": (len(tens), sum(t.numel() * t.element_size() for t in tens) / 2**20),
@@ -135,7 +139,8 @@ def _who_holds(sample_objs, frame_t, depth=8, chains=3):
 
     skip_ids = {id(sample_objs)}
     for o in sample_objs[:chains]:
-        cur, seen, chain = o, {id(o)}, [f"{type(o).__name__}({len(o) if hasattr(o, '__len__') else '?'})"]
+        _sz = getattr(o, "size", None) if not isinstance(o, (bytes, bytearray)) else len(o)
+        cur, seen, chain = o, {id(o)}, [f"{type(o).__name__}({_sz})"]
         for _ in range(depth):
             refs = [r for r in gc.get_referrers(cur)
                     if id(r) not in seen and id(r) not in skip_ids and not isinstance(r, frame_t)
@@ -242,11 +247,19 @@ def main():
                 fr = s.traceback[0]
                 logger.info(f"[probe]      py top: {s.size_diff / 2**20:+8.1f}M ({s.count_diff:+d} blocks) {fr.filename}:{fr.lineno}")
             live = _live_big_objects()
-            logger.info("[probe]      live: " + "  ".join(f"{k}={v[0]} ({v[1]:.0f}M)" for k, v in live.items() if not k.startswith("_")))
+            logger.info("[probe]      live: " + "  ".join(f"{k}={v[0]} ({v[1]:.0f}M)" for k, v in live.items()
+                                                       if not k.startswith("_") and k != "pil_hist"))
+            logger.info(f"[probe]      live PIL (mode,size) top3: {live['pil_hist']}")
+            pil = big = None
             if n == args.n or n == args.every * 2:
-                # Name the holders: walk referrers from a few retained JPEG byte strings.
-                _who_holds(live["_big"], live["_frame_t"])
-            del live
+                # Name the holders: walk referrers from a few retained objects -- the OLDEST PIL images
+                # (gc.get_objects is roughly allocation-ordered, so the first ones are the long-lived ones),
+                # else large byte strings.
+                pil, big = live["_pil"], live["_big"]
+                _who_holds(pil[: 3] if pil else big, live["_frame_t"])
+                if len(pil) > 10:
+                    _who_holds(pil[len(pil) // 2: len(pil) // 2 + 1], live["_frame_t"], chains=1)
+            del live, pil, big
         if n >= args.n:
             break
 
