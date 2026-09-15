@@ -152,6 +152,15 @@ def _live_big_objects():
     }
 
 
+def _report_live(live):
+    """Log the census dict from _live_big_objects (tuple entries = (count, MB); dict entries verbatim)."""
+    counts = "  ".join(f"{k}={v[0]} ({v[1]:.0f}M)" for k, v in live.items() if not k.startswith("_") and isinstance(v, tuple))
+    logger.info("[probe]      live: " + counts)
+    logger.info(f"[probe]      live sample objects: {live['samples']}")
+    logger.info(f"[probe]      live PIL (mode,size) top3: {live['pil_hist']}")
+    logger.info(f"[probe]      census: {live['census']}")
+
+
 def _who_holds(sample_objs, frame_t, depth=16, chains=3, skip=()):
     """Walk gc.get_referrers upward from a few retained objects and name the containers (type, dict key, len)."""
     import inspect
@@ -187,6 +196,9 @@ def _who_holds(sample_objs, frame_t, depth=16, chains=3, skip=()):
             elif inspect.isgenerator(r):
                 _gl = r.gi_frame.f_lineno if r.gi_frame is not None else "finished"
                 desc = f"generator[{r.gi_code.co_name} @ {os.path.basename(r.gi_code.co_filename)}:{_gl}]"
+            elif isinstance(r, types.ModuleType):
+                chain.append(f"module[{r.__name__}]")
+                break
             elif isinstance(r, types.TracebackType):
                 desc = f"traceback[{r.tb_frame.f_code.co_name} @ {os.path.basename(r.tb_frame.f_code.co_filename)}:{r.tb_lineno}]"
             elif isinstance(r, BaseException):
@@ -299,11 +311,7 @@ def main():
                 fr = s.traceback[0]
                 logger.info(f"[probe]      py top: {s.size_diff / 2**20:+8.1f}M ({s.count_diff:+d} blocks) {fr.filename}:{fr.lineno}")
             live = _live_big_objects()
-            logger.info("[probe]      live: " + "  ".join(f"{k}={v[0]} ({v[1]:.0f}M)" for k, v in live.items()
-                                                       if not k.startswith("_") and k not in ("pil_hist", "samples")))
-            logger.info(f"[probe]      live sample objects: {live['samples']}")
-            logger.info(f"[probe]      live PIL (mode,size) top3: {live['pil_hist']}")
-            logger.info(f"[probe]      census: {live['census']}")
+            _report_live(live)
             pil = big = None
             if n == args.n or n == args.every * 2:
                 pil, big, smp, lis = live["_pil"], live["_big"], live["_samples"], live["_list_iters"]
