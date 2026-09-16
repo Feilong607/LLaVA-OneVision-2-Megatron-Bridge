@@ -97,7 +97,7 @@ sys.argv = ["probe", "--n", "6", "--every", "3", "--proc", _tmp, "--data", "fake
 m.main()
 
 # ---- --fix path, phase A: fake energon has no wrappers -> patch must report NOT applied and the run must continue
-sys.argv = ["probe", "--n", "3", "--every", "3", "--proc", _tmp, "--data", "fake.yaml", "--fix"]
+sys.argv = ["probe", "--n", "3", "--every", "3", "--proc", _tmp, "--data", "fake.yaml", "--fix", "--no-thp", "--trim-every", "2"]
 m.main()
 
 # ---- --fix path, phase B: fake wrappers shaped exactly like energon 7.4.1 -> patch applies, frames stop pinning

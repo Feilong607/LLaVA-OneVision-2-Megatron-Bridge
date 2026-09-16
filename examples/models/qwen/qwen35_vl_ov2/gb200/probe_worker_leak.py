@@ -22,6 +22,10 @@ Megatron-LM, aiak_shim, pylibs and the _verify_stubs sitecustomize itself):
 
   python examples/models/qwen/qwen35_vl_ov2/gb200/probe_worker_leak.py --n 300 --every 25
 
+--no-thp disables transparent huge pages for the process (prctl) -- the 09-16 residual hunt found the unexplained
+RSS share equal to AnonHugePages. Allocator A/Bs are env-only: MALLOC_MMAP_THRESHOLD_=131072
+MALLOC_TRIM_THRESHOLD_=131072 or LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libtcmalloc_minimal.so.4; run them
+with OMP_NUM_THREADS matching production (arena count follows thread count).
 --trim-every N logs how much glibc malloc_trim(0) releases every N samples (residual-growth hunt after --fix: the
 released share is free-but-held heap; what stays is live objects / pymalloc arenas / THP -- see the smaps line).
 --fix applies the energon drop_yielded patch (same code path as OV2_ENERGON_DROP_YIELDED=1 in training) for an
@@ -85,6 +89,18 @@ def _libc():
         return lib
     except (OSError, AttributeError):
         return None
+
+
+def _disable_thp():
+    """prctl(PR_SET_THP_DISABLE, 1): opt this process (and everything it forks/execs) out of transparent huge
+    pages. THP backs any touched byte of an anonymous 2 MB region with a whole huge page, so fragmented
+    allocator heaps show up in RSS far above what malloc reports (AnonHugePages in smaps). Returns a status str."""
+    try:
+        lib = ctypes.CDLL(None, use_errno=True)
+        rc = lib.prctl(41, 1, 0, 0, 0)  # PR_SET_THP_DISABLE = 41
+        return "disabled" if rc == 0 else f"prctl rc={rc} errno={ctypes.get_errno()}"
+    except (OSError, AttributeError) as e:
+        return f"unavailable ({type(e).__name__})"
 
 
 def _rss_anon_mb():
@@ -379,6 +395,9 @@ def main():
     ap.add_argument("--buffer", type=int, default=8, help="shuffle_buffer_size (production: 8)")
     ap.add_argument("--top", type=int, default=8, help="tracemalloc top-N lines per report")
     ap.add_argument("--merge", type=int, default=3, help="spatial_merge_size (qwen3.5 p16m33: 3)")
+    ap.add_argument("--no-thp", action="store_true",
+                    help="prctl(PR_SET_THP_DISABLE) before anything is allocated: A/B whether transparent huge pages "
+                         "inflate the residual RSS growth (compare the smaps AnonHugePages and rss columns)")
     ap.add_argument("--trim-every", type=int, default=0,
                     help="call glibc malloc_trim(0) every N samples and log RSS before/after: the released amount is the "
                          "glibc free-but-held share of the residual growth (0 = only once at the end)")
@@ -405,6 +424,8 @@ def main():
           f"MALLOC_MMAP_THRESHOLD_={os.environ.get('MALLOC_MMAP_THRESHOLD_')} "
           f"MALLOC_TRIM_THRESHOLD_={os.environ.get('MALLOC_TRIM_THRESHOLD_')} LD_PRELOAD={os.environ.get('LD_PRELOAD')}")
 
+    if args.no_thp:
+        logger.info(f"[probe] no-thp: {_disable_thp()}")
     if args.fix:
         from megatron.bridge.recipes.ov2.data.energon.energon_patches import apply_drop_yielded_patch
 
