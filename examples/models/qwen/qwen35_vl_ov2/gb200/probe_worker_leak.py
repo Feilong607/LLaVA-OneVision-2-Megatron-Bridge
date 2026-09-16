@@ -22,6 +22,8 @@ Megatron-LM, aiak_shim, pylibs and the _verify_stubs sitecustomize itself):
 
   python examples/models/qwen/qwen35_vl_ov2/gb200/probe_worker_leak.py --n 300 --every 25
 
+--trim-every N logs how much glibc malloc_trim(0) releases every N samples (residual-growth hunt after --fix: the
+released share is free-but-held heap; what stays is live objects / pymalloc arenas / THP -- see the smaps line).
 --fix applies the energon drop_yielded patch (same code path as OV2_ENERGON_DROP_YIELDED=1 in training) for an
 A/B: unpatched, 'live sample objects' PackedCaptioningSample grows ~1 per touched blend component (38 at n=40);
 patched it should stay near shuffle_buffer + in-flight (<= ~10) and d_rss flatten.
@@ -116,6 +118,46 @@ def _sample_bytes(batch):
                 if hasattr(t, "numel") and hasattr(t, "element_size"):
                     total += t.numel() * t.element_size()
     return total / 2**20
+
+
+def _smaps_summary():
+    """Where the anon RSS lives, from /proc/self/smaps (readable for self even where ptrace is denied):
+    glibc heap ([heap]) / anonymous mmaps (glibc big chunks, pymalloc arenas, torch CPU tensors) / shm (memfd,
+    /dev/shm) / file-backed, plus AnonHugePages (THP can inflate RSS well beyond what malloc reports) and how many
+    anonymous regions are >= 64 MB. Empty dict where /proc is absent."""
+    try:
+        with open("/proc/self/smaps") as f:
+            return _parse_smaps(f.read().splitlines(keepends=True))
+    except OSError:
+        return {}
+
+
+def _parse_smaps(lines):
+    """Pure parser behind _smaps_summary (unit-tested by the self-test on a synthetic smaps)."""
+    out = {"heap": 0, "anon": 0, "shm": 0, "file": 0, "thp": 0, "anon_ge64M": 0}
+    if True:
+        cur = None
+        if True:
+            for line in lines:
+                if line and line[0] in "0123456789abcdef" and "-" in line.split()[0]:
+                    parts = line.split()
+                    path = parts[5] if len(parts) > 5 else ""
+                    if path == "[heap]":
+                        cur = "heap"
+                    elif path == "" or path.startswith("[anon"):
+                        cur = "anon"
+                    elif "shm" in path or "memfd" in path:
+                        cur = "shm"
+                    else:
+                        cur = "file"
+                elif line.startswith("Rss:") and cur:
+                    kb = int(line.split()[1])
+                    out[cur] += kb
+                    if cur == "anon" and kb >= 64 * 1024:
+                        out["anon_ge64M"] += 1
+                elif line.startswith("AnonHugePages:"):
+                    out["thp"] += int(line.split()[1])
+    return {k: (v if k == "anon_ge64M" else round(v / 1024)) for k, v in out.items()}  # MB
 
 
 def _modname(o):
@@ -337,6 +379,9 @@ def main():
     ap.add_argument("--buffer", type=int, default=8, help="shuffle_buffer_size (production: 8)")
     ap.add_argument("--top", type=int, default=8, help="tracemalloc top-N lines per report")
     ap.add_argument("--merge", type=int, default=3, help="spatial_merge_size (qwen3.5 p16m33: 3)")
+    ap.add_argument("--trim-every", type=int, default=0,
+                    help="call glibc malloc_trim(0) every N samples and log RSS before/after: the released amount is the "
+                         "glibc free-but-held share of the residual growth (0 = only once at the end)")
     ap.add_argument("--fix", action="store_true",
                     help="apply energon_patches.apply_drop_yielded_patch() before building the dataset (A/B the fix: "
                          "retained PackedCaptioningSample should stay ~shuffle buffer + in-flight instead of growing with n)")
@@ -399,6 +444,9 @@ def main():
         n += 1
         batch_mb += _sample_bytes(batch)
         del batch
+        if args.trim_every and lib is not None and n % args.trim_every == 0:
+            _b = _rss_anon_mb(); lib.malloc_trim(0); _a = _rss_anon_mb()
+            logger.info(f"[probe] trim@{n}: rss {_b:.0f}M -> {_a:.0f}M (released {_b - _a:+.0f}M)")
         if n % args.every == 0 or n == args.n:
             gc.collect()
             rss, (mu, mf) = _rss_anon_mb(), _malloc_mb(lib)
@@ -414,6 +462,10 @@ def main():
                 logger.info(f"[probe]      py top: {s.size_diff / 2**20:+8.1f}M ({s.count_diff:+d} blocks) {fr.filename}:{fr.lineno}")
             live = _live_big_objects()
             _report_live(live)
+            _sm = _smaps_summary()
+            if _sm:
+                logger.info(f"[probe]      smaps MB: heap={_sm['heap']} anon_mmap={_sm['anon']} (>=64M regions: {_sm['anon_ge64M']}) "
+                            f"shm={_sm['shm']} file={_sm['file']} AnonHugePages={_sm['thp']}")
             pil = big = None
             if n == args.n or n == args.every * 2:
                 pil, big, smp, lis = live["_pil"], live["_big"], live["_samples"], live["_list_iters"]

@@ -273,6 +273,8 @@ export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_scale_mode=spectral optimizer.
 # The pod cgroup limit is ~1 TB; the 09-13 smoke saw anon+shmem climb 463 -> 584 GB in minutes at workers=2/buffer=16
 # and the 09-14 production master pod died without a traceback. One line per sample keeps the evidence.
 export OV2_HOSTMEM_EVERY_S="${OV2_HOSTMEM_EVERY_S:-300}"
+# One line of the knobs a post-mortem needs and that /proc/<pid>/environ will not show (ptrace is denied in-pod).
+_say "env: OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset} MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-unset} MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-unset} MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-unset} LD_PRELOAD=${LD_PRELOAD:-unset} OV2_ENERGON_DROP_YIELDED=$OV2_ENERGON_DROP_YIELDED OV2_PARALLEL_SHARD_ITERS=$OV2_PARALLEL_SHARD_ITERS OV2_NUM_WORKERS=${OV2_NUM_WORKERS:-2} OV2_SHUFFLE_BUFFER=${OV2_SHUFFLE_BUFFER:-16} SAVE_EVERY=$SAVE_EVERY"
 if [[ "$OV2_HOSTMEM_EVERY_S" =~ ^[1-9][0-9]*$ && "${OV2_PREFLIGHT_ONLY:-0}" != 1 && -r /sys/fs/cgroup/memory.current ]]; then
   ( while sleep "$OV2_HOSTMEM_EVERY_S"; do
       _cur="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"; _max="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
@@ -281,7 +283,11 @@ if [[ "$OV2_HOSTMEM_EVERY_S" =~ ^[1-9][0-9]*$ && "${OV2_PREFLIGHT_ONLY:-0}" != 1
       # who holds it: /dev/shm (worker->main batch queue) and the top-4 RSS processes (trainer ranks vs dataloader workers)
       _shm="$(df -k /dev/shm 2>/dev/null | awk 'NR==2{printf "%.1fG", $3/1e6}')"
       _top="$(ps -eo rss=,comm=,args= --sort=-rss 2>/dev/null | awk 'NR<=4{n=$2; if ($0 ~ /pt_data_worker|DataLoader/) n="dl_worker"; else if ($0 ~ /run_recipe/) n="trainer"; printf "%s:%.0fG ", n, $1/1e6}')"
-      printf '[hostmem %s] cgroup current=%.1fG max=%s %s shm_used=%s top_rss=[%s] gpu_used_MiB=%s\n' "$(date '+%F %T')" "$(( ${_cur:-0} / 1000000 ))e-3" "${_max:-?}" "$_st" "${_shm:-?}" "$_top" "${_gpu:-?}" >> "$LOG"
+      # RssAnon split by role (RSS alone misleads: the trainers' 85 GB is mostly the shared batch queue). Same-user
+      # /proc/<pid>/status is readable in-pod even though environ/maps are not.
+      _dl="$(for _p in $(pgrep pt_data_worker 2>/dev/null); do grep RssAnon /proc/$_p/status 2>/dev/null; done | awk '{s+=$2; n++} END {if (n) printf "%dx%.1fG", n, s/n/1e6; else printf "0"}')"
+      _tr="$(for _p in $(pgrep -f run_recipe.py 2>/dev/null); do grep RssAnon /proc/$_p/status 2>/dev/null; done | awk '{s+=$2; n++} END {if (n) printf "%dx%.1fG", n, s/n/1e6; else printf "0"}')"
+      printf '[hostmem %s] cgroup current=%.1fG max=%s %s shm_used=%s top_rss=[%s] dl_anon=%s tr_anon=%s gpu_used_MiB=%s\n' "$(date '+%F %T')" "$(( ${_cur:-0} / 1000000 ))e-3" "${_max:-?}" "$_st" "${_shm:-?}" "$_top" "$_dl" "$_tr" "${_gpu:-?}" >> "$LOG"
     done ) &
   _say "hostmem sampler: every ${OV2_HOSTMEM_EVERY_S}s -> $LOG (grep hostmem)"
 fi

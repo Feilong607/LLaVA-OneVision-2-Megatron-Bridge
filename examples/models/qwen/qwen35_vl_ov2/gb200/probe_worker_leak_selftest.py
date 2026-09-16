@@ -153,4 +153,18 @@ pinned = [r for r in gc.get_referrers(decoded_seen[0]) if type(r).__name__ == "g
 assert not pinned, f"patched generators still pin the DECODED sample: {pinned}"
 assert [x.raw is y for x, y in zip(RepeatDataset(MapDataset(raws, _decode)), raws)] == [True, True, True]
 print("[selftest] drop_yielded: applied on 7.4.1-shaped fakes, no generator pins the yielded sample, order intact")
+# ---- smaps parser on a synthetic Linux smaps (macOS has no /proc)
+_smaps = (
+    "55d0c0000000-55d0c8000000 rw-p 00000000 00:00 0                          [heap]\n"
+    "Rss:              131072 kB\nAnonHugePages:      2048 kB\n"
+    "7f0000000000-7f0010000000 rw-p 00000000 00:00 0 \n"
+    "Rss:               98304 kB\nAnonHugePages:         0 kB\n"
+    "7f1000000000-7f1000001000 rw-s 00000000 00:05 12345                      /memfd:torch (deleted)\n"
+    "Rss:                4096 kB\n"
+    "7f2000000000-7f2000100000 r-xp 00000000 08:01 999                        /usr/lib/libc.so.6\n"
+    "Rss:                1024 kB\n"
+)
+_ps = m._parse_smaps(_smaps.splitlines(keepends=True))
+assert _ps == {"heap": 128, "anon": 96, "shm": 4, "file": 1, "thp": 2, "anon_ge64M": 1}, _ps
+print("[selftest] smaps parser OK", _ps)
 print("SELFTEST OK")
