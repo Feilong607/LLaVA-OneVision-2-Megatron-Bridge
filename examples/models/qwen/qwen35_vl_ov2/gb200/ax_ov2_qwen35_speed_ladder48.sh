@@ -154,6 +154,13 @@ _leg_logs()  { echo "$HOME"/train_logs/smoke_qwen35_merged64k_"${_L_TAG}-$1"_*.l
 # _leg NAME TP GBS ACCEL  (ETP fixed at 2: 48 % (2*8) == 0 for both TP4 and TP2; recompute env exported by the caller)
 _leg() {
   local name="$1" tp="$2" gbs="$3" accel="$4" r
+  # OV2_LADDER_ACCEL=<0|1|2>: override the leg's dispatcher lane (A/B of HybridEP vs alltoall at the SAME
+  # TP/recompute, e.g. for the GPU-memory owner probe). Default unset = the leg's baked lane.
+  if [[ -n "${OV2_LADDER_ACCEL:-}" ]]; then
+    [[ "$OV2_LADDER_ACCEL" =~ ^[012]$ ]] || { _say "FATAL: OV2_LADDER_ACCEL must be 0, 1 or 2, got '$OV2_LADDER_ACCEL'"; exit 3; }
+    _say "leg $name: ACCEL override $accel -> $OV2_LADDER_ACCEL (OV2_LADDER_ACCEL)"
+    accel="$OV2_LADDER_ACCEL"
+  fi
   r="$(_result_of "$name")"
   _barrier "prepare_${name}"
   _say "==== leg $name: TP=$tp ETP=2 GBS=$gbs ACCEL=$accel iters=$_ITERS full=$OV2_RECOMPUTE_FULL moe=$OV2_RECOMPUTE_MOE vision=$OV2_VISION_RECOMPUTE ce_fusion=$OV2_CE_FUSION mtp_layers=$OV2_MTP_LAYERS mem_fraction=$OV2_CUDA_MEM_FRACTION nccl_trace=$OV2_LADDER_NCCL_TRACE lr=$OV2_LR->$OV2_MIN_LR wd=.01 muon_extra=.15 beta2=.95 ===="
