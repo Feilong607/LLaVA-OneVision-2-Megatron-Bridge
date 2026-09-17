@@ -125,8 +125,36 @@ fi
 export OV2_MEM_PROBE="${OV2_MEM_PROBE:-$MB_PER_RANK}"
 # 09-14: the first attempt lost 579 iterations (8h53m) to a GPU launch failure + nvshmem chain before the first
 # save. Operator decision: keep 1000 (at ~40 s/iter that is ~11 h between saves); pass SAVE_EVERY=250 to densify.
-export SAVE_EVERY="${SAVE_EVERY:-1000}"
-export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_qwen35_merged_img38_tp4_dp12}"
+# 09-17: three 12-h-class deaths with zero checkpoints -> 250 is the default now (~4 h between saves at ~60 s/iter).
+export SAVE_EVERY="${SAVE_EVERY:-250}"
+export SAVE="${SAVE:-$HOME/ckpts_video_sft/ov2_qwen35_merged_img38_tp4_dp12_v2}"
+_SAVE_TAG="$(basename "$SAVE")"
+
+# ---- 09-17 production defaults (were Args on -3/-4; see OV2-QWEN35-BRINGUP §13.19-13.22). Each is overridable. ----
+# Data supply: the base launcher's OMP_NUM_THREADS=1 left the image processors single-threaded (0/20/40 s stalls
+# between logged steps); 8 threads x 2 workers x 4 ranks fits the 134-core pod.
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
+# Allocator: -3 and -5 died of CUDA OOM with 37-43 GiB reserved-but-unallocated (segment-internal fragmentation)
+# while a 15.9 GiB fp32 CE logits block was requested. expandable_segments removes that term (16-GPU ladder:
+# reserved 139 -> 119 GiB, step time -2%; -4 in production: 127-142 -> 105-112 GiB). No gc_threshold on top.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+# GPU-memory owner account on every MEMPROBE line (device used / NVML per-process / torch reserved, deltas, shape).
+export OV2_MEM_PROBE_DEVICE="${OV2_MEM_PROBE_DEVICE:-1}"
+# UNDER TEST (-5, 09-17 20:xx): unattributed cuMem memory ratchets ~4 GiB/h on every pod's local GPU0/GPU3 only,
+# outside torch and every process's NVML account; 16 GPUs do not reproduce it; the only remaining owner class is
+# NCCL's cross-node structures, of which the 48-rank NVLS multicast group is the largest. NVLS off = A/B and fix
+# candidate in one; pass NCCL_NVLS_ENABLE=1 to restore the previous behaviour.
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+# NCCL log: all allocation-relevant subsystems to a per-process file (ALLOC alone misses NVLS binds / REG).
+export OV2_NCCL_DEBUG="${OV2_NCCL_DEBUG:-INFO}"
+export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NVLS,REG,NET,GRAPH,ALLOC,TUNING}"
+export NCCL_DEBUG_FILE="${NCCL_DEBUG_FILE:-$HOME/train_logs/nccl_${_SAVE_TAG}_%h-%p.log}"
+# Hang diagnostics: 30-min collective timeout (default 300 would sit for 5 h) + flight-recorder dump on timeout.
+export OV2_DIST_TIMEOUT_MIN="${OV2_DIST_TIMEOUT_MIN:-30}"
+export TORCH_NCCL_DUMP_ON_TIMEOUT="${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}"
+export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}"
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE="${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:-$HOME/train_logs/nccl_trace_${_SAVE_TAG}_}"
+mkdir -p "$HOME/train_logs"
 
 # ---- HF assets (config source + processor): the on-cluster extracts, not the pool's raw VL config ----------------
 export OV2_LLM_HF_QWEN35="${OV2_LLM_HF_QWEN35:-$HOME/Qwen3.5-35B-A3B-text}"
@@ -217,7 +245,9 @@ fi
 # ---- launch fingerprint: stream-defining settings must match on resume; memory-only ones are logged ------------
 _STATE_HELPER="$_M48_DIR/merged48_state.py"
 [[ -f "$_STATE_HELPER" ]] || _die "missing state helper: $_STATE_HELPER"
-export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-1}"
+# 16 = the psi16 A/B winner (09-15) and what -3/-4 ran with; it is part of the stream fingerprint, so a resume on
+# the _v2 SAVE must keep it. Pass OV2_PARALLEL_SHARD_ITERS=1 only with a NEW SAVE.
+export OV2_PARALLEL_SHARD_ITERS="${OV2_PARALLEL_SHARD_ITERS:-16}"
 _FP="$SAVE/ov2_launch_fingerprint.json"
 _yaml_sha="$( (shasum -a 256 "$DATA_PATH" 2>/dev/null || sha256sum "$DATA_PATH") | awk '{print $1}')"
 [[ "$_yaml_sha" =~ ^[0-9a-f]{64}$ ]] || _die "could not hash $DATA_PATH"
@@ -274,7 +304,7 @@ export EXTRA_ARGS="${EXTRA_ARGS:-} optimizer.muon_scale_mode=spectral optimizer.
 # and the 09-14 production master pod died without a traceback. One line per sample keeps the evidence.
 export OV2_HOSTMEM_EVERY_S="${OV2_HOSTMEM_EVERY_S:-300}"
 # One line of the knobs a post-mortem needs and that /proc/<pid>/environ will not show (ptrace is denied in-pod).
-_say "env: OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset} MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-unset} MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-unset} MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-unset} LD_PRELOAD=${LD_PRELOAD:-unset} OV2_ENERGON_DROP_YIELDED=$OV2_ENERGON_DROP_YIELDED OV2_PARALLEL_SHARD_ITERS=$OV2_PARALLEL_SHARD_ITERS OV2_NUM_WORKERS=${OV2_NUM_WORKERS:-2} OV2_SHUFFLE_BUFFER=${OV2_SHUFFLE_BUFFER:-16} SAVE_EVERY=$SAVE_EVERY"
+_say "env: NCCL_NVLS_ENABLE=$NCCL_NVLS_ENABLE PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF OV2_MEM_PROBE_DEVICE=$OV2_MEM_PROBE_DEVICE NCCL_DEBUG_SUBSYS=$NCCL_DEBUG_SUBSYS NCCL_DEBUG_FILE=$NCCL_DEBUG_FILE OV2_DIST_TIMEOUT_MIN=$OV2_DIST_TIMEOUT_MIN OMP_NUM_THREADS=${OMP_NUM_THREADS:-unset} MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX:-unset} MALLOC_MMAP_THRESHOLD_=${MALLOC_MMAP_THRESHOLD_:-unset} MALLOC_TRIM_THRESHOLD_=${MALLOC_TRIM_THRESHOLD_:-unset} LD_PRELOAD=${LD_PRELOAD:-unset} OV2_ENERGON_DROP_YIELDED=$OV2_ENERGON_DROP_YIELDED OV2_PARALLEL_SHARD_ITERS=$OV2_PARALLEL_SHARD_ITERS OV2_NUM_WORKERS=${OV2_NUM_WORKERS:-2} OV2_SHUFFLE_BUFFER=${OV2_SHUFFLE_BUFFER:-16} SAVE_EVERY=$SAVE_EVERY"
 if [[ "$OV2_HOSTMEM_EVERY_S" =~ ^[1-9][0-9]*$ && "${OV2_PREFLIGHT_ONLY:-0}" != 1 && -r /sys/fs/cgroup/memory.current ]]; then
   ( while sleep "$OV2_HOSTMEM_EVERY_S"; do
       _cur="$(cat /sys/fs/cgroup/memory.current 2>/dev/null)"; _max="$(cat /sys/fs/cgroup/memory.max 2>/dev/null)"
