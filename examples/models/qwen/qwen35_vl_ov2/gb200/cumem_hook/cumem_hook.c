@@ -24,12 +24,14 @@
 //   t=<epoch.us> lt=<HH:MM:SS.us> pid= tid= api=<name> site=exit ret=<CUresult> size= dev= handle=0x..
 //   mc=0x.. ptr=0x.. off= flags= bt=0xa,0xb,...   (fields absent when not applicable)
 // Overhead: one callback per intercepted driver call (rare, allocation-time only); nothing on kernel launch.
+// Lock discipline: the callback runs inside the driver call. It must not take the dynamic-loader lock
+// (no backtrace()/dladdr()/dlopen): a thread holding that lock while dlopen'ing a compiled kernel would
+// deadlock against the driver lock we hold. Caller attribution = thread name (procfs) + frame-pointer walk.
 
 #define _GNU_SOURCE
 #include <cuda.h>
 #include <cupti.h>
 #include <dlfcn.h>
-#include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -90,6 +92,44 @@ static void hk_dump_maps(void) {
     if (out >= 0) close(out);
 }
 
+
+// Thread name of the calling thread (cached per thread; /proc read is a plain syscall, no locks).
+static const char *hk_thread_name(void) {
+    static __thread char name[32];
+    static __thread int have = 0;
+    if (!have) {
+        have = 1;
+        strcpy(name, "?");
+        int fd = open("/proc/thread-self/comm", O_RDONLY);
+        if (fd >= 0) {
+            ssize_t n = read(fd, name, sizeof name - 1);
+            close(fd);
+            if (n > 0) { name[n] = 0; for (char *c = name; *c; c++) if (*c == '\n' || *c == ' ') *c = '_'; }
+        }
+    }
+    return name;
+}
+
+// Bounded frame-pointer walk: no unwinder, no loader lock. Frames of code built without frame pointers end the
+// chain early; that is accepted (the thread name still names the caller). Every frame pointer is validated to
+// lie above the previous one and within 1 MiB of the current stack position before being dereferenced.
+static int hk_fp_walk(void **out, int max) {
+    int n = 0;
+    uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t lo = (uintptr_t)&fp;
+    uintptr_t hi = lo + (1u << 20);
+    while (n < max && fp >= lo && fp < hi && (fp & (sizeof(void *) - 1)) == 0) {
+        uintptr_t *f = (uintptr_t *)fp;
+        uintptr_t ret = f[1];
+        if (!ret) break;
+        out[n++] = (void *)ret;
+        uintptr_t next = f[0];
+        if (next <= fp) break;
+        fp = next;
+    }
+    return n;
+}
+
 static void hk_emit(const char *line, size_t len) {
     pthread_mutex_lock(&g_mu);
     if (g_fd >= 0) {
@@ -141,8 +181,12 @@ static void CUPTIAPI hk_cb(void *ud, CUpti_CallbackDomain domain, CUpti_Callback
 #endif
     default: break;
     }
+    // Caller attribution WITHOUT taking the dynamic-loader lock (backtrace()/dladdr() do, and a thread that
+    // holds it while dlopen'ing a compiled kernel .so would deadlock against the driver call we are inside of):
+    // thread name from procfs (NCCL/nvshmem worker threads are named) + a bounded frame-pointer walk.
+    APP(" thr=%s", hk_thread_name());
     void *bt[BT_DEPTH];
-    int depth = backtrace(bt, BT_DEPTH);
+    int depth = hk_fp_walk(bt, BT_DEPTH);
     APP(" bt=");
     for (int i = 0; i < depth; i++) APP("%s%p", i ? "," : "", bt[i]);
     APP("\n");

@@ -7,9 +7,9 @@ stay outstanding, and which calls fall inside each MEMPROBE unattributed "click"
     python cumem_ledger_report.py ~/train_logs/cumem/cumem_<host>_*.log [--memprobe train_node0.log] [--events]
 
 Per ledger (= per rank process): counts and bytes per API, net outstanding bytes (cuMemCreate - cuMemRelease of
-known handles), multicast bind/unbind bytes, imports, and the caller library of each call (first backtrace frame
+known handles), multicast bind/unbind bytes, imports, and the caller library of each call (first frame-pointer-walk frame
 outside libcumemhook / libcupti / libcuda, resolved through the cumem_<host>_<pid>.maps dump written next to
-the ledger). With --memprobe, MEMPROBE lines of the same pid are read and every click (d_unattr >= --min-click
+the ledger; falls back to the calling thread's name ``thr:<comm>`` when the walk yields nothing usable). With --memprobe, MEMPROBE lines of the same pid are read and every click (d_unattr >= --min-click
 GiB) is printed with the ledger events that happened between the previous sample and this one -- a bind or
 create of matching size in that window, plus its caller library, closes the case.
 """
@@ -79,8 +79,11 @@ def parse_ledger(path: str):
                 "t": float(kv.get("t", "0")), "lt": kv.get("lt", "?"), "pid": kv.get("pid", "?"),
                 "api": kv.get("api", "?"), "ret": int(kv.get("ret", "-1")),
                 "size": int(kv.get("size", "0")), "handle": kv.get("handle"), "mc": kv.get("mc"),
-                "dev": kv.get("dev"), "frames": frames, "caller": caller_lib(frames),
+                "dev": kv.get("dev"), "thr": kv.get("thr", "?"), "frames": frames,
+                "caller": caller_lib(frames) if frames else "?",
             })
+            if events[-1]["caller"] == "?":
+                events[-1]["caller"] = "thr:" + events[-1]["thr"]
     return events
 
 
@@ -167,7 +170,7 @@ def main(argv=None) -> int:
         if args.events:
             for e in events:
                 print(f"   {e['lt']} {e['api']:<28} ret={e['ret']} size={e['size'] / _GIB:.3f}G dev={e['dev']} "
-                      f"handle={e['handle']} mc={e['mc']} <- {' <- '.join(e['frames'][:6])}")
+                      f"thr={e['thr']} handle={e['handle']} mc={e['mc']} <- {' <- '.join(e['frames'][:6])}")
         if args.memprobe:
             samples = parse_memprobe(args.memprobe, pid)
             if not samples:
@@ -179,7 +182,7 @@ def main(argv=None) -> int:
                     print(f"   CLICK fwd#{fwd} {prev_t}..{t} d_unattr=+{du:.2f}G: {len(win)} ledger events in window")
                     for e in win:
                         print(f"      {e['lt']} {e['api']:<26} ret={e['ret']} size={e['size'] / _GIB:.3f}G dev={e['dev']} "
-                              f"caller={e['caller']} <- {' <- '.join(e['frames'][:5])}")
+                              f"thr={e['thr']} caller={e['caller']} <- {' <- '.join(e['frames'][:5])}")
                     if not win:
                         print("      -> nothing in this process: the bytes were bound/imported by ANOTHER process "
                               "(multicast pages from a peer, fabric import) or the driver -- check the peers' ledgers "
