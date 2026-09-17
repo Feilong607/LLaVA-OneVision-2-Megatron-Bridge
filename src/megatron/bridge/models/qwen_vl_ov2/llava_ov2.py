@@ -723,13 +723,23 @@ class LlavaOnevision2(MegatronModule):
             if _n % _mp == 0:
                 _r = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
                 _g = 1024**3
-                print(
+                _line = (
                     f"[MEMPROBE r{_r}] fwd#{_n} allocated={torch.cuda.memory_allocated() / _g:.1f}G "
                     f"max_allocated={torch.cuda.max_memory_allocated() / _g:.1f}G "
                     f"reserved={torch.cuda.memory_reserved() / _g:.1f}G "
-                    f"max_reserved={torch.cuda.max_memory_reserved() / _g:.1f}G",
-                    flush=True,
+                    f"max_reserved={torch.cuda.max_memory_reserved() / _g:.1f}G"
                 )
+                # OV2_MEM_PROBE_DEVICE=1: append the three-level account (device used / this PID per NVML /
+                # torch reserved, with deltas and the batch shape) -- names the owner class of a GPU
+                # memory "ratchet click" that the torch counters cannot see (see ov2_mem_probe.py).
+                if _probe_os.environ.get("OV2_MEM_PROBE_DEVICE") == "1":
+                    from megatron.bridge.models.qwen_vl_ov2.ov2_mem_probe import device_mem_suffix, env_line
+
+                    if not getattr(self, "_ov2_mem_probe_env_done", False):
+                        self._ov2_mem_probe_env_done = True
+                        print(env_line(self, _r), flush=True)
+                    _line += device_mem_suffix(self, input_ids, images, image_grid_thw)
+                print(_line, flush=True)
         # OV2_PHASE_TIMER=N: every N forwards, split the FORWARD wall time into the multimodal prefix
         # (vision tower + adapter + masked_scatter fuse + mrope) and the LLM, and report how many
         # vision patches produced how many LLM tokens. At seq 10192 a 60-frame bin sends ~63k patches
