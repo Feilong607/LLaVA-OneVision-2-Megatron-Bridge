@@ -26,6 +26,15 @@
 #                                                             loads into the no-MTP model
 #   S  TP4/ETP2 GBS48 selective attn+moe, ACCEL=2 HybridEP   = the §13 production recompute: does it fit?
 #   T  TP2/ETP2 GBS96 full recompute,     ACCEL=0 alltoall   does TP2 fit without MTP, is it faster than A?
+#   H  TP4/ETP2 GBS48 full recompute,     ACCEL=0 alltoall   = A with the dispatcher swapped: the step-time PRICE of
+#                                                             dropping HybridEP. Added 09-18 for the GPU-memory
+#                                                             question (BRINGUP 13.23): on the 48-GPU production run
+#                                                             each pod's GPU0/GPU3 carry ~53 GiB that no process
+#                                                             created, and hybrid_ep_cpp is the only library mapping
+#                                                             memory of that size (54.92 GiB). 16 GPUs do NOT
+#                                                             reproduce that level (unattr 0.45 GiB), so this leg
+#                                                             cannot settle ownership -- it prices the only lever big
+#                                                             enough to matter, so a future 48-GPU trial is not blind.
 #   A leg that does not fit dies as a clean torch OOM at step 1 (~15 min). No leg is gated on another.
 #   Throughput is compared as samples/s (GBS / mean Step Time), never as s/iter: T's GBS is 2x A's.
 #   speedup(X vs A) = (GBS_X / X_s) / (48 / A_s); for T that is 2 * A_s / T_s.
@@ -95,8 +104,8 @@ fi
 # baseline when the with-MTP A number is already on file (09-13: 0.726 samples/s at 80 iters). Pass it through
 # the workload as  Command=env  Args="OV2_LADDER_LEGS=S,T bash <this file>"  (use commas: the Args field is
 # split on spaces; commas or spaces are both accepted here).
-_LEGS="$(tr ',' ' ' <<<"${OV2_LADDER_LEGS:-A S T}")"
-for _l in $_LEGS; do [[ "$_l" =~ ^[AST]$ ]] || { echo "[speed-ladder] FATAL: OV2_LADDER_LEGS must be a subset of A S T, got '$_LEGS'" >&2; exit 3; }; done
+_LEGS="$(tr ',' ' ' <<<"${OV2_LADDER_LEGS:-A S T}")"   # H is opt-in: OV2_LADDER_LEGS=A,S,H
+for _l in $_LEGS; do [[ "$_l" =~ ^[ASTH]$ ]] || { echo "[speed-ladder] FATAL: OV2_LADDER_LEGS must be a subset of A S T H, got '$_LEGS'" >&2; exit 3; }; done
 _want() { [[ " $_LEGS " == *" $1 "* ]]; }
 # Reference logs for the loss table: the 09-13 48-GPU memory smoke (leg A's config but WITH MTP; 20-iteration run, different LR-decay length).
 _REF_GLOB="${OV2_LADDER_REF_GLOB:-$HOME/train_logs/smoke_qwen35_merged64k_q35-img38-smoke48-0913-2_*.log}"
@@ -145,7 +154,7 @@ _barrier() {
     sleep 1
   done
 }
-if [[ -e "$_L_OUT" || -e "$(_result_of A)" || -e "$(_result_of S)" || -e "$(_result_of T)" || -d "$HOME/ckpts_video_sft/_smoke_qwen35_merged64k/${_L_TAG}-A" || -d "$HOME/ckpts_video_sft/_smoke_qwen35_merged64k/${_L_TAG}-S" || -d "$HOME/ckpts_video_sft/_smoke_qwen35_merged64k/${_L_TAG}-T" ]]; then
+if [[ -e "$_L_OUT" || -e "$(_result_of A)" || -e "$(_result_of S)" || -e "$(_result_of T)" || -e "$(_result_of H)" || -d "$HOME/ckpts_video_sft/_smoke_qwen35_merged64k/${_L_TAG}-A" || -d "$HOME/ckpts_video_sft/_smoke_qwen35_merged64k/${_L_TAG}-S" || -d "$HOME/ckpts_video_sft/_smoke_qwen35_merged64k/${_L_TAG}-T" || -d "$HOME/ckpts_video_sft/_smoke_qwen35_merged64k/${_L_TAG}-H" ]]; then
   _say "FATAL: old outputs exist; use a NEW workload name"; exit 3
 fi
 _barrier joined
@@ -203,8 +212,21 @@ _tput() {
 }
 # First 5 "lm loss" values from a set of logs (megatron iteration lines, last rank).
 _first_losses() { cat "$@" 2>/dev/null | grep -o 'lm loss: [0-9.eE+-]*' | head -5 | awk '{print $3}' | tr '\n' ' ' | sed 's/ *$//'; }
+# Device-memory span over every rank of a leg (needs OV2_MEM_PROBE_DEVICE=1 in the Args; without it: n/a).
+# The spread is the point: on 48 GPUs each pod's GPU0/GPU3 sit ~50 GiB above the other two, none of it created
+# by any process (BRINGUP 13.23). unattr = dev_used - NVML per-process, i.e. memory attributed to nobody.
+_mem_span() {
+  grep -h '\[MEMPROBE ' $(_leg_logs "$1") 2>/dev/null | awk '
+    { d=""; u="";
+      if (match($0, /dev_used=[0-9]+MiB/)) d = substr($0, RSTART+9, RLENGTH-12)
+      if (match($0, /unattr=[-+0-9.]+G/))  u = substr($0, RSTART+7, RLENGTH-8)
+      if (d != "") { if (d+0 > dmax) dmax = d+0; if (dmin == "" || d+0 < dmin) dmin = d+0 }
+      if (u != "" && u+0 > umax) umax = u+0 }
+    END { if (dmax) printf "dev_used %d..%d MiB (spread %d), unattr max %.2f GiB", dmin, dmax, dmax-dmin, umax;
+          else printf "n/a (no MEMPROBE device lines: set OV2_MEM_PROBE_DEVICE=1)" }'
+}
 
-_A_RES="$(_result_of A)"; _S_RES="$(_result_of S)"; _T_RES="$(_result_of T)"
+_A_RES="$(_result_of A)"; _S_RES="$(_result_of S)"; _T_RES="$(_result_of T)"; _H_RES="$(_result_of H)"
 # ---------------- A: TP4 full recompute, HybridEP (steady-state baseline) ----------------
 if _want A; then
 export OV2_RECOMPUTE_FULL=1 OV2_RECOMPUTE_MOE=0 OV2_VISION_RECOMPUTE=1
@@ -229,6 +251,14 @@ _T_MEM="$(_max_alloc "$_T_RES")"
 _say "T: passed=$(_passed "$_T_RES" && echo yes || echo no) max_allocated=${_T_MEM:-?} GiB; $(_tput T "$(_gbs_for_tp 2)")"
 fi
 
+# ---------------- H: TP4 full recompute, alltoall (price of dropping HybridEP; same per-rank work as A) --------
+if _want H; then
+export OV2_RECOMPUTE_FULL=1 OV2_RECOMPUTE_MOE=0 OV2_VISION_RECOMPUTE=1
+_leg H 4 "$(_gbs_for_tp 4)" 0
+_H_MEM="$(_max_alloc "$_H_RES")"
+_say "H: passed=$(_passed "$_H_RES" && echo yes || echo no) max_allocated=${_H_MEM:-?} GiB; $(_tput H "$(_gbs_for_tp 4)")"
+fi
+
 _RC=0; for _l in $_LEGS; do _passed "$(_result_of "$_l")" || _RC=1; done
 
 # ---------------- summary (master only; workers just mirror the exit code) ----------------
@@ -244,6 +274,7 @@ if (( _L_IS_MASTER )); then
     echo "A: $(_tput A "$_g4")"
     echo "S: $(_tput S "$_g4")"
     echo "T: $(_tput T "$_g2")"
+    echo "H: $(_tput H "$_g4")"
     _ma="$(_mean_step A)"; _ms="$(_mean_step S)"; _mt="$(_mean_step T)"
     if _passed "$_A_RES" && _passed "$_S_RES" && [[ -n "$_ma" && -n "$_ms" ]]; then
       python3 -c "a=float('$_ma'); x=float('$_ms'); g=$_g4; print(f'S vs A speedup = ({g}/{x:.1f}) / ({g}/{a:.1f}) = A_s/S_s = {a/x:.3f}x')"
@@ -255,6 +286,12 @@ if (( _L_IS_MASTER )); then
     else
       echo "T vs A speedup: n/a (a leg failed, ran too few steps, or has no valid timing)"
     fi
+    _mh="$(_mean_step H)"
+    if _passed "$_A_RES" && _passed "$_H_RES" && [[ -n "$_ma" && -n "$_mh" ]]; then
+      python3 -c "a=float('$_ma'); h=float('$_mh'); print(f'H vs A (alltoall vs HybridEP, same TP/GBS/recompute) = A_s/H_s = {a/h:.3f}x  (<1 means dropping HybridEP costs step time)')"
+    else
+      echo "H vs A: n/a (leg not selected, failed, or has no valid timing)"
+    fi
     echo
     echo "---- descriptive loss comparison: first 5 lm loss, 09-13 reference (WITH MTP, 20-step schedule) vs leg A (no MTP, 80-step); input identity is not verified; descriptive only ----"
     _ref="$(_first_losses $_REF_GLOB)"; _a="$(_first_losses $(_leg_logs A))"
@@ -265,14 +302,16 @@ r, a = (list(map(float, s.split())) for s in sys.argv[1:3]) if all(sys.argv[1:3]
 n = min(len(r), len(a))
 print(f"iter-1 |diff| = {abs(r[0]-a[0]):.4f} (only meaningful with matched input IDs/labels/masks; not an acceptance threshold); max |diff| over first {n} = {max(abs(x-y) for x,y in zip(r[:n],a[:n])):.4f} (later drift from the removed MTP gradient and the LR-decay length is expected; descriptive only, NOT numerical acceptance)" if n else "iter-1 |diff|: n/a (missing series)")
 PY
-    for leg in A S T; do
+    for leg in A S T H; do
       echo; echo "---- leg $leg ----"
       _want "$leg" || { echo "not selected (OV2_LADDER_LEGS=$_LEGS)"; continue; }
       case "$leg" in
         A) echo "TP4/ETP2 GBS$_g4 (DP$(( _WORLD / 4 ))), full recompute, ACCEL=2 HybridEP, no MTP (OV2_MTP_LAYERS=$OV2_MTP_LAYERS)";;
         S) echo "TP4/ETP2 GBS$_g4 (DP$(( _WORLD / 4 ))), selective attn+moe = the §13 production recompute, ACCEL=2 HybridEP, no MTP";;
         T) echo "TP2/ETP2 GBS$_g2 (DP$(( _WORLD / 2 ))), full recompute, ACCEL=0 alltoall, no MTP  [per-rank work = 4 microbatches, same as A]";;
+        H) echo "TP4/ETP2 GBS$_g4 (DP$(( _WORLD / 4 ))), full recompute, ACCEL=0 alltoall, no MTP  [= A with the dispatcher swapped]";;
       esac
+      echo "device memory: $(_mem_span "$leg")"
       r="$(_result_of "$leg")"
       if [[ -f "$r" ]]; then cat "$r"; else echo "no RESULT file (leg died before the verdict -- OOM/FATAL: see its logs)"; fi
     done
