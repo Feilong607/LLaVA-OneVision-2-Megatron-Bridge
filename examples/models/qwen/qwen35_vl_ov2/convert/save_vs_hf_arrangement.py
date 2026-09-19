@@ -25,15 +25,22 @@ WHAT IT DOES
      does not re-execute the mcore model build or the bridge mapping registry it is checking.
   2. Reads the matching tensors out of the HF export's safetensors (row slices; nothing large is
      materialised twice).
-  3. Asks, per family: **is the HF tensor a known REARRANGEMENT of the SAVE tensor, and is it the canonical
-     one?** The candidate set deliberately holds the canonical arrangement AND the classic traps
-     (contiguous-vs-GQA-interleaved QKV, TP-rank-interleaved gate/up, transposed matrices, a zero-centred
-     norm exported without its +1, parts concatenated in the wrong order...). The report names the
-     arrangement that matched.
+  3. Asks, per family: **is the HF tensor a known REARRANGEMENT of the SAVE tensor(s), and is it the
+     canonical one?** The candidate set deliberately holds the canonical arrangement AND the classic traps
+     (contiguous-vs-GQA-interleaved QKV, TP-rank-interleaved gate/up, swapped halves, transposes, a
+     zero-centred norm exported without its +1, fused parts concatenated in the wrong order...). The report
+     names the arrangement that matched.
 
      A trap arrangement matching is a FAIL with a diagnosis. No arrangement matching is a FAIL with the
      smallest max-abs-diff reached. A family whose keys resolve on neither side is UNRESOLVED -- never a
-     pass.
+     pass -- and the row lists the sibling keys that DO exist on each side, so one run is enough to fix it.
+
+NAMES AND SHAPES ARE DISCOVERED, NOT ASSUMED. Both key spaces are read first: which layers carry attention
+vs Gated DeltaNet, how experts are stored (``mlp.experts.experts.linear_fc1.weightN`` in this build, a
+stacked tensor or ``local_experts.N`` elsewhere), whether the GDN input projection is one fused matrix or
+split per role (``in_proj.weight.{query,key,value,z,beta,alpha}``), and whether attention is gated -- the
+q side of a Qwen3.5 attention layer carries its gate, so the q/k/v split is taken from the HF tensors' own
+row counts rather than from head counts.
 
 WHAT IT PROVES / DOES NOT PROVE
 
@@ -50,7 +57,7 @@ USAGE (CPU pod or the export workspace; no GPU, no torchrun)
 
     python3 save_vs_hf_arrangement.py --save <iter_dir> --hf <hf_export_dir>
     python3 save_vs_hf_arrangement.py --save <iter_dir> --hf <hf_export_dir> --dump-keys     # discovery only
-    python3 save_vs_hf_arrangement.py --save ... --hf ... --layers 0,3 --expert 0,17 --json report.json
+    python3 save_vs_hf_arrangement.py --save ... --hf ... --layers 0,3 --expert 0,255 --json report.json
 
 Exit 0 = every checked family matched its canonical arrangement; 1 = a mismatch or a trap arrangement;
 2 = usage / IO error; 3 = a family could not be resolved (``--allow-unresolved`` downgrades that to a
@@ -73,33 +80,52 @@ logger = logging.getLogger("save-vs-hf")
 
 PASS, FAIL, UNRESOLVED, SKIP = "PASS", "FAIL", "UNRESOLVED", "SKIP"
 
+_LLM = "language_model.decoder.layers."
+_VIS = "vision_model.decoder.layers."
+
+
+class Unresolvable(Exception):
+    """A family's keys are absent on one side; the message carries the siblings that do exist."""
+
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
 # Layout arithmetic. Pure functions over ints returning index lists, so every layout claim in this file
 # is unit-testable without torch, DCP or a checkpoint (tests/unit_tests/models/ov2/test_save_vs_hf_layout.py).
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
-def qkv_rows_grouped(num_heads: int, num_kv_heads: int, head_dim: int) -> Tuple[List[int], List[int], List[int]]:
-    """Row indices of q / k / v inside mcore's fused ``linear_qkv.weight``.
+def qkv_rows_grouped_blocks(nq: int, nk: int, nv: int, groups: int) -> Tuple[List[int], List[int], List[int]]:
+    """Row indices of q / k / v inside a fused mcore ``linear_qkv``, given each side's TOTAL row count.
 
-    mcore interleaves by KV group so each group's queries sit next to their K and V:
-    ``[q_1..q_n, k_1, v_1][q_1..q_n, k_2, v_2]...`` with ``n = num_heads // num_kv_heads``. This is the
-    canonical layout; a merge that concatenated the three projections instead gives ``qkv_rows_contiguous``.
+    mcore interleaves by KV group -- each group's queries sit next to their K and V:
+    ``[q-block, k-block, v-block][q-block, k-block, v-block]...``. Taking the block sizes from the row
+    counts rather than from ``heads * head_dim`` is what makes this work for Qwen3.5's GATED attention,
+    where the q side also carries a gate of the same width (q_proj is 2 * heads * head_dim rows).
     """
+    if groups <= 0:
+        raise ValueError(f"groups must be positive, got {groups}")
+    for name, n in (("nq", nq), ("nk", nk), ("nv", nv)):
+        if n <= 0 or n % groups:
+            raise ValueError(f"{name}={n} is not a positive multiple of groups={groups}")
+    qg, kg, vg = nq // groups, nk // groups, nv // groups
+    block = qg + kg + vg
+    q: List[int] = []
+    k: List[int] = []
+    v: List[int] = []
+    for g in range(groups):
+        base = g * block
+        q.extend(range(base, base + qg))
+        k.extend(range(base + qg, base + qg + kg))
+        v.extend(range(base + qg + kg, base + block))
+    return q, k, v
+
+
+def qkv_rows_grouped(num_heads: int, num_kv_heads: int, head_dim: int) -> Tuple[List[int], List[int], List[int]]:
+    """The head-count form of :func:`qkv_rows_grouped_blocks` (ungated attention, one gate-free q per head)."""
     if num_heads <= 0 or num_kv_heads <= 0 or head_dim <= 0:
         raise ValueError(f"bad geometry: heads={num_heads} kv={num_kv_heads} head_dim={head_dim}")
     if num_heads % num_kv_heads:
         raise ValueError(f"num_heads={num_heads} is not a multiple of num_kv_heads={num_kv_heads}")
-    per_group = num_heads // num_kv_heads
-    q: List[int] = []
-    k: List[int] = []
-    v: List[int] = []
-    block = (per_group + 2) * head_dim
-    for g in range(num_kv_heads):
-        base = g * block
-        q.extend(range(base, base + per_group * head_dim))
-        k.extend(range(base + per_group * head_dim, base + (per_group + 1) * head_dim))
-        v.extend(range(base + (per_group + 1) * head_dim, base + (per_group + 2) * head_dim))
-    return q, k, v
+    return qkv_rows_grouped_blocks(num_heads * head_dim, num_kv_heads * head_dim,
+                                   num_kv_heads * head_dim, num_kv_heads)
 
 
 def qkv_rows_contiguous(num_heads: int, num_kv_heads: int, head_dim: int) -> Tuple[List[int], List[int], List[int]]:
@@ -108,6 +134,14 @@ def qkv_rows_contiguous(num_heads: int, num_kv_heads: int, head_dim: int) -> Tup
         raise ValueError(f"bad geometry: heads={num_heads} kv={num_kv_heads} head_dim={head_dim}")
     nq, nk = num_heads * head_dim, num_kv_heads * head_dim
     return list(range(nq)), list(range(nq, nq + nk)), list(range(nq + nk, nq + 2 * nk))
+
+
+def qkv_rows_contiguous_blocks(nq: int, nk: int, nv: int) -> Tuple[List[int], List[int], List[int]]:
+    """The trap layout in row-count form: ``[all q][all k][all v]``."""
+    for name, n in (("nq", nq), ("nk", nk), ("nv", nv)):
+        if n <= 0:
+            raise ValueError(f"{name}={n} must be positive")
+    return list(range(nq)), list(range(nq, nq + nk)), list(range(nq + nk, nq + nk + nv))
 
 
 def qkv_rows_head_interleaved(num_heads: int, head_dim: int) -> Tuple[List[int], List[int], List[int]]:
@@ -142,7 +176,7 @@ def swap_halves(total_rows: int) -> List[int]:
 
 
 def concat_offsets(sizes: Sequence[int]) -> List[Tuple[int, int]]:
-    """``[(start, stop)]`` for each part of a row-concatenation (GDN's 4-way ``in_proj`` split)."""
+    """``[(start, stop)]`` for each part of a row-concatenation."""
     out: List[Tuple[int, int]] = []
     cur = 0
     for s in sizes:
@@ -182,6 +216,12 @@ class SaveReader:
 
     def keys(self) -> List[str]:
         return sorted(self.meta)
+
+    def tensor_keys(self) -> List[str]:
+        return [k for k in self.keys() if self.describe(k) is not None]
+
+    def siblings(self, prefix: str, limit: int = 4) -> List[str]:
+        return [k for k in self.keys() if k.startswith(prefix)][:limit]
 
     def describe(self, key: str) -> Optional[Tuple[Tuple[int, ...], Any]]:
         m = self.meta.get(key)
@@ -235,11 +275,7 @@ class SaveReader:
         return self._cache[key]
 
     def load_dim0_index(self, key: str, index: int):
-        """One dim-0 slice of a stacked tensor, without materialising the whole thing.
-
-        Uses mcore's sharded-tensor load (the same mechanism ``verify_consistency.py`` relies on) to read
-        only that slice; falls back to a full load when mcore is unavailable and the tensor fits the budget.
-        """
+        """One dim-0 slice of a stacked tensor, without materialising the whole thing when it is huge."""
         desc = self.describe(key)
         if desc is None:
             raise KeyError(key)
@@ -287,6 +323,9 @@ class HFReader:
 
     def has(self, key: str) -> bool:
         return key in self.weight_map
+
+    def siblings(self, prefix: str, limit: int = 4) -> List[str]:
+        return [k for k in self.keys() if k.startswith(prefix)][:limit]
 
     def shape(self, key: str) -> Tuple[int, ...]:
         from safetensors import safe_open
@@ -372,6 +411,8 @@ class Checker:
     def run(self, family: str, fn: Callable[[], Result]) -> None:
         try:
             self.results.append(fn())
+        except Unresolvable as exc:
+            self.results.append(Result(family, UNRESOLVED, detail=str(exc)))
         except KeyError as exc:
             self.results.append(Result(family, UNRESOLVED, detail=f"missing key {exc}"))
         except MemoryError as exc:
@@ -379,6 +420,33 @@ class Checker:
         except Exception as exc:  # noqa: BLE001 -- one broken family must not hide the others
             self.results.append(Result(family, UNRESOLVED, detail=f"{type(exc).__name__}: {exc}"))
 
+    # -- key resolution ----------------------------------------------------------------------------
+    def pick_save(self, candidates: Sequence[str], *, diag_prefix: str = "") -> str:
+        for key in candidates:
+            if self.save.describe(key) is not None:
+                return key
+        near = self.save.siblings(diag_prefix) if diag_prefix else []
+        raise Unresolvable(f"no SAVE key among {list(candidates)[:3]}"
+                           + (f"; SAVE has {near}" if near else ""))
+
+    def pick_hf(self, candidates: Sequence[str], *, diag_prefix: str = "") -> str:
+        for key in candidates:
+            if self.hf.has(key):
+                return key
+        near = self.hf.siblings(diag_prefix) if diag_prefix else []
+        raise Unresolvable(f"no HF key among {list(candidates)[:3]}"
+                           + (f"; HF has {near}" if near else ""))
+
+    def pick_hf_group(self, groups: Sequence[Sequence[str]], *, diag_prefix: str = "") -> List[str]:
+        """First group whose every key exists (e.g. a packed tensor, else a gate/up pair)."""
+        for group in groups:
+            if all(self.hf.has(k) for k in group):
+                return list(group)
+        near = self.hf.siblings(diag_prefix) if diag_prefix else []
+        raise Unresolvable(f"no HF key group among {[list(g)[:2] for g in groups][:3]}"
+                           + (f"; HF has {near}" if near else ""))
+
+    # -- verdict -----------------------------------------------------------------------------------
     def _verdict(self, family: str, save_keys: Sequence[str], hf_keys: Sequence[str],
                  candidates: Sequence[Tuple[str, bool, Any, Any]]) -> Result:
         """``candidates`` = (name, is_canonical, save_side_tensor, hf_side_tensor); canonical ones first."""
@@ -406,8 +474,8 @@ class Checker:
                         transpose_ok: bool = True) -> Result:
         """1:1 tensors. ``plus_one``: canonical is HF == SAVE + 1 (mcore zero-centred RMSNorm -> HF RMSNorm).
 
-        Tall tensors are sampled head+tail (``--rows``); a sampled family never tries the transpose
-        candidate, because a row window of a transpose is not the transpose of a row window.
+        Tall tensors are sampled head+tail (``--rows``); the SAVE is always trimmed to the export's row
+        count first, because vocab-parallel padding legitimately makes the SAVE taller.
         """
         import torch
 
@@ -420,9 +488,6 @@ class Checker:
         else:
             hf_rows = int(hf_shape[0])
             windows = sample_windows(hf_rows, self.rows)
-            # The SAVE's dim 0 can be LONGER than the export's (vocab-parallel padding), so the SAVE is
-            # always trimmed to the export's rows before comparing -- never compared whole against a
-            # shorter tensor, which would read as a mismatch when nothing is wrong.
             sv = torch.cat([sv_full[a:b] for a, b in windows], dim=0)
             sampled = windows != [(0, hf_rows)]
             hv = torch.cat([self.hf.load(hf_key, (a, b)) for a, b in windows], dim=0) if sampled \
@@ -440,33 +505,46 @@ class Checker:
         if transpose_ok and whole and sv.ndim == 2:
             cands.append(("transposed", False, sv.t().contiguous(), hv))
         result = self._verdict(family, [save_key], [hf_key], cands)
-        # A SAVE that is TALLER than the export is normal for vocab-parallel padding; say so explicitly
-        # rather than letting a reader assume the extra rows were checked.
         if result.status == PASS and sv_full.ndim >= 1 and hf_shape and sv_full.shape[0] > hf_shape[0]:
             result.detail += (f"; SAVE has {int(sv_full.shape[0]) - int(hf_shape[0])} extra dim-0 rows "
                               f"(vocab padding) that the export legitimately drops")
         return result
 
+    def alternates_family(self, family: str, save_key: str, hf_alternates: Sequence[str], *,
+                          plus_one: bool = False, transpose_ok: bool = True,
+                          diag_prefix: str = "") -> Result:
+        """:meth:`identity_family` over a list of possible HF spellings."""
+        hf_key = self.pick_hf(hf_alternates, diag_prefix=diag_prefix)
+        return self.identity_family(family, save_key, hf_key, plus_one=plus_one, transpose_ok=transpose_ok)
+
     # -- fused / packed families -------------------------------------------------------------------
-    def qkv_family(self, family: str, save_key: str, hf_q: str, hf_k: str, hf_v: str,
-                   num_heads: int, num_kv_heads: int, head_dim: int) -> Result:
+    def qkv_family(self, family: str, save_key: str, hf_q: str, hf_k: str, hf_v: str, groups: int) -> Result:
+        """Fused mcore ``linear_qkv`` vs the export's q / k / v.
+
+        Block sizes come from the HF tensors themselves, so a gated attention layer (q_proj carrying its
+        gate) is handled without special-casing; ``groups`` is the number of KV groups.
+        """
         import torch
 
         sv = self.save.load(save_key)
-        hv = torch.cat([self.hf.load(hf_q), self.hf.load(hf_k), self.hf.load(hf_v)], dim=0)
+        q, k, v = self.hf.load(hf_q), self.hf.load(hf_k), self.hf.load(hf_v)
+        nq, nk, nv = int(q.shape[0]), int(k.shape[0]), int(v.shape[0])
+        hv = torch.cat([q, k, v], dim=0)
+        if nq + nk + nv != int(sv.shape[0]):
+            return Result(family, UNRESOLVED,
+                          detail=(f"HF q/k/v rows {nq}+{nk}+{nv}={nq + nk + nv} do not add up to the fused "
+                                  f"SAVE rows {int(sv.shape[0])}"),
+                          save_keys=[save_key], hf_keys=[hf_q, hf_k, hf_v])
         cands: List[Tuple[str, bool, Any, Any]] = []
-        for name, canonical, idx in (
-            ("gqa_group_interleaved", True, qkv_rows_grouped(num_heads, num_kv_heads, head_dim)),
-            ("contiguous_q_k_v", False, qkv_rows_contiguous(num_heads, num_kv_heads, head_dim)),
-        ):
+        try:
+            idx = qkv_rows_grouped_blocks(nq, nk, nv, groups)
             order = idx[0] + idx[1] + idx[2]
-            if len(order) != int(sv.shape[0]):
-                continue
-            cands.append((name, canonical, sv[torch.as_tensor(order, dtype=torch.long)], hv))
-        if not cands:
-            return Result(family, UNRESOLVED, detail=(
-                f"fused rows {tuple(sv.shape)} do not match heads={num_heads} kv={num_kv_heads} "
-                f"head_dim={head_dim}"), save_keys=[save_key], hf_keys=[hf_q, hf_k, hf_v])
+            cands.append((f"gqa_group_interleaved(groups={groups})", True,
+                          sv[torch.as_tensor(order, dtype=torch.long)], hv))
+        except ValueError:
+            pass
+        order = sum(qkv_rows_contiguous_blocks(nq, nk, nv), [])
+        cands.append(("contiguous_q_k_v", False, sv[torch.as_tensor(order, dtype=torch.long)], hv))
         return self._verdict(family, [save_key], [hf_q, hf_k, hf_v], cands)
 
     def fused_qkv_family(self, family: str, save_key: str, hf_key: str, num_heads: int, head_dim: int) -> Result:
@@ -484,20 +562,23 @@ class Checker:
         cands.append(("identity_no_relayout", False, sv, hv))
         return self._verdict(family, [save_key], [hf_key], cands)
 
-    def gated_pair_family(self, family: str, save_key: str, hf_key: str, *, hf_index0: Optional[int] = None,
-                          save_index0: Optional[int] = None,
+    def gated_pair_family(self, family: str, save_key: str, hf_keys: Sequence[str], *,
+                          hf_index0: Optional[int] = None, save_index0: Optional[int] = None,
                           tp_candidates: Sequence[int] = (2, 4, 8)) -> Result:
         """Fused gate/up matrices (routed experts, shared expert, dense MLP).
 
-        Canonical: the HF tensor is the SAVE's global ``[gate; up]`` rows unchanged (or transposed into HF's
-        layout when the shapes say so). Traps: gate and up interleaved in TP-rank blocks -- what a merge
-        that concatenated ``linear_fc1`` rank slices without honouring the swiglu split produces -- or the
-        two halves swapped.
+        ``hf_keys`` is either one packed tensor or a (gate, up) pair that is concatenated first. Canonical:
+        the HF side equals the SAVE's global ``[gate; up]`` rows (transposed when the shapes say so). Traps:
+        gate and up interleaved in TP-rank blocks -- what a merge that concatenated ``linear_fc1`` rank
+        slices without honouring the swiglu split produces -- or the two halves swapped.
         """
         import torch
 
         sv = self.save.load_dim0_index(save_key, save_index0) if save_index0 is not None else self.save.load(save_key)
-        hv = self.hf.load(hf_key, index0=hf_index0)
+        if len(hf_keys) == 1:
+            hv = self.hf.load(hf_keys[0], index0=hf_index0)
+        else:
+            hv = torch.cat([self.hf.load(k, index0=hf_index0) for k in hf_keys], dim=0)
         needs_t = sv.ndim == 2 and tuple(sv.shape) == tuple(reversed(tuple(hv.shape))) and sv.shape[0] != sv.shape[1]
 
         def shaped(t):
@@ -515,7 +596,7 @@ class Checker:
         if rows % 2 == 0:
             idx = torch.as_tensor(swap_halves(rows), dtype=torch.long)
             cands.append(("halves_swapped", False, shaped(sv[idx]), hv))
-        return self._verdict(family, [save_key], [hf_key], cands)
+        return self._verdict(family, [save_key], list(hf_keys), cands)
 
     def matrix_family(self, family: str, save_key: str, hf_key: str, *, hf_index0: Optional[int] = None,
                       save_index0: Optional[int] = None) -> Result:
@@ -533,12 +614,8 @@ class Checker:
                           save_keys=[save_key], hf_keys=[hf_key])
         return self._verdict(family, [save_key], [hf_key], cands)
 
-    def concat_split_family(self, family: str, save_key: str, hf_keys: Sequence[str]) -> Result:
-        """GDN ``in_proj``: one fused SAVE matrix vs several HF matrices concatenated in a declared order.
-
-        Canonical = the order the Qwen3.5 GDN mapping declares (qkv, z, b, a). Every other ordering of the
-        same parts is a trap candidate, so a swapped pair is named instead of showing up as noise.
-        """
+    def hf_concat_family(self, family: str, save_key: str, hf_keys: Sequence[str]) -> Result:
+        """One fused SAVE matrix vs several HF matrices concatenated in a declared order."""
         import torch
 
         sv = self.save.load(save_key)
@@ -546,7 +623,7 @@ class Checker:
         sizes = [int(parts[k].shape[0]) for k in hf_keys]
         if sum(sizes) != int(sv.shape[0]):
             return Result(family, UNRESOLVED,
-                          detail=(f"parts sum to {sum(sizes)} rows {concat_offsets(sizes)}, SAVE has "
+                          detail=(f"HF parts sum to {sum(sizes)} rows {concat_offsets(sizes)}, SAVE has "
                                   f"{int(sv.shape[0])}"),
                           save_keys=[save_key], hf_keys=list(hf_keys))
         cands: List[Tuple[str, bool, Any, Any]] = []
@@ -555,31 +632,68 @@ class Checker:
             label = "+".join(n.rsplit(".", 2)[-2] for n in names)
             cands.append((f"concat[{label}]", order == tuple(range(len(hf_keys))), sv,
                           torch.cat([parts[n] for n in names], dim=0)))
-        cands.sort(key=lambda c: not c[1])  # canonical order first
+        cands.sort(key=lambda c: not c[1])
         return self._verdict(family, [save_key], list(hf_keys), cands)
 
-    def conv1d_family(self, family: str, save_key: str, hf_key: str) -> Result:
-        sv = self.save.load(save_key)
+    def save_concat_family(self, family: str, save_keys: Sequence[str], hf_key: str) -> Result:
+        """Several SAVE parts vs ONE fused HF tensor -- this build splits GDN in_proj / conv1d per role.
+
+        The canonical order is the declared one; every other ordering of the same parts is a trap candidate,
+        so a query/key swap is named instead of showing up as an unexplained mismatch.
+        """
+        import torch
+
+        parts = {k: self.save.load(k) for k in save_keys}
         hv = self.hf.load(hf_key)
+        sizes = [int(parts[k].shape[0]) for k in save_keys]
+        if sum(sizes) != int(hv.shape[0]):
+            return Result(family, UNRESOLVED,
+                          detail=(f"SAVE parts sum to {sum(sizes)} rows {concat_offsets(sizes)}, HF has "
+                                  f"{int(hv.shape[0])}"),
+                          save_keys=list(save_keys), hf_keys=[hf_key])
         cands: List[Tuple[str, bool, Any, Any]] = []
+        limit = 6 if len(save_keys) <= 3 else 2  # 3 parts -> all 6 orders; more -> canonical + reversed
+        orders = list(permutations(range(len(save_keys))))[:limit] if len(save_keys) <= 3 else [
+            tuple(range(len(save_keys))), tuple(reversed(range(len(save_keys))))]
+        for order in orders:
+            names = [save_keys[i] for i in order]
+            label = "+".join(n.rsplit(".", 1)[-1] for n in names)
+            cands.append((f"concat[{label}]", order == tuple(range(len(save_keys))),
+                          torch.cat([parts[n] for n in names], dim=0), hv))
+        cands.sort(key=lambda c: not c[1])
+        return self._verdict(family, list(save_keys), [hf_key], cands)
+
+    def conv1d_family(self, family: str, save_keys: Sequence[str], hf_key: str) -> Result:
+        """GDN depthwise conv: possibly split per role on the SAVE side, possibly squeezed on the HF side."""
+        import torch
+
+        hv = self.hf.load(hf_key)
+        parts = [self.save.load(k) for k in save_keys]
+        sv = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+        cands: List[Tuple[str, bool, Any, Any]] = []
+        label = "+".join(k.rsplit(".", 1)[-1] for k in save_keys) if len(save_keys) > 1 else "identity"
         if tuple(sv.shape) == tuple(hv.shape):
-            cands.append(("identity", True, sv, hv))
+            cands.append((f"concat[{label}]" if len(save_keys) > 1 else "identity", True, sv, hv))
         if sv.ndim == 3 and hv.ndim == 2 and sv.shape[1] == 1:
             cands.append(("squeezed_channel_dim", True, sv.squeeze(1), hv))
         if sv.ndim == 2 and hv.ndim == 3 and hv.shape[1] == 1:
             cands.append(("unsqueezed_channel_dim", True, sv.unsqueeze(1), hv))
+        if len(save_keys) == 3:
+            rev = torch.cat(list(reversed(parts)), dim=0)
+            if tuple(rev.shape) == tuple(hv.shape):
+                cands.append(("concat[reversed]", False, rev, hv))
         if not cands:
             return Result(family, UNRESOLVED, detail=f"SAVE{tuple(sv.shape)} vs HF{tuple(hv.shape)}",
-                          save_keys=[save_key], hf_keys=[hf_key])
-        return self._verdict(family, [save_key], [hf_key], cands)
+                          save_keys=list(save_keys), hf_keys=[hf_key])
+        return self._verdict(family, list(save_keys), [hf_key], cands)
 
     def absent_family(self, family: str, save_key: str, hf_key: str) -> Result:
         """The tensor must be present on both sides or on neither (the merged line's vision final LN)."""
         in_save = self.save.describe(save_key) is not None
         in_hf = self.hf.has(hf_key)
         if in_save == in_hf:
-            state = "present on both" if in_save else "absent_on_both"
-            return Result(family, SKIP if not in_save else PASS, state,
+            return Result(family, SKIP if not in_save else PASS,
+                          "present_on_both" if in_save else "absent_on_both",
                           "the export carries this tensor exactly when the SAVE does", [save_key], [hf_key])
         return Result(family, FAIL, "present" if in_hf else "missing",
                       f"SAVE has it: {in_save}; HF has it: {in_hf} -- the export must carry this tensor if "
@@ -589,57 +703,86 @@ class Checker:
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
 # Discovery -- what the SAVE actually contains; never assumed from the config
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
-_LLM = "language_model.decoder.layers."
-_VIS = "vision_model.decoder.layers."
+def _layer_suffixes(keys: Sequence[str], prefix: str) -> Dict[int, List[str]]:
+    out: Dict[int, List[str]] = {}
+    pat = re.compile(re.escape(prefix) + r"(\d+)\.(.+)$")
+    for k in keys:
+        m = pat.match(k)
+        if m:
+            out.setdefault(int(m.group(1)), []).append(m.group(2))
+    return out
 
 
-def _layer_ids(keys: Sequence[str], prefix: str, marker: str) -> List[int]:
-    pat = re.compile(re.escape(prefix) + r"(\d+)\." + re.escape(marker) + r"$")
-    return sorted({int(m.group(1)) for m in (pat.match(k) for k in keys) if m})
+def _parts_of(suffixes: Sequence[str], stem: str) -> List[str]:
+    """Named sub-tensors of ``stem`` (``in_proj.weight.query`` -> ``query``), sorted, excluding extra state."""
+    pat = re.compile(re.escape(stem) + r"\.([A-Za-z_]+)$")
+    return sorted({m.group(1) for m in (pat.match(s) for s in suffixes) if m})
 
 
 def discover(save_keys: Sequence[str]) -> dict:
-    """Which layers are attention / GDN / MoE, how experts are stored, what the SAVE carries at all."""
-    per_expert = re.compile(re.escape(_LLM) + r"(\d+)\.mlp\.experts\.linear_fc1\.weight(\d+)$")
-    sequential = re.compile(re.escape(_LLM) + r"(\d+)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight$")
-    stacked = re.compile(re.escape(_LLM) + r"(\d+)\.mlp\.experts\.linear_fc1\.weight$")
-    style: Optional[str] = None
-    experts: List[int] = []
-    for k in save_keys:
-        m = per_expert.match(k)
-        if m:
-            style = style or "per_expert_suffix"
-            experts.append(int(m.group(2)))
-            continue
-        m = sequential.match(k)
-        if m:
-            style = style or "local_experts"
-            experts.append(int(m.group(2)))
-            continue
-        if stacked.match(k):
-            style = style or "stacked"
+    """Which layers are attention / GDN / MoE, how experts and GDN projections are stored, what exists."""
+    llm = _layer_suffixes(save_keys, _LLM)
+    vis = _layer_suffixes(save_keys, _VIS)
+    attention, gdn, moe = [], [], []
+    expert_stem: Optional[str] = None
+    expert_ids: List[int] = []
+    expert_indexed = False
+    in_proj_parts: List[str] = []
+    conv1d_parts: List[str] = []
+    in_proj_fused = False
+    conv1d_fused = False
+    shared_stem: Optional[str] = None
+    for layer, suffixes in sorted(llm.items()):
+        sset = set(suffixes)
+        if "self_attention.linear_qkv.weight" in sset:
+            attention.append(layer)
+        if any(s.startswith("self_attention.in_proj.weight") for s in sset):
+            gdn.append(layer)
+            in_proj_parts = in_proj_parts or _parts_of(suffixes, "self_attention.in_proj.weight")
+            conv1d_parts = conv1d_parts or _parts_of(suffixes, "self_attention.conv1d.weight")
+            in_proj_fused = in_proj_fused or ("self_attention.in_proj.weight" in sset)
+            conv1d_fused = conv1d_fused or ("self_attention.conv1d.weight" in sset)
+        if "mlp.router.weight" in sset:
+            moe.append(layer)
+        for s in suffixes:
+            m = re.match(r"(mlp\.experts\.(?:experts\.)?(?:local_experts\.(\d+)\.)?linear_fc1)\.weight(\d*)$", s)
+            if m:
+                expert_stem = expert_stem or m.group(1).replace(f"local_experts.{m.group(2)}.", "local_experts.{e}.")
+                if m.group(3):
+                    expert_indexed = True
+                    expert_ids.append(int(m.group(3)))
+                elif m.group(2):
+                    expert_ids.append(int(m.group(2)))
+            if shared_stem is None and s.startswith("mlp.shared_experts."):
+                shared_stem = "mlp.shared_experts."
     return {
-        "attention_layers": _layer_ids(save_keys, _LLM, "self_attention.linear_qkv.weight"),
-        "gdn_layers": _layer_ids(save_keys, _LLM, "self_attention.in_proj.weight"),
-        "moe_layers": _layer_ids(save_keys, _LLM, "mlp.router.weight"),
-        "vision_layers": _layer_ids(save_keys, _VIS, "self_attention.linear_qkv.weight"),
-        "expert_style": style,
-        "expert_ids": sorted(set(experts)),
-        "has_shared_experts": any(".mlp.shared_experts." in k for k in save_keys),
+        "attention_layers": attention,
+        "gdn_layers": gdn,
+        "moe_layers": moe,
+        "vision_layers": sorted(vis),
+        "expert_stem": expert_stem,
+        "expert_indexed": expert_indexed,
+        "expert_ids": sorted(set(expert_ids))[:4],
+        "expert_count": len(set(expert_ids)),
+        "gdn_in_proj_parts": in_proj_parts,
+        "gdn_in_proj_fused": in_proj_fused,
+        "gdn_conv1d_parts": conv1d_parts,
+        "gdn_conv1d_fused": conv1d_fused,
+        "shared_expert_stem": shared_stem,
         "has_mtp": any(".mtp." in k for k in save_keys),
         "has_vision_final_ln": any(k.startswith("vision_model.decoder.final_layernorm.") for k in save_keys),
     }
 
 
-def expert_save_keys(layer: int, expert: int, style: Optional[str]) -> Tuple[str, str, Optional[int]]:
-    """(fc1_key, fc2_key, save_dim0_index) for the discovered expert storage style."""
-    base = f"{_LLM}{layer}.mlp.experts."
-    if style == "per_expert_suffix":
-        return f"{base}linear_fc1.weight{expert}", f"{base}linear_fc2.weight{expert}", None
-    if style == "local_experts":
-        return (f"{base}local_experts.{expert}.linear_fc1.weight",
-                f"{base}local_experts.{expert}.linear_fc2.weight", None)
-    return f"{base}linear_fc1.weight", f"{base}linear_fc2.weight", expert
+def expert_save_key(layer: int, expert: int, stem: Optional[str], indexed: bool) -> Tuple[str, Optional[int]]:
+    """(SAVE key for this expert's fc1 stem, dim-0 index) for the discovered expert storage style."""
+    stem = stem or "mlp.experts.linear_fc1"
+    body = stem.replace("{e}", str(expert))
+    if indexed:
+        return f"{_LLM}{layer}.{body}.weight{expert}", None
+    if "local_experts" in stem:
+        return f"{_LLM}{layer}.{body}.weight", None
+    return f"{_LLM}{layer}.{body}.weight", expert
 
 
 def hf_dims(root: Path) -> dict:
@@ -653,7 +796,7 @@ def hf_dims(root: Path) -> dict:
     kv = int(text.get("num_key_value_heads", heads or 1) or 1)
     head_dim = int(text.get("head_dim", (hidden // heads) if heads else 0) or 0)
     v_hidden = int(vision.get("hidden_size", 0) or 0)
-    v_heads = int(vision.get("num_attention_heads", 0) or 0)
+    v_heads = int(vision.get("num_attention_heads", vision.get("num_heads", 0)) or 0)
     return {
         "hidden": hidden, "num_heads": heads, "num_kv_heads": kv, "head_dim": head_dim,
         "num_experts": int(text.get("num_experts", 0) or 0),
@@ -673,113 +816,145 @@ def build_and_run(checker: Checker, found: dict, dims: dict, layers: Sequence[in
     hf_llm = "model.language_model."
     hfl = hf_llm + "layers."
     hv = "model.visual."
+    c = checker
 
-    checker.run("embed_tokens", lambda: checker.identity_family(
+    c.run("embed_tokens", lambda: c.identity_family(
         "embed_tokens", "language_model.embedding.word_embeddings.weight", hf_llm + "embed_tokens.weight",
         transpose_ok=False))
-    checker.run("lm_head", lambda: checker.identity_family(
+    c.run("lm_head", lambda: c.identity_family(
         "lm_head", "language_model.output_layer.weight", "lm_head.weight", transpose_ok=False))
-    checker.run("final_norm", lambda: checker.identity_family(
+    c.run("final_norm", lambda: c.identity_family(
         "final_norm", "language_model.decoder.final_layernorm.weight", hf_llm + "norm.weight"))
 
     for L in layers:
+        sa = f"{_LLM}{L}.self_attention."
         if L in found["attention_layers"]:
-            checker.run(f"attn{L}_qkv", lambda L=L: checker.qkv_family(
-                f"attn{L}_qkv", f"{_LLM}{L}.self_attention.linear_qkv.weight",
-                f"{hfl}{L}.self_attn.q_proj.weight", f"{hfl}{L}.self_attn.k_proj.weight",
-                f"{hfl}{L}.self_attn.v_proj.weight",
-                dims["num_heads"], dims["num_kv_heads"], dims["head_dim"]))
-            checker.run(f"attn{L}_o_proj", lambda L=L: checker.identity_family(
-                f"attn{L}_o_proj", f"{_LLM}{L}.self_attention.linear_proj.weight",
-                f"{hfl}{L}.self_attn.o_proj.weight"))
-            checker.run(f"attn{L}_q_norm", lambda L=L: checker.identity_family(
-                f"attn{L}_q_norm", f"{_LLM}{L}.self_attention.q_layernorm.weight",
-                f"{hfl}{L}.self_attn.q_norm.weight"))
-            checker.run(f"attn{L}_k_norm", lambda L=L: checker.identity_family(
-                f"attn{L}_k_norm", f"{_LLM}{L}.self_attention.k_layernorm.weight",
-                f"{hfl}{L}.self_attn.k_norm.weight"))
-            checker.run(f"attn{L}_input_ln", lambda L=L: checker.identity_family(
-                f"attn{L}_input_ln", f"{_LLM}{L}.self_attention.linear_qkv.layer_norm_weight",
-                f"{hfl}{L}.input_layernorm.weight"))
+            c.run(f"attn{L}_qkv", lambda L=L, sa=sa: c.qkv_family(
+                f"attn{L}_qkv", sa + "linear_qkv.weight",
+                c.pick_hf([f"{hfl}{L}.self_attn.q_proj.weight"], diag_prefix=f"{hfl}{L}.self_attn."),
+                f"{hfl}{L}.self_attn.k_proj.weight", f"{hfl}{L}.self_attn.v_proj.weight",
+                dims["num_kv_heads"] or 1))
+            c.run(f"attn{L}_o_proj", lambda L=L, sa=sa: c.identity_family(
+                f"attn{L}_o_proj", sa + "linear_proj.weight", f"{hfl}{L}.self_attn.o_proj.weight"))
+            c.run(f"attn{L}_q_norm", lambda L=L, sa=sa: c.identity_family(
+                f"attn{L}_q_norm", sa + "q_layernorm.weight", f"{hfl}{L}.self_attn.q_norm.weight"))
+            c.run(f"attn{L}_k_norm", lambda L=L, sa=sa: c.identity_family(
+                f"attn{L}_k_norm", sa + "k_layernorm.weight", f"{hfl}{L}.self_attn.k_norm.weight"))
+            c.run(f"attn{L}_input_ln", lambda L=L, sa=sa: c.identity_family(
+                f"attn{L}_input_ln", sa + "linear_qkv.layer_norm_weight", f"{hfl}{L}.input_layernorm.weight"))
 
         if L in found["gdn_layers"]:
-            checker.run(f"gdn{L}_in_proj", lambda L=L: checker.concat_split_family(
-                f"gdn{L}_in_proj", f"{_LLM}{L}.self_attention.in_proj.weight",
-                [f"{hfl}{L}.linear_attn.in_proj_qkv.weight", f"{hfl}{L}.linear_attn.in_proj_z.weight",
-                 f"{hfl}{L}.linear_attn.in_proj_b.weight", f"{hfl}{L}.linear_attn.in_proj_a.weight"]))
-            checker.run(f"gdn{L}_conv1d", lambda L=L: checker.conv1d_family(
-                f"gdn{L}_conv1d", f"{_LLM}{L}.self_attention.conv1d.weight",
-                f"{hfl}{L}.linear_attn.conv1d.weight"))
+            la = f"{hfl}{L}.linear_attn."
+            parts = found["gdn_in_proj_parts"]
+            # This build splits the GDN input projection per role; older ones keep one fused matrix.
+            if parts:
+                qkv_parts = [p for p in ("query", "key", "value") if p in parts]
+                if len(qkv_parts) == 3:
+                    c.run(f"gdn{L}_in_proj_qkv", lambda L=L, sa=sa, qp=qkv_parts: c.save_concat_family(
+                        f"gdn{L}_in_proj_qkv", [sa + f"in_proj.weight.{p}" for p in qp],
+                        c.pick_hf([f"{hfl}{L}.linear_attn.in_proj_qkv.weight",
+                                   f"{hfl}{L}.linear_attn.in_proj_qkvz.weight"], diag_prefix=la)))
+                for part, hf_names in (("z", ["in_proj_z.weight"]),
+                                       ("beta", ["in_proj_b.weight", "in_proj_ba.weight"]),
+                                       ("alpha", ["in_proj_a.weight"])):
+                    if part not in parts:
+                        continue
+                    c.run(f"gdn{L}_in_proj_{part}", lambda L=L, sa=sa, part=part, hn=hf_names:
+                          c.alternates_family(f"gdn{L}_in_proj_{part}", sa + f"in_proj.weight.{part}",
+                                              [f"{hfl}{L}.linear_attn.{n}" for n in hn], diag_prefix=la))
+            elif found["gdn_in_proj_fused"]:
+                c.run(f"gdn{L}_in_proj", lambda L=L, sa=sa: c.hf_concat_family(
+                    f"gdn{L}_in_proj", sa + "in_proj.weight",
+                    [f"{hfl}{L}.linear_attn.in_proj_qkv.weight", f"{hfl}{L}.linear_attn.in_proj_z.weight",
+                     f"{hfl}{L}.linear_attn.in_proj_b.weight", f"{hfl}{L}.linear_attn.in_proj_a.weight"]))
+            conv_parts = [p for p in ("query", "key", "value") if p in found["gdn_conv1d_parts"]]
+            conv_keys = [sa + f"conv1d.weight.{p}" for p in conv_parts] if conv_parts else [sa + "conv1d.weight"]
+            c.run(f"gdn{L}_conv1d", lambda L=L, ck=conv_keys: c.conv1d_family(
+                f"gdn{L}_conv1d", ck, f"{hfl}{L}.linear_attn.conv1d.weight"))
             # mcore keeps a zero-centred RMSNorm here while the HF class expects the standard one -> +1.
-            checker.run(f"gdn{L}_out_norm", lambda L=L: checker.identity_family(
-                f"gdn{L}_out_norm", f"{_LLM}{L}.self_attention.out_norm.weight",
-                f"{hfl}{L}.linear_attn.norm.weight", plus_one=True))
-            checker.run(f"gdn{L}_out_proj", lambda L=L: checker.identity_family(
-                f"gdn{L}_out_proj", f"{_LLM}{L}.self_attention.out_proj.weight",
-                f"{hfl}{L}.linear_attn.out_proj.weight"))
-            checker.run(f"gdn{L}_A_log", lambda L=L: checker.identity_family(
-                f"gdn{L}_A_log", f"{_LLM}{L}.self_attention.A_log", f"{hfl}{L}.linear_attn.A_log"))
-            checker.run(f"gdn{L}_dt_bias", lambda L=L: checker.identity_family(
-                f"gdn{L}_dt_bias", f"{_LLM}{L}.self_attention.dt_bias", f"{hfl}{L}.linear_attn.dt_bias"))
-            checker.run(f"gdn{L}_input_ln", lambda L=L: checker.identity_family(
-                f"gdn{L}_input_ln", f"{_LLM}{L}.self_attention.in_proj.layer_norm_weight",
-                f"{hfl}{L}.input_layernorm.weight"))
+            c.run(f"gdn{L}_out_norm", lambda L=L, sa=sa: c.identity_family(
+                f"gdn{L}_out_norm", sa + "out_norm.weight", f"{hfl}{L}.linear_attn.norm.weight", plus_one=True))
+            c.run(f"gdn{L}_out_proj", lambda L=L, sa=sa: c.identity_family(
+                f"gdn{L}_out_proj", sa + "out_proj.weight", f"{hfl}{L}.linear_attn.out_proj.weight"))
+            c.run(f"gdn{L}_A_log", lambda L=L, sa=sa: c.identity_family(
+                f"gdn{L}_A_log", sa + "A_log", f"{hfl}{L}.linear_attn.A_log"))
+            c.run(f"gdn{L}_dt_bias", lambda L=L, sa=sa: c.identity_family(
+                f"gdn{L}_dt_bias", sa + "dt_bias", f"{hfl}{L}.linear_attn.dt_bias"))
+            c.run(f"gdn{L}_input_ln", lambda L=L, sa=sa: c.identity_family(
+                f"gdn{L}_input_ln", sa + "in_proj.layer_norm_weight", f"{hfl}{L}.input_layernorm.weight"))
 
         if L in found["moe_layers"]:
-            checker.run(f"moe{L}_router", lambda L=L: checker.identity_family(
+            c.run(f"moe{L}_router", lambda L=L: c.identity_family(
                 f"moe{L}_router", f"{_LLM}{L}.mlp.router.weight", f"{hfl}{L}.mlp.gate.weight"))
-            checker.run(f"moe{L}_pre_mlp_ln", lambda L=L: checker.identity_family(
+            c.run(f"moe{L}_pre_mlp_ln", lambda L=L: c.identity_family(
                 f"moe{L}_pre_mlp_ln", f"{_LLM}{L}.pre_mlp_layernorm.weight",
                 f"{hfl}{L}.post_attention_layernorm.weight"))
+            ex = f"{hfl}{L}.mlp.experts"
             for e in experts:
-                fc1, fc2, save_idx = expert_save_keys(L, e, found["expert_style"])
-                checker.run(f"moe{L}_e{e}_gate_up", lambda L=L, e=e, fc1=fc1, si=save_idx:
-                            checker.gated_pair_family(
-                                f"moe{L}_e{e}_gate_up", fc1, f"{hfl}{L}.mlp.experts.gate_up_proj",
-                                hf_index0=e, save_index0=si))
-                checker.run(f"moe{L}_e{e}_down", lambda L=L, e=e, fc2=fc2, si=save_idx:
-                            checker.matrix_family(
-                                f"moe{L}_e{e}_down", fc2, f"{hfl}{L}.mlp.experts.down_proj",
-                                hf_index0=e, save_index0=si))
-            if found["has_shared_experts"]:
-                checker.run(f"moe{L}_shared_gate_up", lambda L=L: checker.gated_pair_family(
-                    f"moe{L}_shared_gate_up", f"{_LLM}{L}.mlp.shared_experts.linear_fc1.weight",
-                    f"{hfl}{L}.mlp.shared_expert.gate_up_proj.weight"))
-                checker.run(f"moe{L}_shared_down", lambda L=L: checker.matrix_family(
-                    f"moe{L}_shared_down", f"{_LLM}{L}.mlp.shared_experts.linear_fc2.weight",
-                    f"{hfl}{L}.mlp.shared_expert.down_proj.weight"))
+                fc1, idx = expert_save_key(L, e, found["expert_stem"], found["expert_indexed"])
+                fc2 = fc1.replace("linear_fc1", "linear_fc2")
+                c.run(f"moe{L}_e{e}_gate_up", lambda L=L, e=e, fc1=fc1, idx=idx, ex=ex: c.gated_pair_family(
+                    f"moe{L}_e{e}_gate_up", fc1,
+                    c.pick_hf_group([[f"{ex}.gate_up_proj"], [f"{ex}.gate_up_proj.weight"],
+                                     [f"{ex}.{e}.gate_up_proj.weight"],
+                                     [f"{ex}.{e}.gate_proj.weight", f"{ex}.{e}.up_proj.weight"]],
+                                    diag_prefix=ex),
+                    hf_index0=e if c.hf.has(f"{ex}.gate_up_proj") or c.hf.has(f"{ex}.gate_up_proj.weight") else None,
+                    save_index0=idx))
+                c.run(f"moe{L}_e{e}_down", lambda L=L, e=e, fc2=fc2, idx=idx, ex=ex: c.matrix_family(
+                    f"moe{L}_e{e}_down", fc2,
+                    c.pick_hf([f"{ex}.down_proj", f"{ex}.down_proj.weight", f"{ex}.{e}.down_proj.weight"],
+                              diag_prefix=ex),
+                    hf_index0=e if c.hf.has(f"{ex}.down_proj") or c.hf.has(f"{ex}.down_proj.weight") else None,
+                    save_index0=idx))
+            if found["shared_expert_stem"]:
+                sh = f"{_LLM}{L}.{found['shared_expert_stem']}"
+                hsh = f"{hfl}{L}.mlp.shared_expert"
+                c.run(f"moe{L}_shared_gate_up", lambda L=L, sh=sh, hsh=hsh: c.gated_pair_family(
+                    f"moe{L}_shared_gate_up", sh + "linear_fc1.weight",
+                    c.pick_hf_group([[hsh + ".gate_up_proj.weight"],
+                                     [hsh + ".gate_proj.weight", hsh + ".up_proj.weight"],
+                                     [hsh + "s.gate_up_proj.weight"]], diag_prefix=f"{hfl}{L}.mlp.shared")))
+                c.run(f"moe{L}_shared_down", lambda L=L, sh=sh, hsh=hsh: c.alternates_family(
+                    f"moe{L}_shared_down", sh + "linear_fc2.weight",
+                    [hsh + ".down_proj.weight", hsh + "s.down_proj.weight"],
+                    diag_prefix=f"{hfl}{L}.mlp.shared"))
+                c.run(f"moe{L}_shared_gate", lambda L=L, sh=sh: c.alternates_family(
+                    f"moe{L}_shared_gate", sh + "gate_weight",
+                    [f"{hfl}{L}.mlp.shared_expert_gate.weight", f"{hfl}{L}.mlp.shared_expert.gate.weight"],
+                    diag_prefix=f"{hfl}{L}.mlp.shared"))
 
     for L in vision_layers:
         if L not in found["vision_layers"]:
             continue
-        checker.run(f"vis{L}_qkv", lambda L=L: checker.fused_qkv_family(
+        c.run(f"vis{L}_qkv", lambda L=L: c.fused_qkv_family(
             f"vis{L}_qkv", f"{_VIS}{L}.self_attention.linear_qkv.weight",
             f"{hv}encoder.layers.{L}.self_attn.qkv.weight", dims["vision_heads"], dims["vision_head_dim"]))
-        checker.run(f"vis{L}_proj", lambda L=L: checker.identity_family(
+        c.run(f"vis{L}_proj", lambda L=L: c.identity_family(
             f"vis{L}_proj", f"{_VIS}{L}.self_attention.linear_proj.weight",
             f"{hv}encoder.layers.{L}.self_attn.proj.weight"))
-        checker.run(f"vis{L}_fc1", lambda L=L: checker.identity_family(
+        c.run(f"vis{L}_fc1", lambda L=L: c.identity_family(
             f"vis{L}_fc1", f"{_VIS}{L}.mlp.linear_fc1.weight", f"{hv}encoder.layers.{L}.mlp.fc1.weight"))
-        checker.run(f"vis{L}_fc2", lambda L=L: checker.identity_family(
+        c.run(f"vis{L}_fc2", lambda L=L: c.identity_family(
             f"vis{L}_fc2", f"{_VIS}{L}.mlp.linear_fc2.weight", f"{hv}encoder.layers.{L}.mlp.fc2.weight"))
-        checker.run(f"vis{L}_ln1", lambda L=L: checker.identity_family(
+        c.run(f"vis{L}_ln1", lambda L=L: c.identity_family(
             f"vis{L}_ln1", f"{_VIS}{L}.self_attention.linear_qkv.layer_norm_weight",
             f"{hv}encoder.layers.{L}.layer_norm1.weight"))
 
-    checker.run("vision_pre_ln", lambda: checker.identity_family(
+    c.run("vision_pre_ln", lambda: c.identity_family(
         "vision_pre_ln", "vision_model.pre_layernorm.weight", hv + "layernorm_pre.weight"))
-    checker.run("adapter_ln", lambda: checker.identity_family(
+    c.run("adapter_ln", lambda: c.identity_family(
         "adapter_ln", "adapter.layernorm.weight", hv + "merger.ln_q.weight"))
-    checker.run("adapter_fc1", lambda: checker.identity_family(
+    c.run("adapter_fc1", lambda: c.identity_family(
         "adapter_fc1", "adapter.linear_fc1.weight", hv + "merger.mlp.0.weight"))
-    checker.run("adapter_fc2", lambda: checker.identity_family(
+    c.run("adapter_fc2", lambda: c.identity_family(
         "adapter_fc2", "adapter.linear_fc2.weight", hv + "merger.mlp.2.weight"))
 
     # The merged video line trains WITHOUT the vision final LayerNorm (OV2_MTP_LAYERS=0 -> mcore never
     # builds it); the export must agree with the SAVE either way.
-    checker.run("vision_final_ln", lambda: checker.absent_family(
+    c.run("vision_final_ln", lambda: c.absent_family(
         "vision_final_ln", "vision_model.decoder.final_layernorm.weight", hv + "layernorm_post.weight")
-        if not found["has_vision_final_ln"] else checker.identity_family(
+        if not found["has_vision_final_ln"] else c.identity_family(
         "vision_final_ln", "vision_model.decoder.final_layernorm.weight", hv + "layernorm_post.weight"))
 
 
@@ -802,6 +977,7 @@ def main() -> int:
     ap.add_argument("--rtol", type=float, default=0.0, help="relative tolerance (default 0 = bit-exact)")
     ap.add_argument("--max-load-gb", type=float, default=8.0, help="per-tensor SAVE load budget (GiB)")
     ap.add_argument("--dump-keys", action="store_true", help="print both key spaces plus discovery, then exit")
+    ap.add_argument("--grep", default="", help="with --dump-keys: only print keys containing this substring")
     ap.add_argument("--allow-unresolved", action="store_true", help="exit 0 even if a family was UNRESOLVED")
     ap.add_argument("--json", type=Path, default=None, help="write the full report here")
     args = ap.parse_args()
@@ -827,23 +1003,28 @@ def main() -> int:
     logger.info("[save-vs-hf] HF   %s (%d tensors)", args.hf, len(hf.keys()))
     logger.info("[save-vs-hf] dims %s", json.dumps(dims))
     logger.info("[save-vs-hf] found %s", json.dumps(
-        {k: (v[:12] + ["..."] if isinstance(v, list) and len(v) > 12 else v) for k, v in found.items()}))
+        {k: (v[:8] + ["..."] if isinstance(v, list) and len(v) > 8 else v) for k, v in found.items()}))
 
     if args.dump_keys:
         logger.info("---- SAVE keys ----")
         for k in save.keys():
+            if args.grep and args.grep not in k:
+                continue
             desc = save.describe(k)
             logger.info("  %s %s", k, tuple(desc[0]) if desc else "(bytes)")
         logger.info("---- HF keys ----")
         for k in hf.keys():
+            if args.grep and args.grep not in k:
+                continue
             logger.info("  %s %s", k, hf.shape(k))
         return 0
 
     layers = _int_list(args.layers)
     if not layers:
-        layers = ([found["attention_layers"][0]] if found["attention_layers"] else []) + \
-                 ([found["gdn_layers"][0]] if found["gdn_layers"] else [])
-        layers = sorted(set(layers + ([found["moe_layers"][0]] if found["moe_layers"] else [])))
+        layers = sorted(set(
+            ([found["attention_layers"][0]] if found["attention_layers"] else [])
+            + ([found["gdn_layers"][0]] if found["gdn_layers"] else [])
+            + ([found["moe_layers"][0]] if found["moe_layers"] else [])))
     experts = _int_list(args.expert)
     vision_layers = _int_list(args.vision_layers)
     logger.info("[save-vs-hf] checking layers=%s experts=%s vision_layers=%s", layers, experts, vision_layers)

@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Layout arithmetic behind ``save_vs_hf_arrangement.py``: the QKV / SwiGLU / concat index math.
+"""Layout arithmetic and key-space discovery behind ``save_vs_hf_arrangement.py``.
 
-Pure integer reasoning -- no torch, no GPU, no checkpoint -- so the claims the comparator makes about
-mcore's layouts can be checked on any machine. The end-to-end behaviour (real DCP files, safetensors,
+Pure integer and string reasoning -- no torch, no GPU, no checkpoint -- so the claims the comparator makes
+about mcore's layouts can be checked on any machine. The end-to-end behaviour (real DCP files, safetensors,
 injected defects) is covered by ``save_vs_hf_arrangement_selftest.py``, which needs torch.
 
 Runnable both ways::
@@ -37,6 +37,7 @@ except ImportError:  # standalone run on a machine without pytest -- only `raise
 
 _TOOL = (Path(__file__).resolve().parents[4] / "examples" / "models" / "qwen" / "qwen35_vl_ov2" /
          "convert" / "save_vs_hf_arrangement.py")
+_LLM = "language_model.decoder.layers."
 
 
 def _load_module():
@@ -66,12 +67,33 @@ def test_grouped_qkv_is_a_partition_of_the_fused_rows():
         assert len(q) == heads * hd and len(k) == kv * hd and len(v) == kv * hd
 
 
+def test_block_form_handles_qwen35_gated_attention():
+    """The real merged SAVE: 16 heads, 2 KV groups, head_dim 256, and q carries its gate -> 9216 rows."""
+    nq, nk, nv = 2 * 16 * 256, 2 * 256, 2 * 256
+    assert nq + nk + nv == 9216
+    q, k, v = M.qkv_rows_grouped_blocks(nq, nk, nv, 2)
+    assert sorted(q + k + v) == list(range(9216))
+    assert len(q) == 8192 and len(k) == 512 and len(v) == 512
+    # Group 0 owns the first block: half the q(+gate) rows, then its k, then its v.
+    assert q[:3] == [0, 1, 2] and k[0] == 4096 and v[0] == 4096 + 256
+    assert q[4096] == 4608  # group 1 starts after the first (4096 + 256 + 256) block
+
+
+def test_block_form_agrees_with_the_head_count_form_when_ungated():
+    assert M.qkv_rows_grouped_blocks(4 * 2, 2 * 2, 2 * 2, 2) == M.qkv_rows_grouped(4, 2, 2)
+
+
 def test_contiguous_qkv_is_the_other_partition_and_differs_under_gqa():
     q, k, v = M.qkv_rows_contiguous(4, 2, 2)
     assert q == list(range(8)) and k == [8, 9, 10, 11] and v == [12, 13, 14, 15]
     assert M.qkv_rows_contiguous(4, 2, 2) != M.qkv_rows_grouped(4, 2, 2)
-    # Multi-head attention (kv == heads) is still a different arrangement, so the trap stays visible.
     assert M.qkv_rows_contiguous(8, 8, 4) != M.qkv_rows_grouped(8, 8, 4)
+
+
+def test_contiguous_block_form():
+    q, k, v = M.qkv_rows_contiguous_blocks(16, 4, 4)
+    assert q == list(range(16)) and k == [16, 17, 18, 19] and v == [20, 21, 22, 23]
+    assert M.qkv_rows_contiguous_blocks(16, 4, 4) != M.qkv_rows_grouped_blocks(16, 4, 4, 2)
 
 
 def test_grouped_indices_recover_per_head_order():
@@ -103,6 +125,8 @@ def test_qkv_geometry_is_validated():
         M.qkv_rows_grouped(4, 0, 4)
     with pytest.raises(ValueError):
         M.qkv_rows_contiguous(4, 2, 0)
+    with pytest.raises(ValueError):
+        M.qkv_rows_grouped_blocks(9, 4, 4, 2)  # q rows not divisible by the group count
 
 
 # ── SwiGLU / TP interleave ────────────────────────────────────────────────────────────────────────
@@ -161,7 +185,6 @@ def test_sample_windows_covers_head_and_tail():
     windows = M.sample_windows(1000, 100)
     assert windows == [(0, 50), (950, 1000)]
     assert sum(b - a for a, b in windows) == 100
-    # Windows must not overlap: an overlapping tail would silently re-check the head.
     assert windows[0][1] <= windows[1][0]
 
 
@@ -171,40 +194,64 @@ def test_sample_windows_degrades_to_one_window_when_the_tensor_is_short():
 
 
 # ── discovery ─────────────────────────────────────────────────────────────────────────────────────
-def test_discover_reads_layer_kinds_and_expert_style_from_the_key_space():
+def test_discover_reads_the_real_merged_save_key_space():
+    """The shapes this build actually writes: split GDN projections, doubled experts., shared experts."""
     keys = [
-        "language_model.decoder.layers.0.self_attention.linear_qkv.weight",
-        "language_model.decoder.layers.1.self_attention.in_proj.weight",
-        "language_model.decoder.layers.0.mlp.router.weight",
-        "language_model.decoder.layers.0.mlp.experts.linear_fc1.weight0",
-        "language_model.decoder.layers.0.mlp.experts.linear_fc1.weight1",
-        "language_model.decoder.layers.0.mlp.shared_experts.linear_fc1.weight",
+        f"{_LLM}0.self_attention.in_proj.weight.query",
+        f"{_LLM}0.self_attention.in_proj.weight.key",
+        f"{_LLM}0.self_attention.in_proj.weight.value",
+        f"{_LLM}0.self_attention.in_proj.weight.z",
+        f"{_LLM}0.self_attention.in_proj.weight.beta",
+        f"{_LLM}0.self_attention.in_proj.weight.alpha",
+        f"{_LLM}0.self_attention.conv1d.weight.query",
+        f"{_LLM}0.self_attention.conv1d.weight.key",
+        f"{_LLM}0.self_attention.conv1d.weight.value",
+        f"{_LLM}0.mlp.router.weight",
+        f"{_LLM}0.mlp.experts.experts.linear_fc1.weight0",
+        f"{_LLM}0.mlp.experts.experts.linear_fc1.weight1",
+        f"{_LLM}0.mlp.shared_experts.linear_fc1.weight",
+        f"{_LLM}3.self_attention.linear_qkv.weight",
+        f"{_LLM}3.mlp.router.weight",
         "vision_model.decoder.layers.0.self_attention.linear_qkv.weight",
     ]
     found = M.discover(keys)
-    assert found["attention_layers"] == [0]
-    assert found["gdn_layers"] == [1]
-    assert found["moe_layers"] == [0]
+    assert found["attention_layers"] == [3]
+    assert found["gdn_layers"] == [0]
+    assert found["moe_layers"] == [0, 3]
     assert found["vision_layers"] == [0]
-    assert found["expert_style"] == "per_expert_suffix"
+    assert found["gdn_in_proj_parts"] == ["alpha", "beta", "key", "query", "value", "z"]
+    assert found["gdn_conv1d_parts"] == ["key", "query", "value"]
+    assert found["gdn_in_proj_fused"] is False
+    assert found["expert_stem"] == "mlp.experts.experts.linear_fc1"
+    assert found["expert_indexed"] is True
     assert found["expert_ids"] == [0, 1]
-    assert found["has_shared_experts"] is True
+    assert found["shared_expert_stem"] == "mlp.shared_experts."
     assert found["has_vision_final_ln"] is False
 
 
+def test_discover_still_handles_a_fused_gdn_projection():
+    found = M.discover([f"{_LLM}1.self_attention.in_proj.weight"])
+    assert found["gdn_layers"] == [1]
+    assert found["gdn_in_proj_fused"] is True
+    assert found["gdn_in_proj_parts"] == []
+
+
 def test_discover_recognises_the_other_expert_storage_styles():
-    seq = M.discover(["language_model.decoder.layers.0.mlp.experts.local_experts.3.linear_fc1.weight"])
-    assert seq["expert_style"] == "local_experts" and seq["expert_ids"] == [3]
-    stacked = M.discover(["language_model.decoder.layers.0.mlp.experts.linear_fc1.weight"])
-    assert stacked["expert_style"] == "stacked" and stacked["expert_ids"] == []
+    single = M.discover([f"{_LLM}0.mlp.experts.linear_fc1.weight7"])
+    assert single["expert_stem"] == "mlp.experts.linear_fc1" and single["expert_indexed"] is True
+    stacked = M.discover([f"{_LLM}0.mlp.experts.linear_fc1.weight"])
+    assert stacked["expert_stem"] == "mlp.experts.linear_fc1" and stacked["expert_indexed"] is False
+    seq = M.discover([f"{_LLM}0.mlp.experts.local_experts.3.linear_fc1.weight"])
+    assert "local_experts" in (seq["expert_stem"] or "") and seq["expert_ids"] == [3]
 
 
-def test_expert_save_keys_follow_the_discovered_style():
-    assert M.expert_save_keys(2, 5, "per_expert_suffix")[0].endswith("experts.linear_fc1.weight5")
-    assert M.expert_save_keys(2, 5, "per_expert_suffix")[2] is None
-    assert M.expert_save_keys(2, 5, "local_experts")[1].endswith("local_experts.5.linear_fc2.weight")
-    fc1, _, index = M.expert_save_keys(2, 5, "stacked")
-    assert fc1.endswith("experts.linear_fc1.weight") and index == 5
+def test_expert_save_key_follows_the_discovered_style():
+    key, index = M.expert_save_key(2, 5, "mlp.experts.experts.linear_fc1", True)
+    assert key.endswith("mlp.experts.experts.linear_fc1.weight5") and index is None
+    key, index = M.expert_save_key(2, 5, "mlp.experts.linear_fc1", False)
+    assert key.endswith("mlp.experts.linear_fc1.weight") and index == 5
+    key, index = M.expert_save_key(2, 5, "mlp.experts.local_experts.{e}.linear_fc1", False)
+    assert key.endswith("local_experts.5.linear_fc1.weight") and index is None
 
 
 def test_vision_final_layernorm_is_detected_when_present():
