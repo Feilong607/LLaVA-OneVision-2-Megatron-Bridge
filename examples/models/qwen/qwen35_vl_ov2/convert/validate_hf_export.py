@@ -88,15 +88,20 @@ def ep_invariance_evidence(root: Path) -> dict:
     }
 
 
-def check_export_config(root: Path, *, require_mtp: bool) -> None:
-    """Reject incompatible skeleton settings together, before loading GPU weights."""
+def check_export_config(root: Path, *, require_mtp: bool, vision_post_layernorm: bool = True) -> None:
+    """Reject incompatible skeleton settings together, before loading GPU weights.
+
+    ``vision_post_layernorm`` is what the SAVE actually carries (mcore builds the vision tower's final LayerNorm
+    only when ``config.mtp_num_layers`` is not None): True for the s1.5 line (default, unchanged), False for an
+    ``OV2_MTP_LAYERS=0`` SAVE such as the merged video stage. The skeleton flag must match it either way.
+    """
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(root, trust_remote_code=True, local_files_only=True)
     text = config.text_config
     vision = config.vision_config
     wanted = {
-        "use_post_layernorm": True,
+        "use_post_layernorm": bool(vision_post_layernorm),
         "use_head": False,
         "zero_centered_gamma": True,
         "merger_zero_centered_gamma": True,
@@ -211,13 +216,20 @@ def main() -> None:
     parser.add_argument("--require-mtp", action="store_true")
     parser.add_argument("--config-only", action="store_true", help="Check HF construction before GPU export")
     parser.add_argument(
+        "--vision-post-layernorm",
+        type=int,
+        choices=(0, 1),
+        default=1,
+        help="what the SAVE carries for vision_model.decoder.final_layernorm (ckpt_has_key.py); default 1 = s1.5 layout",
+    )
+    parser.add_argument(
         "--require-ep-invariance",
         action="store_true",
         help="Fail unless a matching export_parity.json shows this export is EP-reshard invariant",
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    check_export_config(args.root, require_mtp=args.require_mtp)
+    check_export_config(args.root, require_mtp=args.require_mtp, vision_post_layernorm=bool(args.vision_post_layernorm))
     expected = expected_shapes(args.root)
     if args.config_only:
         logger.info("[q35-export-check] HF config/meta-model preflight PASS: %s inference tensors", len(expected))

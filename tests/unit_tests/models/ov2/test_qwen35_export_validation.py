@@ -435,3 +435,62 @@ def test_monolithic_and_sharded_weights_cannot_coexist(tmp_path):
     save_file({"stale": torch.ones(2)}, tmp_path / "model.safetensors")
     with pytest.raises(ValueError, match="Ambiguous HF weights"):
         validator.tensor_inventory(tmp_path)
+
+
+def _norm_contract_config(skeleton, *, use_post_layernorm, mtp_layers):
+    config_path = skeleton / "config.json"
+    config = json.loads(config_path.read_text())
+    config["architectures"] = ["LlavaOnevision2ForConditionalGeneration"]
+    config["text_config"]["mtp_num_hidden_layers"] = mtp_layers
+    config["vision_config"].update(
+        use_post_layernorm=use_post_layernorm,
+        use_head=False,
+        zero_centered_gamma=True,
+        merger_zero_centered_gamma=True,
+        layer_norm_type="layer_norm",
+        layer_norm_eps=1e-5,
+        post_layernorm_eps=1e-5,
+        pre_layernorm_eps=1e-4,
+        merger_layernorm_eps=1e-6,
+    )
+    config_path.write_text(json.dumps(config))
+
+
+@pytest.mark.unit
+def test_config_preflight_vision_post_layernorm_follows_the_save(skeleton):
+    """An OV2_MTP_LAYERS=0 SAVE has no vision final LayerNorm (mcore builds it only when mtp_num_layers is
+    not None), so its skeleton must say use_post_layernorm=False and the validator must accept that -- while the
+    default (s1.5, MTP head present) still requires True."""
+    _norm_contract_config(skeleton, use_post_layernorm=False, mtp_layers=0)
+    validator.check_export_config(skeleton, require_mtp=False, vision_post_layernorm=False)
+    with pytest.raises(ValueError, match="use_post_layernorm"):
+        validator.check_export_config(skeleton, require_mtp=False)  # default = s1.5 layout
+    _norm_contract_config(skeleton, use_post_layernorm=True, mtp_layers=1)
+    validator.check_export_config(skeleton, require_mtp=True)
+    with pytest.raises(ValueError, match="use_post_layernorm"):
+        validator.check_export_config(skeleton, require_mtp=True, vision_post_layernorm=False)
+
+
+@pytest.mark.unit
+def test_ckpt_has_key_reads_torch_dist_metadata(tmp_path):
+    import subprocess
+    import sys
+
+    import torch.distributed.checkpoint as dcp
+
+    ckpt = tmp_path / "iter_0000005"
+    dcp.save({"vision_model.pre_layernorm.weight": torch.ones(4), "language_model.x": torch.zeros(2)}, checkpoint_id=str(ckpt))
+    assert (ckpt / ".metadata").is_file()
+    tool = CONVERT / "ckpt_has_key.py"
+    present = subprocess.run(
+        [sys.executable, str(tool), str(ckpt), "vision_model.pre_layernorm.weight"], capture_output=True, text=True
+    )
+    assert present.returncode == 0 and present.stdout.strip() == "vision_model.pre_layernorm.weight 1"
+    absent = subprocess.run(
+        [sys.executable, str(tool), str(ckpt), "vision_model.decoder.final_layernorm.weight"],
+        capture_output=True,
+        text=True,
+    )
+    assert absent.returncode == 1 and absent.stdout.strip() == "vision_model.decoder.final_layernorm.weight 0"
+    bad = subprocess.run([sys.executable, str(tool), str(tmp_path), "x"], capture_output=True, text=True)
+    assert bad.returncode == 2 and "no .metadata" in bad.stderr
