@@ -96,6 +96,39 @@ def test_contiguous_block_form():
     assert M.qkv_rows_contiguous_blocks(16, 4, 4) != M.qkv_rows_grouped_blocks(16, 4, 4, 2)
 
 
+def test_gated_head_interleave_small_case():
+    """4 heads / 2 groups / head_dim 2, gated: each group is [q-block, gate-block, k, v] in the SAVE."""
+    q, k, v = M.qkv_rows_gated_head_interleaved(16, 4, 4, 2)
+    # group 0 occupies rows 0..11: q heads at 0-1 / 2-3, their gates at 4-5 / 6-7, then k, then v
+    assert q[:8] == [0, 1, 4, 5, 2, 3, 6, 7]
+    assert k[:2] == [8, 9] and v[:2] == [10, 11]
+    # group 1 repeats the pattern one block (12 rows) later
+    assert q[8:] == [12, 13, 16, 17, 14, 15, 18, 19]
+    assert k[2:] == [20, 21] and v[2:] == [22, 23]
+
+
+def test_gated_head_interleave_covers_the_real_geometry():
+    """16 heads, 2 KV groups, head_dim 256, q carrying its gate -> a partition of all 9216 rows."""
+    q, k, v = M.qkv_rows_gated_head_interleaved(8192, 512, 512, 2)
+    assert sorted(q + k + v) == list(range(9216))
+    assert len(q) == 8192 and len(k) == 512 and len(v) == 512
+    # The first head's gate sits a whole q-block (npg * head_dim = 8 * 256) after its query rows.
+    assert q[:2] == [0, 1] and q[256] == 2048
+
+
+def test_gated_interleave_differs_from_the_plain_group_block():
+    assert M.qkv_rows_gated_head_interleaved(16, 4, 4, 2) != M.qkv_rows_grouped_blocks(16, 4, 4, 2)
+
+
+def test_gated_head_interleave_validates_its_geometry():
+    with pytest.raises(ValueError):
+        M.qkv_rows_gated_head_interleaved(16, 4, 4, 3)     # rows do not split into 3 groups
+    with pytest.raises(ValueError):
+        M.qkv_rows_gated_head_interleaved(16, 4, 8, 2)     # k and v disagree on head_dim
+    with pytest.raises(ValueError):
+        M.qkv_rows_gated_head_interleaved(12, 8, 8, 2)     # q rows per group are not 2 * head_dim * heads
+
+
 def test_grouped_indices_recover_per_head_order():
     """Rows tagged by (head, kind) come back grouped by kind, heads ascending -- what HF q/k/v expect."""
     heads, kv, hd = 6, 3, 4

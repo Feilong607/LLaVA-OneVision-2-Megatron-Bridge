@@ -118,10 +118,10 @@ def build_hf(save: Dict[str, "object"]) -> Dict[str, "object"]:
     import torch
 
     sys.path.insert(0, str(HERE))
-    from save_vs_hf_arrangement import qkv_rows_grouped_blocks, qkv_rows_head_interleaved
+    from save_vs_hf_arrangement import qkv_rows_gated_head_interleaved, qkv_rows_head_interleaved
 
     nq, nk, nv = 2 * NH * HD, NKV * HD, NKV * HD
-    q, k, v = qkv_rows_grouped_blocks(nq, nk, nv, NKV)
+    q, k, v = qkv_rows_gated_head_interleaved(nq, nk, nv, NKV)
     fused = save[f"{_LLM}{ATTN_LAYER}.self_attention.linear_qkv.weight"]
     vq, vk, vv = qkv_rows_head_interleaved(VHEADS, VH // VHEADS)
     vfused = save[f"{_VIS}0.self_attention.linear_qkv.weight"]
@@ -260,6 +260,23 @@ def defect_qkv_contiguous(hf, save):
     return hf
 
 
+def defect_gated_q_then_gate(hf, save):
+    """Defect: q_proj shipped as the SAVE's per-group [q-block, gate-block] instead of per-head [q, gate]."""
+    import torch
+
+    sys.path.insert(0, str(HERE))
+    from save_vs_hf_arrangement import qkv_rows_grouped_blocks
+
+    nq, nk, nv = 2 * NH * HD, NKV * HD, NKV * HD
+    q, k, v = qkv_rows_grouped_blocks(nq, nk, nv, NKV)
+    fused = save[f"{_LLM}{ATTN_LAYER}.self_attention.linear_qkv.weight"]
+    hf = dict(hf)
+    hf[f"{HFL}{ATTN_LAYER}.self_attn.q_proj.weight"] = fused[torch.as_tensor(q)].clone()
+    hf[f"{HFL}{ATTN_LAYER}.self_attn.k_proj.weight"] = fused[torch.as_tensor(k)].clone()
+    hf[f"{HFL}{ATTN_LAYER}.self_attn.v_proj.weight"] = fused[torch.as_tensor(v)].clone()
+    return hf
+
+
 def defect_gate_up_interleaved(hf, save):
     """Defect: one expert's gate/up shipped in TP-rank-interleaved order (the SwiGLU merge trap)."""
     import torch
@@ -341,6 +358,8 @@ def defect_vision_post_ln_present(hf, save):
 CASES: List[Tuple[str, object, Sequence[Tuple[str, str]], int]] = [
     ("clean", None, (), 0),
     ("qkv_contiguous", defect_qkv_contiguous, ((f"attn{ATTN_LAYER}_qkv", "contiguous_q_k_v"),), 1),
+    ("gated_q_then_gate", defect_gated_q_then_gate,
+     ((f"attn{ATTN_LAYER}_qkv", "gated_per_group_q_then_gate"),), 1),
     ("gate_up_interleaved", defect_gate_up_interleaved,
      ((f"moe{ATTN_LAYER}_e0_gate_up", "rank_interleaved_gate_up"),), 1),
     ("shared_halves_swapped", defect_shared_halves_swapped,

@@ -128,6 +128,38 @@ def qkv_rows_grouped(num_heads: int, num_kv_heads: int, head_dim: int) -> Tuple[
                                    num_kv_heads * head_dim, num_kv_heads)
 
 
+def qkv_rows_gated_head_interleaved(nq: int, nk: int, nv: int, groups: int) -> Tuple[List[int], List[int], List[int]]:
+    """Row indices when the layer is GATED and the export interleaves q with its gate per head.
+
+    mcore lays a gated group out as ``[q-block, gate-block, k, v]`` (attention.py, ``split_arg_list`` =
+    [q_per_group*hn, q_per_group*hn, hn, hn]), while an HF ``q_proj`` that is reshaped to
+    ``[..., num_heads, 2*head_dim]`` and chunked on the last dim reads as ``[q_h0, gate_h0, q_h1, ...]``.
+    This returns the SAVE rows in that HF order. Geometry is derived from the row counts alone:
+    ``head_dim = nk // groups`` and ``heads_per_group = (nq // groups) // 2 // head_dim``.
+    """
+    if groups <= 0 or nk % groups or nv % groups or nq % groups:
+        raise ValueError(f"nq={nq} nk={nk} nv={nv} do not split into groups={groups}")
+    hd = nk // groups
+    if hd <= 0 or nv // groups != hd:
+        raise ValueError(f"k and v must contribute one head per group (nk={nk}, nv={nv}, groups={groups})")
+    q_and_gate = nq // groups
+    if q_and_gate % (2 * hd):
+        raise ValueError(f"q rows per group ({q_and_gate}) is not 2 * head_dim ({hd}) * heads_per_group")
+    npg = q_and_gate // (2 * hd)
+    block = q_and_gate + 2 * hd
+    q: List[int] = []
+    k: List[int] = []
+    v: List[int] = []
+    for g in range(groups):
+        base = g * block
+        for j in range(npg):
+            q.extend(range(base + j * hd, base + (j + 1) * hd))                       # q of head j
+            q.extend(range(base + npg * hd + j * hd, base + npg * hd + (j + 1) * hd))  # its gate
+        k.extend(range(base + q_and_gate, base + q_and_gate + hd))
+        v.extend(range(base + q_and_gate + hd, base + block))
+    return q, k, v
+
+
 def qkv_rows_contiguous(num_heads: int, num_kv_heads: int, head_dim: int) -> Tuple[List[int], List[int], List[int]]:
     """The trap layout: all of q, then all of k, then all of v (what a naive row split produces)."""
     if num_heads <= 0 or num_kv_heads <= 0 or head_dim <= 0:
@@ -375,6 +407,52 @@ def compare(a, b, atol: float, rtol: float) -> Tuple[bool, float]:
     return match, (float(diff.max()) if diff.numel() else 0.0)
 
 
+def explain_rows(save_tensor, hf_tensor, max_runs: int = 12) -> str:
+    """Say where each HF row actually came from, by matching rows byte-for-byte against the SAVE.
+
+    When no declared arrangement matches, guessing further is a waste of a push cycle: this reads the
+    answer off the data instead. Rows are hashed (exact bytes, so bf16 is compared as stored), the HF ->
+    SAVE row map is recovered, and consecutive stretches are compressed into runs. Rows that match nothing
+    in the SAVE are reported separately -- those are the ones that cannot be a re-arrangement at all.
+    """
+    import hashlib
+
+    import torch
+
+    if save_tensor.ndim != 2 or hf_tensor.ndim != 2 or save_tensor.shape[1] != hf_tensor.shape[1]:
+        return ""
+
+    def row_hashes(t):
+        flat = t.contiguous().view(torch.uint8).numpy()
+        return [hashlib.blake2b(flat[i].tobytes(), digest_size=16).digest() for i in range(flat.shape[0])]
+
+    index: Dict[bytes, int] = {}
+    duplicates = 0
+    for i, h in enumerate(row_hashes(save_tensor)):
+        if h in index:
+            duplicates += 1
+        else:
+            index[h] = i
+    mapping = [index.get(h, -1) for h in row_hashes(hf_tensor)]
+    unmatched = sum(1 for m in mapping if m < 0)
+
+    runs: List[Tuple[int, int, int]] = []  # (hf_start, save_start, length)
+    for i, m in enumerate(mapping):
+        if runs and m >= 0 and runs[-1][1] >= 0 and m == runs[-1][1] + runs[-1][2] and \
+                i == runs[-1][0] + runs[-1][2]:
+            runs[-1] = (runs[-1][0], runs[-1][1], runs[-1][2] + 1)
+        elif runs and m < 0 and runs[-1][1] < 0 and i == runs[-1][0] + runs[-1][2]:
+            runs[-1] = (runs[-1][0], -1, runs[-1][2] + 1)
+        else:
+            runs.append((i, m, 1))
+    shown = "; ".join(
+        f"HF[{a}:{a + n}]={'SAVE[%d:%d]' % (b, b + n) if b >= 0 else 'NO MATCH'}" for a, b, n in runs[:max_runs])
+    more = f" (+{len(runs) - max_runs} more runs)" if len(runs) > max_runs else ""
+    extra = f"; {unmatched} HF rows match no SAVE row" if unmatched else ""
+    dup = f"; {duplicates} duplicate SAVE rows (mapping may be ambiguous)" if duplicates else ""
+    return f"row map: {shown}{more}{extra}{dup}"
+
+
 class Result:
     """One family's verdict: the status, the arrangement that matched, and the keys behind it."""
 
@@ -400,12 +478,15 @@ class Result:
 class Checker:
     """Runs one family at a time; any exception becomes an UNRESOLVED row instead of killing the run."""
 
-    def __init__(self, save: SaveReader, hf: HFReader, atol: float, rtol: float, rows: int):
+    def __init__(self, save: SaveReader, hf: HFReader, atol: float, rtol: float, rows: int,
+                 explain: bool = True, explain_max_rows: int = 65536):
         self.save = save
         self.hf = hf
         self.atol = atol
         self.rtol = rtol
         self.rows = rows
+        self.explain = explain
+        self.explain_max_rows = explain_max_rows
         self.results: List[Result] = []
 
     def run(self, family: str, fn: Callable[[], Result]) -> None:
@@ -448,7 +529,8 @@ class Checker:
 
     # -- verdict -----------------------------------------------------------------------------------
     def _verdict(self, family: str, save_keys: Sequence[str], hf_keys: Sequence[str],
-                 candidates: Sequence[Tuple[str, bool, Any, Any]]) -> Result:
+                 candidates: Sequence[Tuple[str, bool, Any, Any]],
+                 explain_pair: Optional[Tuple[Any, Any]] = None) -> Result:
         """``candidates`` = (name, is_canonical, save_side_tensor, hf_side_tensor); canonical ones first."""
         if not candidates:
             return Result(family, UNRESOLVED, detail="no comparable arrangement could be built",
@@ -464,10 +546,18 @@ class Checker:
                 return Result(family, FAIL, name,
                               f"HF equals the NON-canonical arrangement '{name}': the export re-laid this "
                               f"family out the wrong way", save_keys, hf_keys, 0.0)
-        return Result(family, FAIL, "none",
-                      f"no known arrangement reproduces the HF tensor from the SAVE "
-                      f"(smallest max|diff| = {best:.6g}); the values themselves differ",
-                      save_keys, hf_keys, best)
+        detail = (f"no known arrangement reproduces the HF tensor from the SAVE "
+                  f"(smallest max|diff| = {best:.6g}); the values themselves differ")
+        if self.explain and explain_pair is not None:
+            sv_raw, hv_raw = explain_pair
+            if int(sv_raw.shape[0]) <= self.explain_max_rows and int(hv_raw.shape[0]) <= self.explain_max_rows:
+                try:
+                    told = explain_rows(sv_raw, hv_raw)
+                except Exception as exc:  # noqa: BLE001 -- diagnostics must never mask the verdict
+                    told = f"row map unavailable ({type(exc).__name__}: {exc})"
+                if told:
+                    detail += "; " + told
+        return Result(family, FAIL, "none", detail, save_keys, hf_keys, best)
 
     # -- 1:1 families ------------------------------------------------------------------------------
     def identity_family(self, family: str, save_key: str, hf_key: str, *, plus_one: bool = False,
@@ -518,11 +608,15 @@ class Checker:
         return self.identity_family(family, save_key, hf_key, plus_one=plus_one, transpose_ok=transpose_ok)
 
     # -- fused / packed families -------------------------------------------------------------------
-    def qkv_family(self, family: str, save_key: str, hf_q: str, hf_k: str, hf_v: str, groups: int) -> Result:
+    def qkv_family(self, family: str, save_key: str, hf_q: str, hf_k: str, hf_v: str, groups: int,
+                   ungated_q_rows: int = 0) -> Result:
         """Fused mcore ``linear_qkv`` vs the export's q / k / v.
 
-        Block sizes come from the HF tensors themselves, so a gated attention layer (q_proj carrying its
-        gate) is handled without special-casing; ``groups`` is the number of KV groups.
+        Block sizes come from the HF tensors themselves. Gating is detected by comparing the HF q rows with
+        ``heads * head_dim``: mcore lays a gated group out as ``[q-block, gate-block, k, v]`` while an HF
+        ``q_proj`` reshaped to ``[..., heads, 2*head_dim]`` reads as ``[q_h0, gate_h0, q_h1, ...]``, so the
+        two differ by a within-group permutation. Both that arrangement and the un-permuted one are
+        candidates; only the first is canonical, and the other is named rather than left unexplained.
         """
         import torch
 
@@ -535,17 +629,36 @@ class Checker:
                           detail=(f"HF q/k/v rows {nq}+{nk}+{nv}={nq + nk + nv} do not add up to the fused "
                                   f"SAVE rows {int(sv.shape[0])}"),
                           save_keys=[save_key], hf_keys=[hf_q, hf_k, hf_v])
+        gated = ungated_q_rows > 0 and nq == 2 * ungated_q_rows
+        plan: List[Tuple[str, bool, Callable[[], Tuple[List[int], List[int], List[int]]]]] = []
+        if gated:
+            plan.append(("gated_per_head_q_gate", True,
+                         lambda: qkv_rows_gated_head_interleaved(nq, nk, nv, groups)))
+            plan.append(("gated_per_group_q_then_gate", False,
+                         lambda: qkv_rows_grouped_blocks(nq, nk, nv, groups)))
+        else:
+            plan.append(("gqa_group_interleaved", True, lambda: qkv_rows_grouped_blocks(nq, nk, nv, groups)))
+            if ungated_q_rows and nq != ungated_q_rows:
+                plan.append(("gated_per_head_q_gate", False,
+                             lambda: qkv_rows_gated_head_interleaved(nq, nk, nv, groups)))
+        plan.append(("contiguous_q_k_v", False, lambda: qkv_rows_contiguous_blocks(nq, nk, nv)))
+
         cands: List[Tuple[str, bool, Any, Any]] = []
-        try:
-            idx = qkv_rows_grouped_blocks(nq, nk, nv, groups)
+        for name, canonical, build in plan:
+            try:
+                idx = build()
+            except ValueError:
+                continue
             order = idx[0] + idx[1] + idx[2]
-            cands.append((f"gqa_group_interleaved(groups={groups})", True,
-                          sv[torch.as_tensor(order, dtype=torch.long)], hv))
-        except ValueError:
-            pass
-        order = sum(qkv_rows_contiguous_blocks(nq, nk, nv), [])
-        cands.append(("contiguous_q_k_v", False, sv[torch.as_tensor(order, dtype=torch.long)], hv))
-        return self._verdict(family, [save_key], [hf_q, hf_k, hf_v], cands)
+            if len(order) != int(sv.shape[0]):
+                continue
+            cands.append((name, canonical, sv[torch.as_tensor(order, dtype=torch.long)], hv))
+        if not cands:
+            return Result(family, UNRESOLVED,
+                          detail=(f"no candidate layout fits rows {int(sv.shape[0])} with "
+                                  f"q/k/v {nq}/{nk}/{nv} and groups={groups}"),
+                          save_keys=[save_key], hf_keys=[hf_q, hf_k, hf_v])
+        return self._verdict(family, [save_key], [hf_q, hf_k, hf_v], cands, explain_pair=(sv, hv))
 
     def fused_qkv_family(self, family: str, save_key: str, hf_key: str, num_heads: int, head_dim: int) -> Result:
         """OV2 vision tower: HF keeps ONE fused ``self_attn.qkv`` ([3d, d]); mcore interleaves per head."""
@@ -596,7 +709,7 @@ class Checker:
         if rows % 2 == 0:
             idx = torch.as_tensor(swap_halves(rows), dtype=torch.long)
             cands.append(("halves_swapped", False, shaped(sv[idx]), hv))
-        return self._verdict(family, [save_key], list(hf_keys), cands)
+        return self._verdict(family, [save_key], list(hf_keys), cands, explain_pair=(sv, hv))
 
     def matrix_family(self, family: str, save_key: str, hf_key: str, *, hf_index0: Optional[int] = None,
                       save_index0: Optional[int] = None) -> Result:
@@ -612,7 +725,7 @@ class Checker:
             return Result(family, UNRESOLVED,
                           detail=f"SAVE{tuple(sv.shape)} vs HF{tuple(hv.shape)} are not shape-compatible",
                           save_keys=[save_key], hf_keys=[hf_key])
-        return self._verdict(family, [save_key], [hf_key], cands)
+        return self._verdict(family, [save_key], [hf_key], cands, explain_pair=(sv, hv))
 
     def hf_concat_family(self, family: str, save_key: str, hf_keys: Sequence[str]) -> Result:
         """One fused SAVE matrix vs several HF matrices concatenated in a declared order."""
@@ -633,7 +746,8 @@ class Checker:
             cands.append((f"concat[{label}]", order == tuple(range(len(hf_keys))), sv,
                           torch.cat([parts[n] for n in names], dim=0)))
         cands.sort(key=lambda c: not c[1])
-        return self._verdict(family, [save_key], list(hf_keys), cands)
+        return self._verdict(family, [save_key], list(hf_keys), cands,
+                             explain_pair=(sv, torch.cat([parts[k] for k in hf_keys], dim=0)))
 
     def save_concat_family(self, family: str, save_keys: Sequence[str], hf_key: str) -> Result:
         """Several SAVE parts vs ONE fused HF tensor -- this build splits GDN in_proj / conv1d per role.
@@ -661,7 +775,8 @@ class Checker:
             cands.append((f"concat[{label}]", order == tuple(range(len(save_keys))),
                           torch.cat([parts[n] for n in names], dim=0), hv))
         cands.sort(key=lambda c: not c[1])
-        return self._verdict(family, list(save_keys), [hf_key], cands)
+        return self._verdict(family, list(save_keys), [hf_key], cands,
+                             explain_pair=(torch.cat([parts[k] for k in save_keys], dim=0), hv))
 
     def conv1d_family(self, family: str, save_keys: Sequence[str], hf_key: str) -> Result:
         """GDN depthwise conv: possibly split per role on the SAVE side, possibly squeezed on the HF side."""
@@ -833,7 +948,7 @@ def build_and_run(checker: Checker, found: dict, dims: dict, layers: Sequence[in
                 f"attn{L}_qkv", sa + "linear_qkv.weight",
                 c.pick_hf([f"{hfl}{L}.self_attn.q_proj.weight"], diag_prefix=f"{hfl}{L}.self_attn."),
                 f"{hfl}{L}.self_attn.k_proj.weight", f"{hfl}{L}.self_attn.v_proj.weight",
-                dims["num_kv_heads"] or 1))
+                dims["num_kv_heads"] or 1, dims["num_heads"] * dims["head_dim"]))
             c.run(f"attn{L}_o_proj", lambda L=L, sa=sa: c.identity_family(
                 f"attn{L}_o_proj", sa + "linear_proj.weight", f"{hfl}{L}.self_attn.o_proj.weight"))
             c.run(f"attn{L}_q_norm", lambda L=L, sa=sa: c.identity_family(
@@ -976,6 +1091,8 @@ def main() -> int:
     ap.add_argument("--atol", type=float, default=0.0, help="absolute tolerance (default 0 = bit-exact)")
     ap.add_argument("--rtol", type=float, default=0.0, help="relative tolerance (default 0 = bit-exact)")
     ap.add_argument("--max-load-gb", type=float, default=8.0, help="per-tensor SAVE load budget (GiB)")
+    ap.add_argument("--no-explain", action="store_true",
+                    help="skip the byte-level row map printed when no arrangement matches")
     ap.add_argument("--dump-keys", action="store_true", help="print both key spaces plus discovery, then exit")
     ap.add_argument("--grep", default="", help="with --dump-keys: only print keys containing this substring")
     ap.add_argument("--allow-unresolved", action="store_true", help="exit 0 even if a family was UNRESOLVED")
@@ -1029,7 +1146,7 @@ def main() -> int:
     vision_layers = _int_list(args.vision_layers)
     logger.info("[save-vs-hf] checking layers=%s experts=%s vision_layers=%s", layers, experts, vision_layers)
 
-    checker = Checker(save, hf, args.atol, args.rtol, args.rows)
+    checker = Checker(save, hf, args.atol, args.rtol, args.rows, explain=not args.no_explain)
     build_and_run(checker, found, dims, layers, experts, vision_layers)
 
     counts = {PASS: 0, FAIL: 0, UNRESOLVED: 0, SKIP: 0}
